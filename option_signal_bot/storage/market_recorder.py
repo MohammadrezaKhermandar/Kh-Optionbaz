@@ -9,15 +9,32 @@
 خرابی بین آن دو یعنی ردیفی که به فایلِ ناموجود اشاره می‌کند. داخل
 تراکنش، یا هر دو هست یا هیچ‌کدام.
 
-**اتمی بودن:** هر نوبت دریافت یک `snapshot_id` ثابت می‌گیرد. ردیف
-snapshot اول با `status='partial'` نوشته می‌شود؛ payload، مشخصات،
-قیمت‌ها و گذارِ نهایی به `complete` همه در **یک تراکنش** انجام می‌شوند.
-برنامه اگر وسط کار بمیرد، ردیف `partial` می‌ماند و مصرف‌کننده ردش
-می‌کند.
+**اتمی بودن:** هر نوبت دریافت یک `snapshot_id` ثابت می‌گیرد. payload،
+مشخصات، قیمت‌ها و گذارِ نهایی به وضعیت پایانی همه در **یک تراکنش**
+انجام می‌شوند.
+
+خرابی وسط کار یعنی **rollback کامل**: نه ردیف snapshot می‌ماند نه
+قیمتی. وضعیت `partial` فقط داخل همان تراکنش وجود دارد و هرگز به
+دیسک commit نمی‌شود — پس «ردیف نیمه‌کاره‌ی جامانده» حالتی نیست که
+مصرف‌کننده لازم باشد نگرانش باشد. آنچه در پایگاه دیده می‌شود یا
+`complete` است، یا `complete_with_issues`، یا `failed`.
+
+**وضعیت‌های پایانی:**
+
+| وضعیت | یعنی |
+|---|---|
+| `complete` | پاسخ کامل و بدون تعارض ثبت شد |
+| `complete_with_issues` | ثبت شد ولی پاسخ **تعارض** یا ردیف استخراج‌نشده داشت |
+| `failed` | دریافت یا پردازش شکست خورد |
 
 ⚠️ `complete` یعنی «پاسخِ دریافت‌شده کامل ثبت و پردازش شد». **به معنی
 تضمین پوشش کل بازار از سوی منبع نیست** — اگر منبع نصف بازار را داده
 باشد، ما همان نصف را کامل ثبت کرده‌ایم.
+
+**تغییرناپذیری:** یک `snapshot_id` که ثبت شده، با محتوای **متفاوت**
+دوباره نوشته نمی‌شود. اثر انگشت محتوا ذخیره می‌گردد؛ ثبت دوباره‌ی همان
+شناسه با همان محتوا بی‌اثر است (برای retry ذخیره‌سازی) و با محتوای
+دیگر **خطا** می‌دهد. مشاهده‌ی مستقل باید شناسه‌ی تازه بگیرد.
 
 **تفکیک زنده و آزمایشی:** نوع پایگاه هنگام ساخت در جدول `meta` مهر
 می‌شود و در هر بازکردن بعدی کنترل می‌گردد. پایگاه `live` هرگز داده‌ی
@@ -28,6 +45,7 @@ fixture نمی‌پذیرد و پایگاه `test` هرگز داده‌ی زند
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import logging
 import sqlite3
@@ -42,15 +60,22 @@ from data.raw_snapshot import CURRENCY, SCHEMA_VERSION, ExtractionResult
 logger = logging.getLogger(__name__)
 
 #: نسخه‌ی اسکیمای همین جدول‌ها (جدا از `SCHEMA_VERSION` نگاشت فیلدها).
-DB_SCHEMA_VERSION = 1
+#: ۲ = افزودن جدول `conflicts`، ستون‌های اثر انگشت و فیلدهای نامعتبر.
+DB_SCHEMA_VERSION = 2
 
 #: انواع مجاز پایگاه. مخلوط‌شدنشان ممنوع است.
 KIND_LIVE = "live"
 KIND_TEST = "test"
 
+#: فقط داخل تراکنش وجود دارد؛ هرگز روی دیسک commit نمی‌شود.
 STATUS_PARTIAL = "partial"
 STATUS_COMPLETE = "complete"
+#: ثبت شد، ولی پاسخ تعارض یا ردیف استخراج‌نشده داشت.
+STATUS_COMPLETE_WITH_ISSUES = "complete_with_issues"
 STATUS_FAILED = "failed"
+
+#: وضعیت‌هایی که یعنی داده‌ی این نوبت قابل استفاده است.
+USABLE_STATUSES = (STATUS_COMPLETE, STATUS_COMPLETE_WITH_ISSUES)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -73,8 +98,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
     row_count       INTEGER,
     contract_count  INTEGER,
     rejected_count  INTEGER,
+    conflict_count  INTEGER,
+    duplicate_count INTEGER,
     raw_payload     BLOB,            -- JSON فشرده‌شده با gzip
     raw_bytes       INTEGER,
+    -- اثر انگشت محتوا: ثبت دوباره‌ی همان شناسه با محتوای متفاوت رد می‌شود
+    fingerprint     TEXT,
     error           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_requested_at ON snapshots(requested_at);
@@ -148,11 +177,46 @@ CREATE TABLE IF NOT EXISTS rejected_rows (
     ins_code     TEXT,
     FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
 );
+
+-- تعارض‌ها: یک شناسه با مقادیر متفاوت در همان پاسخ. **هیچ‌کدام** در
+-- `quotes` ثبت نمی‌شوند؛ اینجا می‌مانند تا انتخابِ بی‌صدا رخ ندهد و
+-- بعداً از payload خام قابل بازبینی باشند.
+CREATE TABLE IF NOT EXISTS conflicts (
+    snapshot_id  TEXT NOT NULL,
+    kind         TEXT NOT NULL,   -- contract | underlying
+    key          TEXT NOT NULL,   -- ins_code یا نماد پایه
+    row_index    INTEGER NOT NULL,
+    side         TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_conflicts_key ON conflicts(key);
+
+-- فیلدهایی که منبع داد ولی معتبر نبودند (NaN، بی‌نهایت، کسر برای فیلد
+-- صحیح). مقدارشان NULL شد ولی علتشان اینجا می‌ماند.
+CREATE TABLE IF NOT EXISTS invalid_fields (
+    snapshot_id  TEXT NOT NULL,
+    ins_code     TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
+);
 """
 
 
 class DatabaseKindMismatch(RuntimeError):
     """تلاش برای مخلوط‌کردن داده‌ی زنده و آزمایشی در یک پایگاه."""
+
+
+class SchemaVersionMismatch(RuntimeError):
+    """پایگاه با نسخه‌ی دیگری از اسکیما نوشته شده."""
+
+
+class SnapshotConflict(RuntimeError):
+    """ثبت دوباره‌ی یک `snapshot_id` با محتوای **متفاوت**.
+
+    شناسه‌ی یک نوبت دریافت نباید معنایش عوض شود. اگر محتوا فرق دارد،
+    این یک مشاهده‌ی **تازه** است و باید شناسه‌ی تازه بگیرد.
+    """
 
 
 @dataclass
@@ -223,6 +287,21 @@ class MarketRecorder:
                 f"پایگاه مخلوط شوند؛ مسیر جداگانه بدهید."
             )
 
+        version = self._connection.execute(
+            "SELECT value FROM meta WHERE key = 'db_schema_version'"
+        ).fetchone()
+        stored = int(version["value"]) if version else 1
+        if stored != DB_SCHEMA_VERSION:
+            # مهاجرت خودکار عمداً انجام نمی‌شود: پایگاه نسخه‌ی قبلی
+            # ستون اثر انگشت و جدول تعارض‌ها را ندارد، و ساختنِ آن‌ها
+            # از داده‌ی موجود یعنی حدس‌زدن چیزی که آن موقع ثبت نشده.
+            raise SchemaVersionMismatch(
+                f"این پایگاه با اسکیمای نسخه‌ی {stored} نوشته شده ولی کد "
+                f"فعلی نسخه‌ی {DB_SCHEMA_VERSION} است. پایگاه قدیمی را "
+                f"نگه دارید (داده‌اش سالم است) و برای ثبت تازه مسیر "
+                f"جدیدی بدهید."
+            )
+
     def close(self) -> None:
         self._connection.close()
 
@@ -251,32 +330,63 @@ class MarketRecorder:
     ) -> int:
         """ثبت **اتمیک** یک نوبت کامل. تعداد قرارداد ثبت‌شده را برمی‌گرداند.
 
-        همه‌چیز در یک تراکنش است: ردیف snapshot با `partial`، payload
-        فشرده، نسخه‌های مشخصات، مشاهده‌ها، نمادهای پایه، ردیف‌های ردشده،
-        و در آخر گذار به `complete`. خرابی در هر نقطه یعنی rollback کامل.
+        همه‌چیز در یک تراکنش است: ردیف snapshot، payload فشرده،
+        نسخه‌های مشخصات، مشاهده‌ها، نمادهای پایه، ردیف‌های ردشده،
+        تعارض‌ها، و گذار به وضعیت پایانی. خرابی در هر نقطه یعنی
+        **rollback کامل** — هیچ ردیفی روی دیسک نمی‌ماند.
 
-        فراخوانِ دوباره با همان `snapshot_id` (مثلاً retry ذخیره‌سازی)
-        داده را بازنویسی می‌کند، **نه** اینکه ردیف تکراری بسازد.
+        فراخوانِ دوباره با همان `snapshot_id`:
+
+        * **همان محتوا** (retry ذخیره‌سازی) → بی‌اثر، بدون ردیف اضافه.
+        * **محتوای متفاوت** → `SnapshotConflict`؛ نسخه‌ی قبلی
+          دست‌نخورده می‌ماند.
+
+        مقدار بازگشتی برابر تعداد ردیف‌های واقعاً نوشته‌شده است و با
+        `extraction.contract_count` می‌خواند.
 
         Raises:
             DatabaseKindMismatch: اگر منشأ داده با نوع پایگاه نخواند.
+            SnapshotConflict: اگر همان شناسه با محتوای دیگری ثبت شود.
         """
         self._guard_kind(is_live)
 
-        blob = gzip.compress(
-            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        blob = _compress(raw)
+        fingerprint = _fingerprint(
+            raw, extraction, requested_at, received_at, source, endpoint
+        )
+        existing = self._connection.execute(
+            "SELECT fingerprint, status, contract_count FROM snapshots"
+            " WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["fingerprint"] == fingerprint:
+                logger.info(
+                    "snapshot %s از قبل با همین محتوا ثبت شده؛ بدون تغییر.",
+                    snapshot_id[:8],
+                )
+                return int(existing["contract_count"] or 0)
+            raise SnapshotConflict(
+                f"snapshot «{snapshot_id}» قبلاً با محتوای متفاوتی ثبت شده "
+                f"(وضعیت فعلی: {existing['status']}). یک مشاهده‌ی تازه باید "
+                f"شناسه‌ی تازه بگیرد؛ نسخه‌ی قبلی بازنویسی نمی‌شود."
+            )
+
+        status = (
+            STATUS_COMPLETE if extraction.is_clean else STATUS_COMPLETE_WITH_ISSUES
         )
         try:
             with self._connection:  # تراکنش: commit یا rollback کامل
-                self._purge(snapshot_id)
                 self._connection.execute(
                     """
                     INSERT INTO snapshots (
                         snapshot_id, requested_at, received_at, source_time,
                         source, is_live, endpoint, status, schema_version,
                         currency, row_count, contract_count, rejected_count,
-                        raw_payload, raw_bytes, error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                        conflict_count, duplicate_count, raw_payload, raw_bytes,
+                        fingerprint, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         snapshot_id,
@@ -292,22 +402,34 @@ class MarketRecorder:
                         extraction.row_count,
                         extraction.contract_count,
                         len(extraction.rejected),
+                        len(extraction.conflicts),
+                        extraction.duplicate_count,
                         blob,
                         len(blob),
+                        fingerprint,
                     ),
                 )
-                written = self._write_rows(snapshot_id, extraction)
+                written = self._write_rows(snapshot_id, extraction, received_at)
+                if written != extraction.contract_count:
+                    # نباید رخ بدهد؛ اگر داد یعنی شمارش گزارش با ثبت
+                    # واقعی نمی‌خواند و کل تراکنش باید برگردد.
+                    raise sqlite3.IntegrityError(
+                        f"تعداد ثبت‌شده ({written}) با شمارش گزارش "
+                        f"({extraction.contract_count}) نمی‌خواند."
+                    )
                 self._connection.execute(
                     "UPDATE snapshots SET status = ? WHERE snapshot_id = ?",
-                    (STATUS_COMPLETE, snapshot_id),
+                    (status, snapshot_id),
                 )
         except sqlite3.Error:
             logger.exception("ثبت snapshot %s ناموفق بود؛ تراکنش برگشت خورد.", snapshot_id)
             raise
 
         logger.info(
-            "snapshot %s ثبت شد: %s قرارداد، %s ردیف ردشده، %s KiB فشرده.",
-            snapshot_id[:8], written, len(extraction.rejected), len(blob) // 1024,
+            "snapshot %s ثبت شد (%s): %s قرارداد، %s تعارض، %s تکرار یکسان، "
+            "%s ردیف ردشده، %s KiB فشرده.",
+            snapshot_id[:8], status, written, len(extraction.conflicts),
+            extraction.duplicate_count, len(extraction.rejected), len(blob) // 1024,
         )
         return written
 
@@ -327,23 +449,45 @@ class MarketRecorder:
 
         نبودِ داده هم یک واقعیت است: بدون این، یک قطعی چندروزه از
         تاریخچه نامرئی می‌ماند و بعداً «بازار آرام بود» تفسیر می‌شود.
+
+        ⚠️ اگر همان شناسه قبلاً **موفق** ثبت شده باشد، پاکش نمی‌کند:
+        یک شکستِ بعدی نباید داده‌ی سالمِ قبلی را از بین ببرد.
+
+        Raises:
+            SnapshotConflict: اگر شناسه قبلاً با ثبت موفق اشغال شده باشد.
         """
         self._guard_kind(is_live)
+        existing = self._connection.execute(
+            "SELECT status FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing["status"] in USABLE_STATUSES:
+                raise SnapshotConflict(
+                    f"snapshot «{snapshot_id}» قبلاً با موفقیت ثبت شده "
+                    f"({existing['status']})؛ ثبت شکست روی آن، داده‌ی سالم را "
+                    f"از بین می‌برد. برای تلاش تازه شناسه‌ی تازه بگیرید."
+                )
+            # شکستِ قبلی با شکستِ تازه‌تر جایگزین می‌شود — داده‌ای از
+            # دست نمی‌رود چون چیزی ثبت نشده بود.
+            self._connection.execute(
+                "DELETE FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
+            )
+
         blob = (
-            gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            _compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
             if payload is not None
             else None
         )
         with self._connection:
-            self._purge(snapshot_id)
             self._connection.execute(
                 """
                 INSERT INTO snapshots (
                     snapshot_id, requested_at, received_at, source_time, source,
                     is_live, endpoint, status, schema_version, currency,
-                    row_count, contract_count, rejected_count, raw_payload,
-                    raw_bytes, error
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)
+                    row_count, contract_count, rejected_count, conflict_count,
+                    duplicate_count, raw_payload, raw_bytes, fingerprint, error
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
+                          NULL, NULL, ?, ?, NULL, ?)
                 """,
                 (
                     snapshot_id,
@@ -371,23 +515,12 @@ class MarketRecorder:
                 f"جداگانه بسازید."
             )
 
-    def _purge(self, snapshot_id: str) -> None:
-        """پاک‌کردن آثار قبلی همان `snapshot_id` (برای retry ذخیره‌سازی).
-
-        ترتیب مهم است: فرزندها قبل از والد، چون `foreign_keys` روشن است.
-        """
-        for table in ("quotes", "underlying_quotes", "rejected_rows"):
-            self._connection.execute(
-                f"DELETE FROM {table} WHERE snapshot_id = ?", (snapshot_id,)
-            )
-        self._connection.execute(
-            "DELETE FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
-        )
-
-    def _write_rows(self, snapshot_id: str, extraction: ExtractionResult) -> int:
+    def _write_rows(
+        self, snapshot_id: str, extraction: ExtractionResult, observed_at: datetime
+    ) -> int:
         written = 0
         for quote in extraction.quotes:
-            spec_id = self._spec_id(quote.spec)
+            spec_id = self._spec_id(quote.spec, observed_at)
             self._connection.execute(
                 """
                 INSERT OR REPLACE INTO quotes (
@@ -407,6 +540,12 @@ class MarketRecorder:
                 ),
             )
             written += 1
+            for reason in quote.invalid_fields:
+                self._connection.execute(
+                    "INSERT INTO invalid_fields (snapshot_id, ins_code, reason)"
+                    " VALUES (?, ?, ?)",
+                    (snapshot_id, quote.spec.ins_code, reason),
+                )
 
         for underlying in extraction.underlyings:
             self._connection.execute(
@@ -434,14 +573,30 @@ class MarketRecorder:
                     rejected.reason, rejected.ins_code,
                 ),
             )
+
+        for conflict in extraction.conflicts:
+            self._connection.execute(
+                """
+                INSERT INTO conflicts (snapshot_id, kind, key, row_index, side, reason)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id, conflict.kind, conflict.key,
+                    conflict.row_index, conflict.side, conflict.reason,
+                ),
+            )
         return written
 
-    def _spec_id(self, spec) -> int:
+    def _spec_id(self, spec, observed_at: datetime) -> int:
         """شناسه‌ی نسخه‌ی مشخصات؛ در صورت نبود ساخته می‌شود.
 
         یکتایی روی **کل مشخصات** است نه فقط `ins_code`: اگر منبع فردا
         استرایک یا اندازه‌ی قرارداد دیگری بدهد، نسخه‌ی تازه‌ای ساخته
         می‌شود و مشاهده‌های قبلی همچنان به نسخه‌ی خودشان وصل می‌مانند.
+
+        `first_seen_at` از **زمان دریافت همان مشاهده** می‌آید، نه ساعت
+        اجرای ذخیره‌سازی: اگر یک payload ساعت‌ها بعد ثبت شود، ساعت ثبت
+        چیزی درباره‌ی بازار نمی‌گوید.
         """
         values = (
             spec.ins_code, spec.symbol, spec.option_type, spec.underlying,
@@ -467,7 +622,7 @@ class MarketRecorder:
                 strike, expiry, contract_size, begin_date, full_name, first_seen_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (*values, datetime.now().astimezone().isoformat()),
+            (*values, _stamp(observed_at)),
         )
         return int(cursor.lastrowid)
 
@@ -480,10 +635,12 @@ class MarketRecorder:
             "SELECT requested_at, status FROM snapshots"
             " ORDER BY requested_at DESC LIMIT 1"
         ).fetchone()
+        placeholders = ", ".join("?" for _ in USABLE_STATUSES)
         complete = conn.execute(
-            "SELECT received_at, contract_count FROM snapshots"
-            " WHERE status = ? ORDER BY requested_at DESC LIMIT 1",
-            (STATUS_COMPLETE,),
+            "SELECT received_at, contract_count, status FROM snapshots"
+            f" WHERE status IN ({placeholders})"
+            " ORDER BY requested_at DESC LIMIT 1",
+            USABLE_STATUSES,
         ).fetchone()
         failure = conn.execute(
             "SELECT requested_at, error FROM snapshots"
@@ -523,6 +680,49 @@ class MarketRecorder:
         with sqlite3.connect(str(destination)) as backup:
             self._connection.backup(backup)
         return destination
+
+
+def _compress(raw: bytes) -> bytes:
+    """فشرده‌سازی **قطعی**.
+
+    `gzip.compress` به‌طور پیش‌فرض زمان فعلی را در سرآیند می‌گذارد، پس
+    دو بار فشرده‌کردنِ همان داده بایت‌های متفاوت می‌دهد. با `mtime=0`
+    خروجی فقط تابع ورودی است — لازمه‌ی مقایسه‌ی اثر انگشت.
+    """
+    return gzip.compress(raw, mtime=0)
+
+
+def _fingerprint(
+    raw: bytes,
+    extraction: ExtractionResult,
+    requested_at: datetime,
+    received_at: datetime,
+    source: str,
+    endpoint: str | None,
+) -> str:
+    """اثر انگشت محتوای یک نوبت.
+
+    روی **JSON خام** حساب می‌شود نه بایت‌های فشرده. نتیجه‌ی استخراج و
+    زمان‌ها هم در آن هستند، تا
+    «همان شناسه با محتوای متفاوت» قابل تشخیص باشد. تکرارِ ذخیره‌سازی
+    با ورودی کاملاً یکسان همین اثر انگشت را می‌سازد و بی‌اثر می‌ماند.
+    """
+    digest = hashlib.sha256()
+    digest.update(raw)
+    for part in (
+        source,
+        endpoint or "",
+        requested_at.isoformat(),
+        received_at.isoformat(),
+        str(extraction.row_count),
+        str(extraction.contract_count),
+        str(len(extraction.rejected)),
+        str(len(extraction.conflicts)),
+        str(extraction.duplicate_count),
+    ):
+        digest.update(b"\x00")
+        digest.update(part.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _stamp(moment: datetime) -> str:
