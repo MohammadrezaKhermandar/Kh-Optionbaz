@@ -43,7 +43,13 @@ dist/
 .DS_Store
 Thumbs.db
 
-# --- استثنای صریح: fixtureهای پروژه هرگز نادیده گرفته نشوند ---
-# اگر روزی الگویی بالا سهواً این‌ها را بگیرد، این خط جلویش را می‌گیرد.
+# --- استثنای محدود برای fixtureهای پروژه ---
+# `var/` و `*.db` می‌توانند مسیرهای داخل fixtures را هم بگیرند، پس فقط
+# **همان پسوندهایی** که fixtureهای فعلی دارند برگردانده می‌شوند.
+#
+# ⚠️ عمداً `!.../fixtures/**` فراگیر استفاده **نشده**: چنین خطی قواعد
+# فایل حساس بالا (HAR، session، .env) را داخل این پوشه خنثی می‌کرد و یک
+# فایل حساس که اشتباهی آن‌جا بیفتد بی‌محافظ می‌ماند.
 !option_signal_bot/tests/fixtures/
-!option_signal_bot/tests/fixtures/**
+!option_signal_bot/tests/fixtures/**/
+!option_signal_bot/tests/fixtures/**/*.json
