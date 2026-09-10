@@ -130,6 +130,9 @@ class UnderlyingQuote:
     last_price: float | None
     close_price: float | None
     previous_close: float | None
+    #: مثل `ContractQuote.invalid_fields` — خطای تبدیل قیمت پایه هم
+    #: دور ریخته نمی‌شود.
+    invalid_fields: tuple[str, ...] = ()
 
 
 @dataclass
@@ -164,9 +167,25 @@ class ExtractionResult:
         return bool(self.conflicts)
 
     @property
+    def invalid_field_count(self) -> int:
+        """شمار کل فیلدهای نامعتبر، در قراردادها و نمادهای پایه."""
+        return sum(len(q.invalid_fields) for q in self.quotes) + sum(
+            len(u.invalid_fields) for u in self.underlyings
+        )
+
+    @property
     def is_clean(self) -> bool:
-        """آیا استخراج بدون تعارض و بدون ردیف ردشده تمام شد؟"""
-        return not self.conflicts and not self.rejected
+        """آیا استخراج بدون هیچ مشکلی تمام شد؟
+
+        فیلد عددیِ نامعتبر هم مشکل است: مقدارش `NULL` شده و آن ستون در
+        این مشاهده داده‌ای ندارد. چنین snapshotای نباید `complete`
+        معمولی معرفی شود.
+        """
+        return (
+            not self.conflicts
+            and not self.rejected
+            and self.invalid_field_count == 0
+        )
 
 
 @dataclass(frozen=True)
@@ -377,6 +396,7 @@ def _collect_underlying(
         underlying.last_price,
         underlying.close_price,
         underlying.previous_close,
+        underlying.invalid_fields,
     )
     previous = seen.get(underlying.symbol)
     if previous is None:
@@ -397,10 +417,15 @@ def _collect_underlying(
 
 
 def _signature(quote: ContractQuote) -> tuple:
-    """امضای کامل یک مشاهده: مشخصات **و** مقادیر قیمتی.
+    """امضای کامل یک مشاهده: مشخصات، مقادیر قیمتی، و خطاهای تبدیل.
 
     تعارض فقط اختلاف مشخصات نیست؛ همان قرارداد با قیمت یا حجم متفاوت
     در یک پاسخ هم یعنی معلوم نیست کدام درست است.
+
+    `invalid_fields` عمداً جزو امضاست: هر دو حالتِ «منبع نداد» و
+    «منبع چیز نامعتبری داد» مقدار `None` می‌سازند، ولی یکی نیستند.
+    بدون این، یک ردیف با `NaN` و ردیفی که همان فیلد را اصلاً ندارد
+    «تکرارِ یکسان» شمرده می‌شدند و تعارض واقعی پنهان می‌ماند.
     """
     return (
         *quote.spec.identity(),
@@ -409,6 +434,7 @@ def _signature(quote: ContractQuote) -> tuple:
         quote.volume, quote.value, quote.trade_count,
         quote.open_interest, quote.previous_open_interest,
         quote.notional_value, quote.remained_day,
+        quote.invalid_fields,
     )
 
 
@@ -424,12 +450,21 @@ def _extract_underlying(row: dict[str, Any]) -> UnderlyingQuote | None:
     symbol = _text(row.get("lval30_UA"))
     if symbol is None:
         return None
+    problems: list[str] = []
+
+    def num(key: str) -> float | None:
+        value, reason = _number(row.get(key), key)
+        if reason:
+            problems.append(reason)
+        return value
+
     return UnderlyingQuote(
         symbol=symbol,
         ins_code=_text(row.get("uaInsCode")),
-        last_price=_number(row.get("pDrCotVal_UA"), "pDrCotVal_UA")[0],
-        close_price=_number(row.get("pClosing_UA"), "pClosing_UA")[0],
-        previous_close=_number(row.get("priceYesterday_UA"), "priceYesterday_UA")[0],
+        last_price=num("pDrCotVal_UA"),
+        close_price=num("pClosing_UA"),
+        previous_close=num("priceYesterday_UA"),
+        invalid_fields=tuple(problems),
     )
 
 

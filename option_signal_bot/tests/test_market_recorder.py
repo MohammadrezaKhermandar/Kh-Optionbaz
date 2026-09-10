@@ -44,6 +44,7 @@ from storage.market_recorder import (
     STATUS_PARTIAL,
     DatabaseKindMismatch,
     MarketRecorder,
+    SchemaVersionMismatch,
     SnapshotConflict,
 )
 
@@ -544,15 +545,15 @@ def test_nan_and_infinity_never_reach_a_numeric_column(recorder):
     reasons = [
         r["reason"]
         for r in recorder._connection.execute(
-            "SELECT reason FROM invalid_fields WHERE ins_code = '1515'"
+            "SELECT reason FROM invalid_fields WHERE key = '1515'"
         ).fetchall()
     ]
     assert any("NaN" in r for r in reasons)
     assert any("بی‌نهایت" in r for r in reasons)
-    # پاسخ مشکل‌دار «معمولی» معرفی نمی‌شود
+    # پاسخ دارای فیلد نامعتبر «معمولی» معرفی نمی‌شود
     assert recorder._connection.execute(
         "SELECT status FROM snapshots WHERE snapshot_id = 'snap-nan'"
-    ).fetchone()["status"] == STATUS_COMPLETE
+    ).fetchone()["status"] == STATUS_COMPLETE_WITH_ISSUES
 
 
 def test_fractional_value_for_an_integer_field_is_not_truncated(recorder):
@@ -658,3 +659,135 @@ def test_cli_status_needs_no_network_and_no_database(tmp_path, capsys):
     code = record_market.main(["--status", "--db", str(tmp_path / "absent.db")])
     assert code == record_market.EXIT_OK
     assert "هنوز چیزی ثبت نشده" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------
+# ۹. رگرسیون بازبینی PR #3
+# ----------------------------------------------------------------------
+def test_invalid_underlying_price_keeps_field_key_and_reason(recorder):
+    """خطای تبدیل قیمت **نماد پایه** هم دور ریخته نمی‌شود."""
+    row = _row(ins_code="2020")
+    row["pDrCotVal_UA"] = float("nan")
+
+    extraction = extract(_payload(row))
+    assert extraction.underlyings[0].invalid_fields  # علت نگه داشته شد
+    assert not extraction.is_clean
+
+    _record(recorder, _payload(row), "snap-ua-bad")
+
+    stored = recorder._connection.execute(
+        "SELECT kind, key, reason FROM invalid_fields"
+        " WHERE snapshot_id = 'snap-ua-bad' AND kind = 'underlying'"
+    ).fetchone()
+    assert stored["key"] == "65883838195688438"   # شناسه‌ی پایدار پایه
+    assert "pDrCotVal_UA" in stored["reason"]     # نام فیلد
+    assert "NaN" in stored["reason"]              # علت
+
+    assert recorder._connection.execute(
+        "SELECT status, invalid_field_count FROM snapshots"
+        " WHERE snapshot_id = 'snap-ua-bad'"
+    ).fetchone()["status"] == STATUS_COMPLETE_WITH_ISSUES
+
+
+def test_invalid_field_count_is_visible_in_status(recorder):
+    """شمارش مشکلات عددی در `--status` دیده می‌شود."""
+    row = _row(ins_code="2021")
+    row["oP_C"] = float("inf")
+    _record(recorder, _payload(row), "snap-count")
+
+    status = recorder.status()
+    assert status.total_invalid_fields >= 1
+    assert status.snapshots_with_issues == 1
+
+
+def test_invalid_value_and_missing_value_are_not_the_same_observation(recorder):
+    """امضای تکرار نباید «نامعتبر» را با «ناموجود» یکی بگیرد.
+
+    هر دو مقدار ستون را `None` می‌کنند، ولی یکی نیستند — و اگر امضا
+    فرقشان را نبیند، یک تعارض واقعی «تکرارِ یکسان» شمرده می‌شود.
+    """
+    invalid = _row(ins_code="2022")
+    invalid["pMeDem_C"] = float("nan")   # منبع داد، ولی نامعتبر
+    missing = _row(ins_code="2022")
+    missing.pop("pMeDem_C")              # منبع اصلاً نداد
+
+    extraction = extract(_payload(invalid, missing))
+
+    # سمت کال: تعارض، چون یکی NaN داشت و دیگری اصلاً فیلد را نداشت.
+    assert any(c.key == "2022" for c in extraction.conflicts)
+    assert not any(q.spec.ins_code == "2022" for q in extraction.quotes)
+    # سمت پوت واقعاً یکسان است و درست هم «تکرار یکسان» شمرده می‌شود —
+    # یعنی امضا فقط جایی که باید فرق می‌گذارد.
+    assert extraction.duplicate_count == 1
+    assert any(q.spec.ins_code == "20229" for q in extraction.quotes)
+
+
+def test_opening_a_v1_database_changes_neither_schema_nor_data(tmp_path):
+    """رد نسخه‌ی ناسازگار باید **پیش از هر DDL** باشد.
+
+    قبلاً `executescript` اول اجرا می‌شد، پس بازکردن یک پایگاه نسخه‌ی ۱
+    جدول‌های نسخه‌ی ۲ را به آن اضافه می‌کرد — خطا می‌داد ولی پایگاه را
+    هم عوض کرده بود.
+    """
+    path = tmp_path / "v1.db"
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE snapshots (snapshot_id TEXT PRIMARY KEY);
+        INSERT INTO meta VALUES ('kind', 'test'), ('db_schema_version', '1');
+        INSERT INTO snapshots VALUES ('old-snap');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    def snapshot_of(db: Path) -> tuple:
+        conn = sqlite3.connect(str(db))
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        ]
+        rows = [r[0] for r in conn.execute("SELECT snapshot_id FROM snapshots")]
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        conn.close()
+        return tables, rows, meta
+
+    before = snapshot_of(path)
+    with pytest.raises(SchemaVersionMismatch):
+        MarketRecorder(path, kind=KIND_TEST)
+
+    assert snapshot_of(path) == before, "پایگاه ناسازگار نباید تغییر کند"
+    assert "conflicts" not in before[0]
+
+
+def test_raw_payload_survives_a_storage_failure(tmp_path, monkeypatch):
+    """اگر نوشتن بشکند ولی ثبتِ خطا ممکن باشد، payload خام حفظ می‌شود."""
+    from scripts import record_market
+
+    db = tmp_path / "fail.db"
+    monkeypatch.setattr(
+        MarketRecorder,
+        "_write_rows",
+        lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("دیسک پر")),
+    )
+    code = record_market.main(
+        ["--once", "--kind", "test", "--fixture", str(FIXTURE), "--db", str(db)]
+    )
+    assert code == record_market.EXIT_FAILED
+
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status, error, raw_payload FROM snapshots"
+    ).fetchone()
+    assert row["status"] == STATUS_FAILED
+    assert "تراکنش برگشت خورد" in row["error"]
+
+    # و خودِ داده‌ی خام قابل بازیابی است
+    assert row["raw_payload"] is not None
+    restored = json.loads(gzip.decompress(row["raw_payload"]).decode("utf-8"))
+    assert len(restored["instrumentOptMarketWatch"]) > 0
+    conn.close()

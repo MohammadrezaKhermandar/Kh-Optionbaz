@@ -24,7 +24,8 @@
 | وضعیت | یعنی |
 |---|---|
 | `complete` | پاسخ کامل و بدون تعارض ثبت شد |
-| `complete_with_issues` | ثبت شد ولی پاسخ **تعارض** یا ردیف استخراج‌نشده داشت |
+| `complete_with_issues` | ثبت شد، ولی پاسخ **تعارض**، ردیف
+  استخراج‌نشده یا **فیلد عددی نامعتبر** داشت |
 | `failed` | دریافت یا پردازش شکست خورد |
 
 ⚠️ `complete` یعنی «پاسخِ دریافت‌شده کامل ثبت و پردازش شد». **به معنی
@@ -70,7 +71,7 @@ KIND_TEST = "test"
 #: فقط داخل تراکنش وجود دارد؛ هرگز روی دیسک commit نمی‌شود.
 STATUS_PARTIAL = "partial"
 STATUS_COMPLETE = "complete"
-#: ثبت شد، ولی پاسخ تعارض یا ردیف استخراج‌نشده داشت.
+#: ثبت شد، ولی پاسخ تعارض، ردیف استخراج‌نشده یا فیلد نامعتبر داشت.
 STATUS_COMPLETE_WITH_ISSUES = "complete_with_issues"
 STATUS_FAILED = "failed"
 
@@ -100,6 +101,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     rejected_count  INTEGER,
     conflict_count  INTEGER,
     duplicate_count INTEGER,
+    invalid_field_count INTEGER,
     raw_payload     BLOB,            -- JSON فشرده‌شده با gzip
     raw_bytes       INTEGER,
     -- اثر انگشت محتوا: ثبت دوباره‌ی همان شناسه با محتوای متفاوت رد می‌شود
@@ -196,10 +198,12 @@ CREATE INDEX IF NOT EXISTS idx_conflicts_key ON conflicts(key);
 -- صحیح). مقدارشان NULL شد ولی علتشان اینجا می‌ماند.
 CREATE TABLE IF NOT EXISTS invalid_fields (
     snapshot_id  TEXT NOT NULL,
-    ins_code     TEXT NOT NULL,
-    reason       TEXT NOT NULL,
+    kind         TEXT NOT NULL,   -- contract | underlying
+    key          TEXT NOT NULL,   -- ins_code قرارداد، یا نماد پایه
+    reason       TEXT NOT NULL,   -- شامل نام فیلد و علت
     FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
 );
+CREATE INDEX IF NOT EXISTS idx_invalid_key ON invalid_fields(key);
 """
 
 
@@ -234,6 +238,11 @@ class SnapshotStatus:
     last_error_at: str | None
     last_error: str | None
     distinct_contracts: int
+    #: شمار مشکلات کیفیت داده در کل پایگاه — تا در `--status` دیده شوند.
+    total_conflicts: int = 0
+    total_invalid_fields: int = 0
+    total_rejected_rows: int = 0
+    snapshots_with_issues: int = 0
 
 
 class MarketRecorder:
@@ -253,54 +262,77 @@ class MarketRecorder:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(str(self.db_path))
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.executescript(_SCHEMA)
-        self._connection.commit()
-        self._check_kind()
+        try:
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            # ⚠️ ترتیب حیاتی است: **اول** اعتبارسنجی، بعد DDL. اگر
+            # اسکیما پیش از بررسی اجرا شود، بازکردنِ یک پایگاه ناسازگار
+            # جدول‌های نسخه‌ی جدید را به آن اضافه می‌کند — یعنی خطا
+            # می‌دهد ولی پایگاه را هم عوض کرده. همین اتفاق یک بار افتاد.
+            if self._is_established():
+                self._validate_existing()
+            else:
+                self._create_schema()
+        except Exception:
+            # سازنده که شکست بخورد، اتصال نباید باز بماند.
+            self._connection.close()
+            raise
 
     # ------------------------------------------------------------------
-    def _check_kind(self) -> None:
-        """نوع پایگاه را مهر یا کنترل می‌کند.
+    def _is_established(self) -> bool:
+        """آیا این فایل از قبل یک پایگاهِ ساخته‌شده است؟
 
-        اولین بار مهر می‌شود؛ دفعات بعد اگر نوع نخواند، خطا می‌دهد.
-        این قید عمداً اینجاست و نه در CLI: هیچ فلگی نباید بتواند
-        داده‌ی fixture را وارد پایگاه زنده کند.
+        ملاک وجود جدول `meta` است، نه وجود فایل: `sqlite3.connect`
+        فایل خالی می‌سازد، پس «فایل هست» چیزی درباره‌ی محتوا نمی‌گوید.
         """
         row = self._connection.execute(
-            "SELECT value FROM meta WHERE key = 'kind'"
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
         ).fetchone()
-        if row is None:
-            self._connection.executemany(
-                "INSERT INTO meta (key, value) VALUES (?, ?)",
-                [
-                    ("kind", self.kind),
-                    ("db_schema_version", str(DB_SCHEMA_VERSION)),
-                    ("created_at", datetime.now().astimezone().isoformat()),
-                ],
-            )
-            self._connection.commit()
-            return
-        if row["value"] != self.kind:
+        return row is not None
+
+    def _validate_existing(self) -> None:
+        """نوع و نسخه‌ی یک پایگاه موجود را **پیش از هر تغییری** بررسی می‌کند.
+
+        ناسازگاری یعنی خطا، بدون اینکه حتی یک `CREATE TABLE` اجرا شده
+        باشد. مهاجرت خودکار عمداً وجود ندارد: پایگاه نسخه‌ی قبلی ستون
+        اثر انگشت و جدول تعارض‌ها را ندارد، و ساختنشان از داده‌ی موجود
+        یعنی حدس‌زدن چیزی که آن موقع ثبت نشده.
+        """
+        meta = dict(self._connection.execute("SELECT key, value FROM meta"))
+
+        stored_kind = meta.get("kind")
+        if stored_kind is not None and stored_kind != self.kind:
             raise DatabaseKindMismatch(
-                f"این پایگاه از نوع «{row['value']}» است ولی با نوع "
+                f"این پایگاه از نوع «{stored_kind}» است ولی با نوع "
                 f"«{self.kind}» باز شد. داده‌ی زنده و آزمایشی نباید در یک "
                 f"پایگاه مخلوط شوند؛ مسیر جداگانه بدهید."
             )
 
-        version = self._connection.execute(
-            "SELECT value FROM meta WHERE key = 'db_schema_version'"
-        ).fetchone()
-        stored = int(version["value"]) if version else 1
-        if stored != DB_SCHEMA_VERSION:
-            # مهاجرت خودکار عمداً انجام نمی‌شود: پایگاه نسخه‌ی قبلی
-            # ستون اثر انگشت و جدول تعارض‌ها را ندارد، و ساختنِ آن‌ها
-            # از داده‌ی موجود یعنی حدس‌زدن چیزی که آن موقع ثبت نشده.
+        stored_version = int(meta.get("db_schema_version", 1))
+        if stored_version != DB_SCHEMA_VERSION:
             raise SchemaVersionMismatch(
-                f"این پایگاه با اسکیمای نسخه‌ی {stored} نوشته شده ولی کد "
-                f"فعلی نسخه‌ی {DB_SCHEMA_VERSION} است. پایگاه قدیمی را "
-                f"نگه دارید (داده‌اش سالم است) و برای ثبت تازه مسیر "
+                f"این پایگاه با اسکیمای نسخه‌ی {stored_version} نوشته شده "
+                f"ولی کد فعلی نسخه‌ی {DB_SCHEMA_VERSION} است. پایگاه قدیمی "
+                f"دست‌نخورده می‌ماند (داده‌اش سالم است)؛ برای ثبت تازه مسیر "
                 f"جدیدی بدهید."
             )
+
+        # نسخه سازگار است: حالا اجرای اسکیما بی‌خطر است (همه‌ی دستورها
+        # `IF NOT EXISTS` دارند) و جدولی که شاید جا مانده باشد را می‌سازد.
+        self._connection.executescript(_SCHEMA)
+        self._connection.commit()
+
+    def _create_schema(self) -> None:
+        """ساخت اسکیمای تازه و مهرزدن نوع و نسخه."""
+        self._connection.executescript(_SCHEMA)
+        self._connection.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            [
+                ("kind", self.kind),
+                ("db_schema_version", str(DB_SCHEMA_VERSION)),
+                ("created_at", datetime.now().astimezone().isoformat()),
+            ],
+        )
+        self._connection.commit()
 
     def close(self) -> None:
         self._connection.close()
@@ -384,9 +416,9 @@ class MarketRecorder:
                         snapshot_id, requested_at, received_at, source_time,
                         source, is_live, endpoint, status, schema_version,
                         currency, row_count, contract_count, rejected_count,
-                        conflict_count, duplicate_count, raw_payload, raw_bytes,
-                        fingerprint, error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                        conflict_count, duplicate_count, invalid_field_count,
+                        raw_payload, raw_bytes, fingerprint, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         snapshot_id,
@@ -404,6 +436,7 @@ class MarketRecorder:
                         len(extraction.rejected),
                         len(extraction.conflicts),
                         extraction.duplicate_count,
+                        extraction.invalid_field_count,
                         blob,
                         len(blob),
                         fingerprint,
@@ -427,9 +460,10 @@ class MarketRecorder:
 
         logger.info(
             "snapshot %s ثبت شد (%s): %s قرارداد، %s تعارض، %s تکرار یکسان، "
-            "%s ردیف ردشده، %s KiB فشرده.",
+            "%s ردیف ردشده، %s فیلد نامعتبر، %s KiB فشرده.",
             snapshot_id[:8], status, written, len(extraction.conflicts),
-            extraction.duplicate_count, len(extraction.rejected), len(blob) // 1024,
+            extraction.duplicate_count, len(extraction.rejected),
+            extraction.invalid_field_count, len(blob) // 1024,
         )
         return written
 
@@ -485,9 +519,10 @@ class MarketRecorder:
                     snapshot_id, requested_at, received_at, source_time, source,
                     is_live, endpoint, status, schema_version, currency,
                     row_count, contract_count, rejected_count, conflict_count,
-                    duplicate_count, raw_payload, raw_bytes, fingerprint, error
+                    duplicate_count, invalid_field_count, raw_payload, raw_bytes,
+                    fingerprint, error
                 ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
-                          NULL, NULL, ?, ?, NULL, ?)
+                          NULL, NULL, NULL, ?, ?, NULL, ?)
                 """,
                 (
                     snapshot_id,
@@ -542,8 +577,8 @@ class MarketRecorder:
             written += 1
             for reason in quote.invalid_fields:
                 self._connection.execute(
-                    "INSERT INTO invalid_fields (snapshot_id, ins_code, reason)"
-                    " VALUES (?, ?, ?)",
+                    "INSERT INTO invalid_fields (snapshot_id, kind, key, reason)"
+                    " VALUES (?, 'contract', ?, ?)",
                     (snapshot_id, quote.spec.ins_code, reason),
                 )
 
@@ -561,6 +596,13 @@ class MarketRecorder:
                     underlying.previous_close,
                 ),
             )
+            for reason in underlying.invalid_fields:
+                # شناسه‌ی پایدار پایه ترجیح دارد؛ اگر منبع ندهد، نماد.
+                self._connection.execute(
+                    "INSERT INTO invalid_fields (snapshot_id, kind, key, reason)"
+                    " VALUES (?, 'underlying', ?, ?)",
+                    (snapshot_id, underlying.ins_code or underlying.symbol, reason),
+                )
 
         for rejected in extraction.rejected:
             self._connection.execute(
@@ -650,6 +692,14 @@ class MarketRecorder:
         distinct = conn.execute(
             "SELECT COUNT(DISTINCT ins_code) AS n FROM quotes"
         ).fetchone()["n"]
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            for table in ("conflicts", "invalid_fields", "rejected_rows")
+        }
+        with_issues = conn.execute(
+            "SELECT COUNT(*) AS n FROM snapshots WHERE status = ?",
+            (STATUS_COMPLETE_WITH_ISSUES,),
+        ).fetchone()["n"]
         return SnapshotStatus(
             kind=self.kind,
             db_path=str(self.db_path),
@@ -666,6 +716,10 @@ class MarketRecorder:
             last_error_at=failure["requested_at"] if failure else None,
             last_error=failure["error"] if failure else None,
             distinct_contracts=int(distinct),
+            total_conflicts=int(counts["conflicts"]),
+            total_invalid_fields=int(counts["invalid_fields"]),
+            total_rejected_rows=int(counts["rejected_rows"]),
+            snapshots_with_issues=int(with_issues),
         )
 
     def backup_to(self, target: str | Path) -> Path:
@@ -719,6 +773,7 @@ def _fingerprint(
         str(len(extraction.rejected)),
         str(len(extraction.conflicts)),
         str(extraction.duplicate_count),
+        str(extraction.invalid_field_count),
     ):
         digest.update(b"\x00")
         digest.update(part.encode("utf-8"))

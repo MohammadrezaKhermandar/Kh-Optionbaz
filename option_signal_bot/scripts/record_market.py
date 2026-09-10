@@ -223,7 +223,7 @@ def _record_once(
         # اصلاً قابل نوشتن نباشد همین هم شکست می‌خورد و صریح گفته می‌شود.
         return _note_failure(
             recorder, snapshot_id, source, endpoint, is_live, requested_at,
-            f"ثبت ناموفق (تراکنش برگشت خورد): {exc}", received_at, None,
+            f"ثبت ناموفق (تراکنش برگشت خورد): {exc}", received_at, payload,
         )
 
     _print_summary(args, options, recorder, extraction, snapshot_id, written, is_live)
@@ -286,12 +286,18 @@ def _print_summary(
     print(f"  تکرار یکسان    : {extraction.duplicate_count}")
     print(f"  تعارض          : {len(extraction.conflicts)}")
     print(f"  ردیف ردشده     : {len(extraction.rejected)}")
+    print(f"  فیلد نامعتبر   : {extraction.invalid_field_count}")
     print(f"  نماد پایه      : {len(extraction.underlyings)}")
     print(f"  وضعیت          : {status.last_attempt_status}")
     print(f"  حجم پایگاه     : {status.db_bytes / 1024:.0f} KiB")
     for label, reasons in (
         ("علت‌های رد شدن", [r.reason for r in extraction.rejected]),
         ("تعارض‌ها", [c.reason for c in extraction.conflicts]),
+        (
+            "فیلدهای نامعتبر",
+            [r for q in extraction.quotes for r in q.invalid_fields]
+            + [r for u in extraction.underlyings for r in u.invalid_fields],
+        ),
     ):
         if not reasons:
             continue
@@ -336,6 +342,10 @@ def show_status(args: argparse.Namespace, options: dict) -> int:
           f"  ({status.last_attempt_status or '—'})")
     print(f"آخرین ثبت کامل    : {status.last_complete_at or '—'}")
     print(f"  قرارداد آن نوبت : {contracts}")
+    print(f"نوبت دارای مشکل   : {status.snapshots_with_issues}")
+    print(f"  تعارض           : {status.total_conflicts}")
+    print(f"  فیلد نامعتبر    : {status.total_invalid_fields}")
+    print(f"  ردیف ردشده      : {status.total_rejected_rows}")
     print(f"آخرین خطا         : {status.last_error_at or '—'}")
     if status.last_error:
         print(f"  متن خطا         : {status.last_error}")
