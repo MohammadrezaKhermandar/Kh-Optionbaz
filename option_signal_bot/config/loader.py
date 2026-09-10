@@ -177,6 +177,23 @@ def default_settings() -> dict[str, Any]:
             # مثل مقدار پیش‌فرض خودِ OrderBookClient
             "order_book_ttl_seconds": 10.0,
         },
+        # ثبت تاریخچه‌ی خام بازار (`scripts/record_market.py`).
+        #
+        # این بخش فقط **پیش‌فرض مسیرها** را نگه می‌دارد؛ خودِ ابزار از CLI
+        # اجرا می‌شود و به حلقه‌ی اصلی ربات وصل نیست. حلقه‌ی زمان‌بندی در
+        # مرحله‌ی بعد اضافه می‌شود، پس `enabled` هنوز چیزی را روشن
+        # نمی‌کند و صرفاً نیت کاربر را ثبت می‌کند.
+        "recorder": {
+            "enabled": False,
+            "sqlite_path": "var/recorder/market.db",
+            # پایگاه آزمایشی عمداً مسیر جداست: داده‌ی fixture و زنده
+            # هرگز در یک فایل مخلوط نمی‌شوند (لایه‌ی ذخیره‌سازی هم این
+            # را مستقل از تنظیمات اعمال می‌کند).
+            "test_sqlite_path": "var/recorder/test.db",
+            "market": 0,
+            "timeout": 15,
+            "retries": 3,
+        },
     }
 
 
