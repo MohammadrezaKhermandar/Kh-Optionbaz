@@ -229,9 +229,11 @@ def test_expiry_is_never_settled_automatically(tmp_path):
     می‌کرد؛ یک اختیارِ بی‌ارزش این‌طور برای حساب پول می‌ساخت. حالا
     موقعیت دست‌نخورده می‌ماند و وضعیتش صریح است.
     """
-    expired_contract = _contract(expiry_days=-1, last_price=1300.0)
-    broker = _broker(tmp_path, _deep_book(), contract=expired_contract)
+    live, expired_contract = _contract(30), _contract(expiry_days=-1, last_price=1300.0)
+    broker = _broker(tmp_path, _deep_book(), contract=live)
     broker.place_order(SYMBOL, "buy", 4)
+    # حالا همان نماد سررسید شده است.
+    broker.resolve_contract = lambda s: expired_contract if s == SYMBOL else None
     cash_before = broker.get_account_balance()["cash"]
 
     expired = broker.expired_positions()
@@ -248,9 +250,10 @@ def test_expiry_is_never_settled_automatically(tmp_path):
 
 def test_manual_settlement_uses_the_price_the_user_gives(tmp_path):
     """تسویه فقط با قیمتی که کاربر می‌دهد — از جمله صفر."""
-    expired_contract = _contract(expiry_days=-1, last_price=1300.0)
-    broker = _broker(tmp_path, _deep_book(), contract=expired_contract)
+    live, expired_contract = _contract(30), _contract(expiry_days=-1, last_price=1300.0)
+    broker = _broker(tmp_path, _deep_book(), contract=live)
     broker.place_order(SYMBOL, "buy", 4)
+    broker.resolve_contract = lambda s: expired_contract if s == SYMBOL else None
     cash_before = broker.get_account_balance()["cash"]
 
     trade = broker.settle_position(SYMBOL, settlement_price=0.0)

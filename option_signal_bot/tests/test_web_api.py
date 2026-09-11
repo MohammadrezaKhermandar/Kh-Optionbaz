@@ -682,3 +682,52 @@ def test_settle_refuses_a_position_that_has_not_expired(client, paper_order_book
 
     assert response.status_code == 400
     assert "سررسید" in response.json()["detail"]
+
+
+def test_settle_rejects_non_finite_prices_at_the_api_boundary(client, paper_order_book):
+    """`inf`/`nan` باید در خودِ مرزِ API رد شوند، نه اینکه تا لایه‌ی مالی بروند.
+
+    JSON کلمه‌ی `Infinity` ندارد ولی `1e999` همان می‌شود؛ بدون
+    `allow_inf_nan=False` بی‌صدا رد می‌شد و نقد را بی‌نهایت می‌کرد.
+    """
+    _enable_paper_trading(client)
+
+    for bad in ("1e999", "-1e999"):
+        response = client.post(
+            "/api/paper-trading/settle",
+            content=f'{{"symbol": "{PAPER_SYMBOL}", "settlement_price": {bad}}}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422, bad
+
+
+def test_settle_rejects_a_negative_price_at_the_api_boundary(client, paper_order_book):
+    _enable_paper_trading(client)
+
+    response = client.post(
+        "/api/paper-trading/settle",
+        json={"symbol": PAPER_SYMBOL, "settlement_price": -1.0},
+    )
+
+    assert response.status_code == 422
+
+
+def test_settle_requires_an_explicit_price(client, paper_order_book):
+    """قیمت پیش‌فرض ندارد: نبودنش خطاست، نه صفر."""
+    _enable_paper_trading(client)
+
+    response = client.post("/api/paper-trading/settle", json={"symbol": PAPER_SYMBOL})
+
+    assert response.status_code == 422
+
+
+def test_account_separates_costs_known_from_rates_configured(client, paper_order_book):
+    """دو پرچم جدا: «هزینه دانسته است» و «نرخ تنظیم شده»."""
+    _enable_paper_trading(client)
+
+    account = client.get("/api/paper-trading/account").json()
+
+    assert "costs_known" in account
+    assert "rates_configured" in account
+    assert "positions_with_unknown_cost" in account
+    assert "total_costs_recorded" in account

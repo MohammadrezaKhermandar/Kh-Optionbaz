@@ -86,6 +86,10 @@ class PositionValuation:
     #: کارمزد ورودی که به همین تعدادِ باقی‌مانده تعلق دارد (پرداخت‌شده)
     entry_fees_open: float
     status: ValuationStatus
+    #: آیا عددِ بالا **دانسته** است؟ موقعیتی که از اسکیمای قدیمی مهاجرت
+    #: کرده، کارمزد ورودش ثبت نشده بود؛ صفرِ پیش‌فرض نباید صفرِ قطعی
+    #: خوانده شود، وگرنه «خالص»ش بی‌سروصدا خوش‌بینانه می‌شود.
+    entry_fees_known: bool = True
     mark_price: float | None = None
     #: بهترین مظنه‌ی خرید — فقط **مرجع**؛ در جمعِ حساب نمی‌آید
     reference_price: float | None = None
@@ -93,9 +97,20 @@ class PositionValuation:
     fillable_quantity: int = 0
 
     @property
-    def cost_basis(self) -> float:
-        """پولی که برای همین تعداد رفته است، شاملِ کارمزد ورود."""
-        return self.average_price * self.quantity * self.contract_size + self.entry_fees_open
+    def gross_cost(self) -> float:
+        """پرداختیِ خالصِ پرمیوم برای همین تعداد، **بدون** کارمزد."""
+        return self.average_price * self.quantity * self.contract_size
+
+    @property
+    def cost_basis(self) -> float | None:
+        """پولی که برای همین تعداد رفته است، شاملِ کارمزد ورود.
+
+        `None` وقتی کارمزد ورود دانسته نیست — عددی که یک جزء ناشناخته
+        دارد، «سرمایه‌ی درگیر» نیست.
+        """
+        if not self.entry_fees_known:
+            return None
+        return self.gross_cost + self.entry_fees_open
 
     @property
     def market_value(self) -> float | None:
@@ -119,9 +134,12 @@ class PositionValuation:
         کارمزد خروج اینجا کم نمی‌شود: هنوز پرداخت نشده و مقدارش به قیمتِ
         خروجِ آینده بستگی دارد. کم کردنش یعنی خرج‌نکرده را خرج‌شده نشان
         دادن.
+
+        `None` وقتی کارمزد ورود دانسته نیست. صفر گرفتنش «خالص» را به
+        «ناخالص» تبدیل می‌کرد و کاربر تفاوتش را نمی‌دید.
         """
         gross = self.unrealized_gross
-        if gross is None:
+        if gross is None or not self.entry_fees_known:
             return None
         return gross - self.entry_fees_open
 
@@ -139,20 +157,31 @@ class RealizedTotals:
     exit_costs: float = 0.0
     trade_count: int = 0
     #: معامله‌هایی که پیش از نسخه‌ی ۲ ثبت شده‌اند و سهمِ کارمزد ورودشان
-    #: ثبت نشده است. ناخالصشان درست است ولی خالصشان کم‌برآورد می‌شود.
+    #: ثبت نشده است. ناخالصشان درست است ولی خالصشان دانسته نیست.
     trades_missing_entry_cost: int = 0
+    #: همان، برای کارمزد خروج (در عمل نباید پیش بیاید؛ برای کامل‌بودن).
+    trades_missing_exit_cost: int = 0
 
     @property
     def costs(self) -> float:
+        """هزینه‌های **ثبت‌شده**. همیشه قابل نمایش است، حتی ناقص."""
         return self.entry_costs + self.exit_costs
 
     @property
-    def net(self) -> float:
+    def net(self) -> float | None:
+        """سود خالصِ **قطعی**؛ `None` وقتی هزینه‌ی معامله‌ای دانسته نیست.
+
+        معلوم‌بودن هزینه به اطلاعاتِ **همان معامله** بستگی دارد، نه به
+        نرخی که امروز در تنظیمات نشسته: نرخ امروز چیزی درباره‌ی هزینه‌ی
+        معامله‌ی دیروز نمی‌گوید.
+        """
+        if not self.costs_complete:
+            return None
         return self.gross - self.costs
 
     @property
     def costs_complete(self) -> bool:
-        return self.trades_missing_entry_cost == 0
+        return self.trades_missing_entry_cost == 0 and self.trades_missing_exit_cost == 0
 
 
 @dataclass(frozen=True)
@@ -163,8 +192,10 @@ class AccountSnapshot:
     cash: float
     positions: tuple[PositionValuation, ...]
     realized: RealizedTotals
-    #: آیا نرخ کارمزدی تنظیم شده یا هزینه‌ی واقعی‌ای پرداخت شده است؟
-    costs_known: bool
+    #: آیا کاربر نرخ کارمزدی **تنظیم کرده** است؟ این فقط درباره‌ی
+    #: معامله‌های **بعدی** حرف می‌زند. عمداً از `costs_known` جداست:
+    #: تنظیم نرخ امروز، هزینه‌ی نامعلومِ معامله‌ی دیروز را معلوم نمی‌کند.
+    rates_configured: bool = False
     blocked: float = 0.0
     blocked_reason: str = ""
     #: لحظه‌ی قیمت‌گذاری (ISO). رابط با این می‌فهمد عدد چقدر تازه است.
@@ -209,18 +240,40 @@ class AccountSnapshot:
 
     @property
     def unrealized_net(self) -> float | None:
+        """`None` وقتی ارزش‌گذاری ناقص است **یا** کارمزد ورودی نامعلوم."""
         if not self.valuation_complete:
             return None
-        return sum(p.unrealized_net or 0.0 for p in self.priced_positions)
+        nets = [p.unrealized_net for p in self.priced_positions]
+        if any(n is None for n in nets):
+            return None
+        return sum(n or 0.0 for n in nets)
 
     @property
     def open_entry_costs(self) -> float:
-        """کارمزد ورودی که هنوز روی موقعیت‌های باز نشسته است."""
+        """کارمزد ورودیِ **ثبت‌شده** روی موقعیت‌های باز."""
         return sum(p.entry_fees_open for p in self.positions)
 
     @property
-    def total_costs_paid(self) -> float:
-        """همه‌ی هزینه‌ی پرداخت‌شده تا حالا — بسته و باز، بدون شمارشِ دوباره."""
+    def positions_with_unknown_cost(self) -> tuple[PositionValuation, ...]:
+        """موقعیت‌هایی که کارمزد ورودشان دانسته نیست (مهاجرت‌شده)."""
+        return tuple(p for p in self.positions if not p.entry_fees_known)
+
+    @property
+    def costs_known(self) -> bool:
+        """آیا هزینه‌ی **همه‌ی** عملیات‌های این حساب دانسته است؟
+
+        فقط از داده‌ی ثبت‌شده می‌آید، نه از نرخِ امروز. تا این `False`
+        باشد، هیچ عددِ «خالصِ قطعی» نمایش داده نمی‌شود — ولی ناخالص و
+        هزینه‌های ثبت‌شده همچنان قابل نمایش‌اند.
+        """
+        return self.realized.costs_complete and not self.positions_with_unknown_cost
+
+    @property
+    def total_costs_recorded(self) -> float:
+        """همه‌ی هزینه‌ی **ثبت‌شده** — بسته و باز، بدون شمارشِ دوباره.
+
+        اگر `costs_known` نادرست باشد، این عدد کفِ هزینه است نه کلِ آن.
+        """
         return self.realized.costs + self.open_entry_costs
 
     # -- ارزش کل ----------------------------------------------------------
@@ -263,10 +316,14 @@ class AccountSnapshot:
         """
         equity = self.equity
         unrealized = self.unrealized_net
-        if equity is None or unrealized is None:
+        realized_net = self.realized.net
+        if equity is None or unrealized is None or realized_net is None:
+            # اتحاد فقط وقتی سنجیدنی است که هر دو طرفش دانسته باشند.
+            # سنجیدنش با عددِ ناقص، «نخواند» را به گردنِ حسابداری
+            # می‌انداخت، در حالی که مسئله نبودِ داده است.
             return {"applicable": False, "difference": None, "ok": None}
         actual = equity - self.initial_balance
-        expected = self.realized.net + unrealized
+        expected = realized_net + unrealized
         difference = actual - expected
         return {
             "applicable": True,
@@ -329,31 +386,36 @@ def summarize_trades(trades: list[dict[str, object]]) -> RealizedTotals:
     صریح بگوید خالصِ کدام بخش کامل نیست.
     """
     gross = entry_costs = exit_costs = 0.0
-    missing = 0
+    missing_entry = missing_exit = 0
     for trade in trades:
         gross += float(trade.get("gross_pnl") or 0.0)
-        exit_costs += float(trade.get("exit_fee") or 0.0)
         entry_fee = trade.get("entry_fee")
         if entry_fee is None:
-            missing += 1
+            missing_entry += 1
         else:
             entry_costs += float(entry_fee)
+        exit_fee = trade.get("exit_fee")
+        if exit_fee is None:
+            missing_exit += 1
+        else:
+            exit_costs += float(exit_fee)
     return RealizedTotals(
         gross=gross,
         entry_costs=entry_costs,
         exit_costs=exit_costs,
         trade_count=len(trades),
-        trades_missing_entry_cost=missing,
+        trades_missing_entry_cost=missing_entry,
+        trades_missing_exit_cost=missing_exit,
     )
 
 
-def return_on_cost_pct(net_pnl: float, cost_basis: float) -> float | None:
+def return_on_cost_pct(net_pnl: float | None, cost_basis: float | None) -> float | None:
     """بازده نسبت به **پولی که واقعاً درگیر شد**، نه نسبت به پرمیوم.
 
     `pnl_pct` قدیمی `(خروج−ورود)/ورود` بود: نه کارمزد داشت، نه اندازه‌ی
     موقعیت. دو معامله با درصدِ یکسان ولی حجم‌های خیلی متفاوت، اثر یکسانی
     روی حساب نمی‌گذارند.
     """
-    if cost_basis <= 0:
+    if net_pnl is None or cost_basis is None or cost_basis <= 0:
         return None
     return net_pnl / cost_basis * 100.0

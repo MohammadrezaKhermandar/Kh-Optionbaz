@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import uuid
 from collections.abc import Callable
 from datetime import date, datetime
@@ -57,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 #: علت بسته‌شدن یک معامله
 CLOSE_REASON_MANUAL = "manual"
+#: تعیین تکلیفِ سررسید با **فرضِ کاربر** — نه تسویه‌ی رسمی. مقدارش برای
+#: سازگاری با ردیف‌های موجود عوض نشده، ولی معنایش همین است.
 CLOSE_REASON_EXPIRY = "expiry_settlement"
 
 #: چون فروش استقراضی و سفارش معلق مدل نشده‌اند، هیچ پولی مسدود نمی‌شود.
@@ -65,6 +68,22 @@ BLOCKED_REASON = (
     "هیچ مبلغی مسدود نمی‌شود: سفارش معلق وجود ندارد (هر سفارش فوری حل "
     "می‌شود) و فروش استقراضی مدل نشده، پس وجه تضمینی هم در کار نیست."
 )
+
+
+def _finite(value: object, label: str) -> float:
+    """عدد را به `float` تبدیل می‌کند و `nan`/`inf` را **رد** می‌کند.
+
+    `float("inf")` در محاسبات مالی سر و صدا نمی‌کند: نقد را بی‌نهایت
+    می‌کند و `nan` هر مقایسه‌ای را `False` می‌کند، پس کنترل‌ها بی‌صدا رد
+    می‌شوند. بهتر است همان‌جا بشکند.
+    """
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} باید یک عدد باشد.") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{label} باید یک عدد متناهی باشد، نه {number}.")
+    return number
 
 
 class PaperBroker(OrderExecutorInterface):
@@ -103,6 +122,7 @@ class PaperBroker(OrderExecutorInterface):
         side: str,
         quantity: int,
         price: float | None = None,
+        today: date | None = None,
         **kwargs: object,
     ) -> Order:
         """ثبت سفارش کاغذی — فوری، در برابر عمق واقعی دفتر سفارش.
@@ -112,8 +132,8 @@ class PaperBroker(OrderExecutorInterface):
 
         ترتیب بررسی‌ها عمدی است: هرچه **پیش از** تغییر حساب رد شدنی است،
         پیش از آن رد می‌شود — تعداد، سمت، موجودیِ پوزیشن برای فروش،
-        قرارداد، عمق، و در آخر **کفایت وجه**. هیچ‌کدام حساب را نیمه‌کاره
-        رها نمی‌کنند.
+        قرارداد، **سررسید**، عمق، و در آخر کفایت وجه. هیچ‌کدام حساب را
+        نیمه‌کاره رها نمی‌کنند.
         """
         del price  # مرجع/نمایشی؛ پرشدن همیشه از عمق واقعی است
         now = datetime.now().isoformat(timespec="seconds")
@@ -146,6 +166,20 @@ class PaperBroker(OrderExecutorInterface):
         if contract is None or not contract.ins_code:
             reason = "نماد یا ins_code یافت نشد"
             return self._rejected(order_id, symbol, side, quantity, now, reason)
+
+        # ⚠️ سررسید **پیش از** دفتر سفارش بررسی می‌شود. منبع ممکن است
+        # هنوز برای نماد سررسیدشده مظنه بدهد (ردیف کهنه، یا نمادی که
+        # هنوز از دیده‌بان حذف نشده)، ولی معامله‌ی عادی روی آن ممکن نیست.
+        # پرکردنش یعنی حسابی که با قراردادی معامله کرده که وجود ندارد.
+        # تعیین تکلیف موقعیتِ سررسیدشده مسیر جداگانه‌ای دارد
+        # (`settle_position`) که قیمتش را از کاربر می‌گیرد.
+        if contract.expiry < (today or date.today()):
+            return self._rejected(
+                order_id, symbol, side, quantity, now,
+                f"{symbol} در {contract.expiry.isoformat()} سررسید شده است؛ "
+                "سفارش عادی روی قرارداد گذشته از سررسید ثبت نمی‌شود. "
+                "موقعیتِ باز را از مسیر «تسویه» تعیین تکلیف کنید.",
+            )
 
         book = self.order_book_client.try_get_order_book(contract.ins_code, symbol)
         if book is None:
@@ -276,12 +310,15 @@ class PaperBroker(OrderExecutorInterface):
         new_qty = existing["quantity"] + filled_qty
         old_cost = existing["quantity"] * existing["average_price"]
         new_avg = (old_cost + filled_qty * avg_price) / new_qty
+        # افزودن به موقعیتی که کارمزد ورودش دانسته نیست، جمعِ تازه را هم
+        # نامعلوم می‌کند: بخشی از آن عدد همچنان ناشناخته است.
         self.store.upsert_position(
             symbol,
             new_qty,
             new_avg,
             existing["opened_at"],
             entry_fees=self._entry_fees_of(existing) + fee,
+            entry_fees_known=self._entry_fees_known_of(existing),
         )
 
     def _apply_sell(
@@ -307,6 +344,7 @@ class PaperBroker(OrderExecutorInterface):
         # سهمِ کارمزد ورودِ همین تعداد با معامله می‌رود؛ بقیه روی موقعیتِ
         # باقی‌مانده می‌ماند. بدون این تسهیم، خروج جزئی یا هزینه را دو بار
         # می‌شمرد یا برای همیشه گمش می‌کند.
+        entry_fees_known = self._entry_fees_known_of(position)
         entry_fee_share = allocate_entry_fee(entry_fees_total, filled_qty, held)
         remaining = held - filled_qty
         self.store.upsert_position(
@@ -315,6 +353,7 @@ class PaperBroker(OrderExecutorInterface):
             entry_price,
             opened_at,
             entry_fees=entry_fees_total - entry_fee_share,
+            entry_fees_known=entry_fees_known,
         )
 
         self._record_close(
@@ -322,7 +361,8 @@ class PaperBroker(OrderExecutorInterface):
             quantity=filled_qty,
             entry_price=entry_price,
             exit_price=avg_price,
-            entry_fee=entry_fee_share,
+            # سهمی از عددی که دانسته نیست، خودش هم دانسته نیست.
+            entry_fee=entry_fee_share if entry_fees_known else None,
             exit_fee=fee,
             contract_size=contract.contract_size,
             opened_at=opened_at,
@@ -338,7 +378,7 @@ class PaperBroker(OrderExecutorInterface):
         quantity: int,
         entry_price: float,
         exit_price: float,
-        entry_fee: float,
+        entry_fee: float | None,
         exit_fee: float,
         contract_size: int,
         opened_at: str,
@@ -348,8 +388,14 @@ class PaperBroker(OrderExecutorInterface):
     ) -> dict[str, object]:
         """ثبت یک معامله‌ی بسته‌شده با تفکیک کاملِ ناخالص و هزینه‌ها."""
         gross = (exit_price - entry_price) * quantity * contract_size
-        net = gross - entry_fee - exit_fee
-        cost_basis = entry_price * quantity * contract_size + entry_fee
+        # `entry_fee is None` یعنی سهمِ کارمزد ورود دانسته نیست (موقعیتِ
+        # مهاجرت‌شده). آن‌وقت خالص و درصدش هم دانسته نیستند و `None`
+        # ثبت می‌شوند — صفر گرفتنشان یعنی ادعای بی‌هزینه بودن.
+        net = None if entry_fee is None else gross - entry_fee - exit_fee
+        cost_basis = (
+            None if entry_fee is None
+            else entry_price * quantity * contract_size + entry_fee
+        )
         trade = {
             "trade_id": str(uuid.uuid4()),
             "symbol": symbol,
@@ -358,11 +404,14 @@ class PaperBroker(OrderExecutorInterface):
             "exit_price": exit_price,
             # `fee_paid` برای سازگاری با ردیف‌های قدیمی می‌ماند و حالا
             # **کل** هزینه‌ی همین معامله است، نه فقط کارمزد خروج.
-            "fee_paid": entry_fee + exit_fee,
+            "fee_paid": (0.0 if entry_fee is None else entry_fee) + exit_fee,
             "entry_fee": entry_fee,
             "exit_fee": exit_fee,
             "gross_pnl": gross,
-            "pnl_absolute": net,
+            # ستون `pnl_absolute` در اسکیما NOT NULL است؛ وقتی خالص
+            # دانسته نیست، **ناخالص منهای هزینه‌های ثبت‌شده** می‌نشیند —
+            # همان کفِ زیان. `entry_fee IS NULL` علامتِ ناقص بودنش است.
+            "pnl_absolute": gross - exit_fee if net is None else net,
             # درصدِ معنادار: نسبت به پولی که واقعاً درگیر شد.
             "pnl_pct": return_on_cost_pct(net, cost_basis) or 0.0,
             "return_on_cost_pct": return_on_cost_pct(net, cost_basis),
@@ -377,8 +426,22 @@ class PaperBroker(OrderExecutorInterface):
 
     @staticmethod
     def _entry_fees_of(position: dict[str, object]) -> float:
-        """کارمزد ورودِ ثبت‌شده‌ی یک موقعیت (صفر برای ردیف‌های نسخه‌ی ۱)."""
+        """کارمزد ورودِ **ثبت‌شده‌ی** یک موقعیت.
+
+        برای موقعیتِ مهاجرت‌شده صفر است، ولی آن صفر «دانسته» نیست —
+        همیشه کنار `_entry_fees_known_of` خوانده شود.
+        """
         return float(position.get("entry_fees") or 0.0)
+
+    @staticmethod
+    def _entry_fees_known_of(position: dict[str, object]) -> bool:
+        """آیا کارمزد ورودِ این موقعیت دانسته است؟
+
+        ستون در نسخه‌ی ۳ آمده؛ نبودنش محافظه‌کارانه «نامعلوم» گرفته
+        می‌شود — ادعای دانستن، گران‌تر از اعتراف به ندانستن است.
+        """
+        value = position.get("entry_fees_known")
+        return bool(value) if value is not None else False
 
     def _rejected(
         self, order_id: str, symbol: str, side: str, quantity: int, now: str, reason: str
@@ -433,6 +496,7 @@ class PaperBroker(OrderExecutorInterface):
         symbol = str(row["symbol"])
         quantity = int(row["quantity"])
         entry_fees = self._entry_fees_of(row)
+        entry_fees_known = self._entry_fees_known_of(row)
         average_price = float(row["average_price"])
         contract = self.resolve_contract(symbol)
         contract_size = contract.contract_size if contract else 1
@@ -449,6 +513,7 @@ class PaperBroker(OrderExecutorInterface):
                 contract_size=contract_size,
                 average_price=average_price,
                 entry_fees_open=entry_fees,
+                entry_fees_known=entry_fees_known,
                 status=status,
                 mark_price=mark,
                 reference_price=reference,
@@ -485,16 +550,14 @@ class PaperBroker(OrderExecutorInterface):
         """جمعِ معاملات بسته‌شده، با تفکیک ناخالص و هزینه."""
         return summarize_trades(self.store.list_trades(days))
 
-    def costs_known(self) -> bool:
-        """آیا «خالص» عدد معناداری است؟
+    def rates_configured(self) -> bool:
+        """آیا کاربر نرخ کارمزد/مالیاتی تنظیم کرده است؟
 
-        اگر هیچ نرخی تنظیم نشده و هیچ هزینه‌ای هم پرداخت نشده، «خالص»
-        فقط تکرارِ «ناخالص» است و نمایشش به‌عنوان سود قطعی، دقتِ کاذب
-        می‌سازد.
+        ⚠️ این فقط درباره‌ی معامله‌های **بعدی** حرف می‌زند. عمداً در
+        محاسبه‌ی «هزینه دانسته است یا نه» دخالت نمی‌کند: نرخی که امروز
+        وارد شده، چیزی درباره‌ی هزینه‌ی معامله‌ی دیروز نمی‌گوید.
         """
-        if not self.fees.is_zero:
-            return True
-        return self.realized_totals().costs > 0
+        return not self.fees.is_zero
 
     def account_snapshot(self, today: date | None = None) -> AccountSnapshot:
         """عکسِ کامل و قابل تطبیق حساب — همان چیزی که داشبورد نشان می‌دهد."""
@@ -504,7 +567,7 @@ class PaperBroker(OrderExecutorInterface):
             cash=float(account["cash"]),
             positions=tuple(self.value_positions(today)),
             realized=self.realized_totals(),
-            costs_known=self.costs_known(),
+            rates_configured=self.rates_configured(),
             blocked=0.0,
             blocked_reason=BLOCKED_REASON,
             priced_at=datetime.now().isoformat(timespec="seconds"),
@@ -536,17 +599,28 @@ class PaperBroker(OrderExecutorInterface):
         settlement_price: float,
         today: date | None = None,
     ) -> dict[str, object]:
-        """تسویه‌ی دستیِ یک موقعیتِ سررسیدشده با قیمتی که **کاربر** می‌دهد.
+        """ثبتِ **فرضِ کاربر** برای تعیین تکلیف یک موقعیتِ سررسیدشده.
 
-        قیمت از بیرون می‌آید چون منبعِ درستش (قواعد تسویه‌ی بورس) در این
-        پروژه نیست. صفر هم قیمتِ معتبری است — «اختیار بی‌ارزش منقضی شد»
-        همان تسویه‌ی صفر است، و این با «قیمت نداریم» فرق دارد.
+        این «تسویه‌ی رسمی» نیست و وانمود هم نمی‌کند که هست. قواعد اعمال
+        و تسویه‌ی بورس تهران در این پروژه پیاده نشده‌اند و هزینه‌ی خودِ
+        تسویه هم مدل نشده است — تنها چیزی که اینجا اتفاق می‌افتد این است
+        که عددی که **کاربر فرض می‌کند** در شبیه‌سازی ثبت می‌شود تا حساب
+        بسته شود و ارزش‌گذاری معلق نماند.
+
+        Args:
+            settlement_price: پرمیوم تسویه **به ازای هر واحد** — همان
+                مبنایی که بقیه‌ی قیمت‌های این پروژه با آن کار می‌کنند.
+                ارزش کل از `قیمت × تعداد × اندازه‌ی قرارداد` در می‌آید.
+                صفر مقدارِ معتبری است («اختیار بی‌ارزش منقضی شد») و با
+                «قیمت نداریم» فرق دارد — ولی باید **صریح** داده شود.
         """
         position = self.store.get_position(symbol)
         if position is None:
             raise ValueError(f"موقعیتی روی {symbol} باز نیست.")
-        if settlement_price < 0:
+        price = _finite(settlement_price, "قیمت تسویه")
+        if price < 0:
             raise ValueError("قیمت تسویه نمی‌تواند منفی باشد.")
+        settlement_price = price
 
         contract = self.resolve_contract(symbol)
         if contract is None:
@@ -618,29 +692,64 @@ class PaperBroker(OrderExecutorInterface):
     def realized_drawdown(self, days: int | None = None) -> dict[str, object]:
         """بیشترین افتِ **حساب** روی منحنی نقدیِ معاملات بسته‌شده.
 
-        از سرمایه‌ی اولیه شروع می‌شود و سود/زیانِ خالصِ هر معامله را به
-        ترتیب زمان جمع می‌کند. این افتِ ریالیِ حساب است، نه جمعِ درصدِ
-        معاملات — آن یکی با افتِ واقعیِ سرمایه هیچ نسبتی ندارد.
+        درصدِ افت از **قله‌ی مربوط به همان افت** حساب می‌شود، نه از
+        سرمایه‌ی اولیه: ۱۰۰ → ۲۰۰ → ۱۵۰ یعنی افتِ مبلغی ۵۰ و افتِ درصدیِ
+        ۲۵٪ (نه ۵۰٪). نسبت‌دادن به سرمایه‌ی اولیه، افتِ یک حسابِ رشدکرده
+        را کوچک نشان می‌دهد.
+
+        بیشترین افتِ مبلغی و بیشترین افتِ درصدی **لزوماً یک‌جا نیستند** —
+        افتِ کوچک از یک قله‌ی کوچک می‌تواند درصدِ بزرگ‌تری بدهد. پس هر دو
+        جدا نگه داشته و زمانشان جدا گزارش می‌شود.
+
+        با فیلتر بازه، منحنی از **مانده‌ی ابتدای همان بازه** شروع می‌شود
+        (سرمایه‌ی اولیه به‌علاوه‌ی سود/زیانِ معاملاتِ پیش از بازه)، نه از
+        سرمایه‌ی اولیه — وگرنه افتِ یک ماهِ خاص با قله‌ای سنجیده می‌شد که
+        اصلاً در آن ماه وجود نداشت.
 
         ⚠️ فقط معاملاتِ **بسته‌شده** را می‌بیند: افتی که در دلِ یک
         موقعیتِ باز اتفاق افتاده و هنوز تحقق نیافته، اینجا نیست.
+
+        ⚠️ مبنای هر گام `pnl_absolute`ِ ثبت‌شده است. برای معامله‌هایی که
+        کارمزد ورودشان دانسته نیست، آن عدد کفِ زیان است نه قطعیِ آن.
         """
         account = self.store.get_account()
-        start = float(account["initial_balance"]) if account else 0.0
-        equity = start
-        peak = start
-        worst = 0.0
-        worst_at: str | None = None
-        for trade in self.store.list_trades(days):
+        initial = float(account["initial_balance"]) if account else 0.0
+
+        window = self.store.list_trades(days)
+        if days is None:
+            opening = initial
+        else:
+            # هر دو فهرست بر اساس `closed_at` صعودی‌اند و فیلتر یک
+            # «پسوند» است، پس معاملاتِ پیش از بازه همان ابتدای فهرست کل‌اند.
+            everything = self.store.list_trades(None)
+            prior = everything[: len(everything) - len(window)]
+            opening = initial + sum(float(t["pnl_absolute"]) for t in prior)
+
+        equity = peak = opening
+        worst_currency = 0.0
+        worst_currency_at: str | None = None
+        worst_pct = 0.0
+        worst_pct_at: str | None = None
+        for trade in window:
             equity += float(trade["pnl_absolute"])
             peak = max(peak, equity)
-            if peak - equity > worst:
-                worst = peak - equity
-                worst_at = str(trade["closed_at"])
+            drop = peak - equity
+            if drop > worst_currency:
+                worst_currency = drop
+                worst_currency_at = str(trade["closed_at"])
+            if peak > 0:
+                pct = drop / peak * 100.0
+                if pct > worst_pct:
+                    worst_pct = pct
+                    worst_pct_at = str(trade["closed_at"])
+
         return {
-            "max_drawdown_currency": worst,
-            "max_drawdown_pct": (worst / start * 100.0) if start > 0 else None,
-            "at": worst_at,
+            "opening_balance": opening,
+            "max_drawdown_currency": worst_currency,
+            "max_drawdown_currency_at": worst_currency_at,
+            "max_drawdown_pct": worst_pct,
+            "max_drawdown_pct_at": worst_pct_at,
+            "peak_relative": True,
             "basis": "realized_closed_trades",
         }
 

@@ -1293,19 +1293,28 @@ function paperValueRow(a) {
     a.valuation_complete ? null : `قیمت‌خورده: ${fmt(a.market_value_priced)}`,
   ));
 
+  // «خالص» فقط وقتی عدد می‌گیرد که هزینه‌های همان عملیات دانسته باشند.
+  // `fmt(null)` همان «—» است، و زیرنویس می‌گوید چرا.
   row.append(paperStat(
     "سود/زیان تحقق‌یافته",
     fmt(a.realized_net),
-    `ناخالص ${fmt(a.realized_gross)} − هزینه ${fmt(a.realized_costs)}`,
+    a.realized_net === null
+      ? `ناخالص ${fmt(a.realized_gross)} · هزینه‌ی ثبت‌شده ${fmt(a.realized_costs)} (ناقص)`
+      : `ناخالص ${fmt(a.realized_gross)} − هزینه ${fmt(a.realized_costs)}`,
     signClass(a.realized_net),
   ));
 
+  const unrealizedSub = () => {
+    if (a.unrealized_gross === null) return "ارزش‌گذاری ناقص";
+    if (a.unrealized_net === null) {
+      return `ناخالص ${fmt(a.unrealized_gross)} · کارمزد ورود نامعلوم`;
+    }
+    return `ناخالص ${fmt(a.unrealized_gross)} − کارمزد ورود ${fmt(a.open_entry_costs)}`;
+  };
   row.append(paperStat(
     "سود/زیان تحقق‌نیافته",
     fmt(a.unrealized_net),
-    a.unrealized_gross === null
-      ? "ارزش‌گذاری ناقص"
-      : `ناخالص ${fmt(a.unrealized_gross)} − کارمزد ورود ${fmt(a.open_entry_costs)}`,
+    unrealizedSub(),
     signClass(a.unrealized_net),
   ));
 
@@ -1335,21 +1344,28 @@ function paperNotices(a) {
     ));
   }
 
-  if (!a.costs_known) {
+  if (!a.rates_configured) {
     box.append(el(
       "div", "warnbar",
-      "هزینه مشخص نشده: نرخ کارمزد/مالیات وارد نشده و صفر فرض شده است، پس " +
-      "«خالص» همان «ناخالص» است و هزینه‌ی واقعی کارگزاری در آن نیست. " +
-      "نرخ خودتان را در تنظیمات بالا وارد کنید.",
+      "نرخ کارمزد/مالیات وارد نشده و برای معامله‌های بعدی صفر فرض می‌شود. " +
+      "نرخ خودتان را در تنظیمات بالا وارد کنید تا شبیه‌سازی واقعی‌تر شود. " +
+      "(این تنظیم روی معامله‌های گذشته اثری ندارد.)",
     ));
   }
 
-  if (a.trades_missing_entry_cost > 0) {
+  if (!a.costs_known) {
+    const parts = [];
+    if (a.trades_missing_entry_cost > 0) {
+      parts.push(`${fmt(a.trades_missing_entry_cost)} معامله‌ی بسته‌شده`);
+    }
+    if ((a.positions_with_unknown_cost || []).length) {
+      parts.push(`موقعیت ${a.positions_with_unknown_cost.join("، ")}`);
+    }
     box.append(el(
       "div", "warnbar",
-      `${fmt(a.trades_missing_entry_cost)} معامله‌ی قدیمی (پیش از تفکیک هزینه‌ها) ` +
-      "سهم کارمزد ورودشان ثبت نشده است؛ «تحقق‌یافته‌ی خالص» برای آن‌ها " +
-      "خوش‌بینانه است.",
+      `هزینه‌ی ${parts.join(" و ")} دانسته نیست (ثبت‌شده پیش از تفکیک ` +
+      "هزینه‌ها). تا آن موقع «خالص» به‌عنوان عدد قطعی نمایش داده نمی‌شود؛ " +
+      "ناخالص و هزینه‌های ثبت‌شده همچنان درست‌اند.",
     ));
   }
 
@@ -1459,18 +1475,34 @@ async function loadPaperPositions() {
 }
 
 async function settlePaperPosition(position, btn) {
+  const total = (p) => fmt(p * position.quantity * position.contract_size);
   const raw = prompt(
-    `قیمت تسویه‌ی هر قرارداد ${position.symbol}؟
-` +
-    "صفر هم معتبر است (انقضای بی‌ارزش). حدس زده نمی‌شود، پس خودتان وارد کنید.",
+    [
+      `پرمیوم تسویه‌ی ${position.symbol} به ازای هر واحد؟`,
+      `ارزش کل = قیمت × ${position.quantity} × ${position.contract_size}`,
+      "این فرضِ شماست، نه تسویه‌ی رسمی: قواعد اعمال بورس و هزینه‌ی خودِ",
+      "تسویه در این شبیه‌ساز پیاده نشده‌اند.",
+      "صفر معتبر است (انقضای بی‌ارزش) ولی باید صریح وارد شود.",
+    ].join("\n"),
     "",
   );
   if (raw === null) return;
-  const price = Number(raw);
-  if (!Number.isFinite(price) || price < 0) {
-    toast("قیمت تسویه باید یک عدد نامنفی باشد.", "bad");
+  // ⚠️ `Number("")` و `Number("   ")` هر دو صفر می‌دهند. بدون این بررسی،
+  // زدنِ OK روی فیلد خالی به «تسویه با قیمت صفر» تعبیر می‌شد — یعنی حساب
+  // موقعیت را بی‌ارزش می‌بست بی‌آنکه کاربر چنین گفته باشد.
+  if (raw.trim() === "") {
+    toast("قیمت تسویه وارد نشد. صفر باید صریح نوشته شود.", "bad");
     return;
   }
+  const price = Number(raw);
+  if (!Number.isFinite(price) || price < 0) {
+    toast("قیمت تسویه باید یک عدد متناهیِ نامنفی باشد.", "bad");
+    return;
+  }
+  if (!confirm(
+    `تسویه‌ی ${position.symbol} با پرمیوم ${fmt(price)} هر واحد` +
+    ` — ارزش کل ${total(price)} ریال.\nادامه؟`
+  )) return;
   btn.disabled = true;
   try {
     await api("/api/paper-trading/settle", {

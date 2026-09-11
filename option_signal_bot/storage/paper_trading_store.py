@@ -9,11 +9,18 @@
 حسابِ نیمه‌تغییرکرده می‌ماند: پول کم شده ولی موقعیتی ثبت نشده. با این
 context manager همه‌ی نوشتن‌ها یک‌جا commit یا یک‌جا rollback می‌شوند.
 
-**نسخه‌ی اسکیما ۲** — ستون‌های تازه‌ای اضافه شده تا هزینه‌ی ورود و خروج
-از هم جدا بماند. مهاجرت **حافظِ داده** است: ستون‌ها با `ALTER TABLE`
-اضافه می‌شوند و ردیف‌های موجود می‌مانند. چیزی که دانسته نیست (سهم کارمزد
-ورودِ معاملات قدیمی) `NULL` می‌ماند و صفر **فرض نمی‌شود** — وگرنه
-خالصِ آن معاملات بی‌سروصدا خوش‌بینانه می‌شد.
+**نسخه‌ی اسکیما ۳** — مهاجرت **حافظِ داده** است: ستون‌ها با `ALTER TABLE`
+اضافه می‌شوند و هیچ ردیفی حذف یا بازنویسی نمی‌شود.
+
+* نسخه ۲: هزینه‌ی ورود و خروج از هم جدا شد.
+* نسخه ۳: `entry_fees_known` روی موقعیت‌ها.
+
+چیزی که دانسته نیست، `NULL` یا «نامعلوم» می‌ماند و صفر **فرض نمی‌شود**.
+برای معامله‌ها این `entry_fee IS NULL` است؛ برای موقعیت‌های باز، ستون
+عددی `entry_fees` نمی‌توانست `NULL` بگیرد (ALTER TABLE با NOT NULL
+پیش‌فرض پر می‌کند)، پس یک پرچم جدا آمد. بدون آن، صفرِ پیش‌فرضِ مهاجرت
+از صفرِ واقعی قابل تشخیص نبود و خالصِ آن موقعیت‌ها بی‌سروصدا خوش‌بینانه
+می‌شد.
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 #: نسخه‌ی جاری اسکیما. با هر تغییر ساختاری یکی بالا می‌رود.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_meta (
@@ -68,7 +75,9 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     average_price   REAL NOT NULL,
     opened_at       TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
-    entry_fees      REAL NOT NULL DEFAULT 0
+    entry_fees      REAL NOT NULL DEFAULT 0,
+    -- ۰ یعنی «کارمزد ورودِ این موقعیت دانسته نیست»، نه «صفر بوده».
+    entry_fees_known INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS paper_trades (
@@ -93,15 +102,16 @@ CREATE TABLE IF NOT EXISTS paper_trades (
 CREATE INDEX IF NOT EXISTS idx_paper_trades_closed_at ON paper_trades(closed_at);
 """
 
-#: ستون‌هایی که در نسخه‌ی ۲ اضافه شده‌اند: (جدول، ستون، تعریف).
+#: ستون‌هایی که بعد از نسخه‌ی ۱ اضافه شده‌اند: (جدول، ستون، تعریف).
 #: ترتیب مهم نیست؛ هرکدام که نباشد اضافه می‌شود.
-_V2_COLUMNS: tuple[tuple[str, str, str], ...] = (
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("paper_positions", "entry_fees", "REAL NOT NULL DEFAULT 0"),
     ("paper_trades", "gross_pnl", "REAL"),
     ("paper_trades", "entry_fee", "REAL"),
     ("paper_trades", "exit_fee", "REAL"),
     ("paper_trades", "return_on_cost_pct", "REAL"),
     ("paper_trades", "contract_size", "INTEGER"),
+    ("paper_positions", "entry_fees_known", "INTEGER NOT NULL DEFAULT 1"),
 )
 
 
@@ -164,7 +174,7 @@ class PaperTradingStore:
             return
 
         added = 0
-        for table, column, definition in _V2_COLUMNS:
+        for table, column, definition in _ADDED_COLUMNS:
             if column in self._columns(table):
                 continue
             self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -181,6 +191,12 @@ class PaperTradingStore:
              WHERE exit_fee IS NULL OR gross_pnl IS NULL
             """
         )
+        # موقعیت‌هایی که **پیش از** این ارتقا وجود داشته‌اند: نمی‌شود ثابت
+        # کرد کارمزد ورودشان ثبت شده بوده، پس «نامعلوم» علامت می‌خورند.
+        # صفرِ پیش‌فرضِ ALTER TABLE نباید به‌عنوان صفرِ قطعی خوانده شود.
+        if version and version < 3:
+            self._connection.execute("UPDATE paper_positions SET entry_fees_known = 0")
+
         self._set_meta("schema_version", str(SCHEMA_VERSION))
         if added or version:
             logger.info(
@@ -288,12 +304,17 @@ class PaperTradingStore:
         average_price: float,
         opened_at: str,
         entry_fees: float = 0.0,
+        entry_fees_known: bool = True,
     ) -> None:
         """ثبت یا به‌روزرسانی پوزیشن. `quantity <= 0` یعنی صاف‌شده — حذف می‌شود.
 
         `entry_fees` کارمزدِ ورودِ **پرداخت‌شده‌ی** همین تعدادِ باقی‌مانده
         است. با هر خروج جزئی باید به نسبت کم شود، وگرنه هزینه‌ای که
         سهمش به معامله‌ی بسته‌شده رفته، دوباره روی موقعیت هم می‌ماند.
+
+        `entry_fees_known=False` یعنی عددِ بالا دانسته نیست (موقعیتی که
+        از نسخه‌ی قدیمی مهاجرت کرده). آن‌وقت «خالص» برای این موقعیت
+        محاسبه نمی‌شود؛ صفر فرض کردنش یعنی ادعای چیزی که نمی‌دانیم.
         """
         if quantity <= 0:
             self.delete_position(symbol)
@@ -302,16 +323,19 @@ class PaperTradingStore:
         self._connection.execute(
             """
             INSERT INTO paper_positions (
-                symbol, quantity, average_price, opened_at, updated_at, entry_fees
+                symbol, quantity, average_price, opened_at, updated_at,
+                entry_fees, entry_fees_known
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 quantity = excluded.quantity,
                 average_price = excluded.average_price,
                 updated_at = excluded.updated_at,
-                entry_fees = excluded.entry_fees
+                entry_fees = excluded.entry_fees,
+                entry_fees_known = excluded.entry_fees_known
             """,
-            (symbol, quantity, average_price, opened_at, now, entry_fees),
+            (symbol, quantity, average_price, opened_at, now, entry_fees,
+             int(entry_fees_known)),
         )
         self._commit()
 

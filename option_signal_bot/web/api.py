@@ -22,8 +22,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -51,6 +52,33 @@ app = FastAPI(title="GarnetTrader — داشبورد سیگنال", docs_url="/a
 
 #: قفل، تا دو درخواست همزمان یک پاس رصد را دوبار اجرا نکنند
 _scan_lock = asyncio.Lock()
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(
+    request: Request,  # noqa: ARG001 — امضا را خودِ FastAPI تعیین می‌کند
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """۴۲۲ تمیز، حتی وقتی ورودیِ رد‌شده خودش JSON نمی‌شود.
+
+    پاسخ پیش‌فرض FastAPI مقدارِ ورودی را در بدنه بازمی‌تاباند. برای
+    `inf`/`nan` همان بازتاباندن با `Out of range float values are not
+    JSON compliant` می‌شکست و کاربر به‌جای «رد شد» یک خطای سرور می‌گرفت.
+    """
+    errors = []
+    for error in exc.errors():
+        safe = {k: v for k, v in error.items() if k != "input"}
+        value = error.get("input")
+        try:
+            # ⚠️ `allow_nan=False` لازم است: `json.dumps` پیش‌فرض برای
+            # `inf` رشته‌ی غیراستاندارد `Infinity` می‌سازد و بی‌صدا رد
+            # می‌شود، بعد خودِ پاسخ سر سریالایز شدن می‌شکند.
+            json.dumps(value, allow_nan=False)
+            safe["input"] = value
+        except (TypeError, ValueError):
+            safe["input"] = repr(value)
+        errors.append(safe)
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 # ----------------------------------------------------------------------
@@ -768,12 +796,20 @@ class PaperOrderRequest(BaseModel):
 
 
 class PaperSettleRequest(BaseModel):
-    """تسویه‌ی دستیِ یک موقعیتِ سررسیدشده."""
+    """ثبتِ **فرضِ کاربر** برای تعیین تکلیف یک موقعیتِ سررسیدشده.
+
+    این تسویه‌ی رسمی نیست: قواعد اعمال و تسویه‌ی بورس تهران پیاده نشده‌اند
+    و هزینه‌ی خودِ تسویه هم مدل نشده است.
+    """
 
     symbol: str
-    #: قیمت تسویه‌ی هر قرارداد. صفر مجاز است (انقضای بی‌ارزش) ولی
-    #: پیش‌فرض ندارد: حدس زدنش همان کاری است که این تغییر جلویش را گرفت.
-    settlement_price: float
+    #: پرمیوم تسویه **به ازای هر واحد** — همان مبنای بقیه‌ی قیمت‌های
+    #: پروژه. ارزش کل = قیمت × تعداد × اندازه‌ی قرارداد.
+    #:
+    #: صفر مجاز است (انقضای بی‌ارزش) ولی پیش‌فرض ندارد: حدس زدنش همان
+    #: کاری است که این تغییر جلویش را گرفت. `allow_inf_nan=False` چون
+    #: `inf` نقد را بی‌نهایت می‌کند و `nan` هر کنترلی را بی‌صدا رد.
+    settlement_price: float = Field(ge=0, allow_inf_nan=False)
 
 
 @app.get("/api/datasource")
@@ -1109,6 +1145,8 @@ def _serialize_valuation(v: Any) -> dict[str, Any]:
         "contract_size": v.contract_size,
         "average_price": v.average_price,
         "entry_fees_open": v.entry_fees_open,
+        "entry_fees_known": v.entry_fees_known,
+        "gross_cost": v.gross_cost,
         "cost_basis": v.cost_basis,
         "status": v.status.value,
         "status_label": v.status_label,
@@ -1150,11 +1188,18 @@ def _serialize_snapshot(snapshot: Any) -> dict[str, Any]:
         "realized_trade_count": realized.trade_count,
         "realized_costs_complete": realized.costs_complete,
         "trades_missing_entry_cost": realized.trades_missing_entry_cost,
+        "trades_missing_exit_cost": realized.trades_missing_exit_cost,
         "unrealized_gross": snapshot.unrealized_gross,
         "unrealized_net": snapshot.unrealized_net,
         "open_entry_costs": snapshot.open_entry_costs,
-        "total_costs_paid": snapshot.total_costs_paid,
+        "total_costs_recorded": snapshot.total_costs_recorded,
+        # «هزینه دانسته است» فقط از داده‌ی ثبت‌شده می‌آید؛ «نرخ تنظیم شده»
+        # جداست و فقط درباره‌ی معامله‌های بعدی حرف می‌زند.
         "costs_known": snapshot.costs_known,
+        "rates_configured": snapshot.rates_configured,
+        "positions_with_unknown_cost": [
+            p.symbol for p in snapshot.positions_with_unknown_cost
+        ],
         # --- ارزش کل ---
         "equity": snapshot.equity,
         "equity_priced_part": snapshot.equity_priced_part,
@@ -1218,11 +1263,15 @@ async def get_paper_account() -> dict[str, Any]:
 
 @app.post("/api/paper-trading/settle")
 async def settle_paper_position(request: PaperSettleRequest) -> dict[str, Any]:
-    """تسویه‌ی دستیِ یک موقعیتِ سررسیدشده، با قیمتی که کاربر می‌دهد.
+    """ثبتِ فرضِ کاربر برای تعیین تکلیف یک موقعیتِ سررسیدشده.
 
-    قیمت از بیرون گرفته می‌شود چون قواعد رسمی تسویه‌ی بورس تهران در این
-    پروژه نیست و حدس زده نمی‌شود. صفر قیمتِ معتبری است: «اختیار بی‌ارزش
-    منقضی شد» همان تسویه‌ی صفر است.
+    ⚠️ این «تسویه‌ی رسمی» نیست و وانمود هم نمی‌کند که هست: قواعد اعمال و
+    تسویه‌ی بورس تهران در این پروژه پیاده نشده‌اند و هزینه‌ی خودِ تسویه
+    هم مدل نشده است. تنها کاری که می‌کند ثبتِ عددی است که **کاربر فرض
+    می‌کند**، تا موقعیت بسته شود و ارزش‌گذاری معلق نماند.
+
+    `settlement_price` پرمیوم **هر واحد** است، نه ارزش کل قرارداد؛ ارزش
+    کل از `قیمت × تعداد × اندازه‌ی قرارداد` در می‌آید.
     """
     settings = _settings()
     _require_paper_trading_enabled(settings)
@@ -1241,7 +1290,15 @@ async def settle_paper_position(request: PaperSettleRequest) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("تسویه‌ی موقعیت کاغذی ناموفق بود.")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"ok": True, "trade": trade}
+    return {
+        "ok": True,
+        "trade": trade,
+        "basis": "user_assumption",
+        "note": (
+            "این عدد فرضِ شماست، نه تسویه‌ی رسمی: قواعد اعمال و تسویه‌ی "
+            "بورس و هزینه‌ی خودِ تسویه در این شبیه‌ساز پیاده نشده‌اند."
+        ),
+    }
 
 
 @app.get("/api/paper-trading/report")

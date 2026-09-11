@@ -159,7 +159,7 @@ def test_scenario_full_exit_counts_both_fees_exactly_once(tmp_path):
     assert snapshot.realized.costs == pytest.approx(23_000.0)
     assert snapshot.realized.net == pytest.approx(977_000.0)
     # هزینه‌ها یک بار: کل پرداختی = ۵٬۰۰۰ + ۱۸٬۰۰۰
-    assert snapshot.total_costs_paid == pytest.approx(23_000.0)
+    assert snapshot.total_costs_recorded == pytest.approx(23_000.0)
     assert snapshot.reconciliation["ok"] is True
 
 
@@ -208,7 +208,7 @@ def test_scenario_partial_exit_splits_quantity_and_cost(tmp_path):
     # کارمزد ورود نه گم شد نه دو بار شمرده شد: ۴٬۰۰۰ رفت + ۶٬۰۰۰ ماند
     assert snapshot.realized.entry_costs == pytest.approx(4_000.0)
     assert snapshot.open_entry_costs == pytest.approx(6_000.0)
-    assert snapshot.total_costs_paid == pytest.approx(10_000.0 + 14_400.0)
+    assert snapshot.total_costs_recorded == pytest.approx(10_000.0 + 14_400.0)
     assert snapshot.reconciliation["ok"] is True
 
 
@@ -350,21 +350,29 @@ def test_insufficient_exit_depth_is_not_marked_at_a_partial_price(tmp_path):
 # ======================================================================
 # سناریو ۶ — هزینه‌ی مشخص‌نشده
 # ======================================================================
-def test_costs_unknown_when_no_rate_is_configured(tmp_path):
-    """با نرخ صفر، «خالص» فقط تکرارِ «ناخالص» است و باید علامت بخورد."""
+def test_zero_rates_are_recorded_costs_not_unknown_costs(tmp_path):
+    """نرخ صفر یعنی هزینه **صفر بوده**، نه اینکه دانسته نیست.
+
+    این دو با هم فرق دارند: هزینه‌ی ثبت‌شده‌ی صفر یک واقعیت است و خالص
+    را معنادار می‌گذارد؛ «دانسته نیست» یعنی نمی‌شود خالص داد. پرچمِ
+    جدا (`rates_configured`) فقط می‌گوید برای معامله‌های **بعدی** نرخی
+    وارد نشده.
+    """
     broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0), fees=FeeSchedule())
     broker.place_order(SYMBOL, "buy", 5)
     broker.place_order(SYMBOL, "sell", 5)
 
     snapshot = broker.account_snapshot()
-    assert snapshot.costs_known is False
+    assert snapshot.rates_configured is False
+    assert snapshot.costs_known is True
     assert snapshot.realized.gross == pytest.approx(1_000_000.0)
     assert snapshot.realized.costs == 0.0
+    assert snapshot.realized.net == pytest.approx(1_000_000.0)
 
 
-def test_costs_known_once_a_rate_is_configured(tmp_path):
+def test_rates_configured_is_reported_separately(tmp_path):
     broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0))
-    assert broker.account_snapshot().costs_known is True
+    assert broker.account_snapshot().rates_configured is True
 
 
 # ======================================================================
@@ -414,43 +422,146 @@ def test_a_failed_settlement_leaves_the_position_untouched(tmp_path):
 
 
 # ======================================================================
-# سناریو ۸ — افت حساب از ریال، نه از جمع درصدها
+# سناریو ۸ — افت حساب: از قله‌ی مرتبط، نه از سرمایه‌ی اولیه
 # ======================================================================
-def test_account_drawdown_is_measured_in_currency_not_summed_percentages(tmp_path):
-    """دو معامله: اولی +۹۷۷٬۰۰۰ و دومی زیان‌ده.
+def _seed_trades(store, pnls, initial=INITIAL):
+    """چند معامله‌ی بسته‌شده‌ی ساختگی با سود/زیانِ معین و زمانِ صعودی.
 
-    افتِ حساب باید از منحنیِ ریالیِ حساب بیرون بیاید. جمعِ درصدها
-    اندازه‌ی موقعیت را نمی‌بیند و عددش با افتِ واقعیِ سرمایه نسبتی
-    ندارد.
+    اینجا عمداً مستقیم در پایگاه نوشته می‌شود، نه از مسیر سفارش: هدف
+    سنجیدنِ **منحنی افت** است و ساختن هر عدد از راه دفتر سفارش، تست را
+    به چیزی که موضوعش نیست گره می‌زد.
     """
-    contract = _contract()
-    store = PaperTradingStore(tmp_path / "paper.db")
-    books: dict[str, OrderBook | None] = {INS_CODE: _book(bid=1_200.0, ask=1_000.0, qty=100)}
-    broker = PaperBroker(
-        store=store,
-        order_book_client=FakeBooks(books),
-        resolve_contract=lambda s: contract if s == SYMBOL else None,
-        initial_balance=INITIAL,
-        fees=FEES,
-    )
-    broker.place_order(SYMBOL, "buy", 5)
-    broker.place_order(SYMBOL, "sell", 5)  # سود
+    store.init_account(initial)
+    for index, pnl in enumerate(pnls, start=1):
+        store.record_trade({
+            "trade_id": f"t{index}",
+            "symbol": SYMBOL,
+            "quantity": 1,
+            "entry_price": 1_000.0,
+            "exit_price": 1_000.0,
+            "fee_paid": 0.0,
+            "entry_fee": 0.0,
+            "exit_fee": 0.0,
+            "gross_pnl": pnl,
+            "pnl_absolute": pnl,
+            "pnl_pct": 0.0,
+            "return_on_cost_pct": 0.0,
+            "contract_size": CONTRACT_SIZE,
+            "opened_at": f"2026-01-{index:02d}T09:00:00",
+            "closed_at": f"2026-01-{index:02d}T12:00:00",
+            "signal_id": None,
+            "close_reason": "manual",
+        })
 
-    books[INS_CODE] = _book(bid=400.0, ask=1_000.0, qty=100)
-    broker.place_order(SYMBOL, "buy", 5)
-    broker.place_order(SYMBOL, "sell", 5)  # زیان
+
+def test_drawdown_percentage_is_measured_from_the_relevant_peak(tmp_path):
+    """مثال پذیرش: ۱۰۰ → ۲۰۰ → ۱۵۰.
+
+    افتِ مبلغی ۵۰ است و افتِ درصدی **۲۵٪** (۵۰ از قله‌ی ۲۰۰)، نه ۵۰٪
+    که نسبت به سرمایه‌ی اولیه‌ی ۱۰۰ در می‌آمد. نسبت‌دادن به سرمایه‌ی
+    اولیه، افتِ یک حسابِ رشدکرده را کوچک‌تر از واقع نشان می‌دهد.
+    """
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0), balance=100.0)
+    _seed_trades(broker.store, [100.0, -50.0], initial=100.0)
 
     drawdown = broker.realized_drawdown()
+
+    assert drawdown["opening_balance"] == pytest.approx(100.0)
+    assert drawdown["max_drawdown_currency"] == pytest.approx(50.0)
+    assert drawdown["max_drawdown_pct"] == pytest.approx(25.0)
+    assert drawdown["peak_relative"] is True
     assert drawdown["basis"] == "realized_closed_trades"
-    assert drawdown["max_drawdown_currency"] > 0
-    # درصد افت نسبت به سرمایه‌ی اولیه است، نه جمع درصد معاملات.
-    assert drawdown["max_drawdown_pct"] == pytest.approx(
-        drawdown["max_drawdown_currency"] / INITIAL * 100.0
-    )
+
+
+def test_biggest_currency_and_percent_drawdowns_can_be_different_points(tmp_path):
+    """بیشترین افتِ مبلغی و درصدی لزوماً یک‌جا نیستند.
+
+    مسیر: ۱۰۰ → ۱۲۰ → ۶۰ → ۳۶۰ → ۲۶۰.
+        افت اول: از قله‌ی ۱۲۰ به ۶۰  → مبلغی ۶۰،  درصدی ۵۰٪
+        افت دوم: از قله‌ی ۳۶۰ به ۲۶۰ → مبلغی ۱۰۰، درصدی ۲۷٫۷۸٪
+
+    پس بیشترین مبلغی ۱۰۰ (در گام آخر) و بیشترین درصدی ۵۰٪ (در گام دوم)
+    است. گزارشِ یک عدد به‌جای هر دو، یکی از این دو را پنهان می‌کرد.
+    """
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0), balance=100.0)
+    _seed_trades(broker.store, [20.0, -60.0, 300.0, -100.0], initial=100.0)
+
+    drawdown = broker.realized_drawdown()
+
+    assert drawdown["max_drawdown_currency"] == pytest.approx(100.0)
+    assert drawdown["max_drawdown_currency_at"] == "2026-01-04T12:00:00"
+    assert drawdown["max_drawdown_pct"] == pytest.approx(50.0)
+    assert drawdown["max_drawdown_pct_at"] == "2026-01-02T12:00:00"
+    assert drawdown["max_drawdown_currency_at"] != drawdown["max_drawdown_pct_at"]
+
+
+def test_windowed_drawdown_starts_from_the_balance_at_the_window_start(tmp_path):
+    """با فیلتر بازه، منحنی از مانده‌ی ابتدای همان بازه شروع می‌شود.
+
+    دو معامله‌ی قدیمی (+۹۰۰ و +۱۰۰) حساب را از ۱۰۰ به ۱۱۰۰ می‌برند و
+    بیرون بازه‌اند. داخل بازه یک زیانِ ۱۱۰ هست. افت باید ۱۱۰ از قله‌ی
+    ۱۱۰۰ باشد (۱۰٪) — نه چیزی که از سرمایه‌ی اولیه‌ی ۱۰۰ حساب شود، که
+    عددی بی‌معنا (۱۱۰٪) می‌داد.
+    """
+    from datetime import datetime, timedelta
+
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0), balance=100.0)
+    store = broker.store
+    store.init_account(100.0)
+    old = (datetime.now() - timedelta(days=40)).isoformat(timespec="seconds")
+    recent = (datetime.now() - timedelta(days=1)).isoformat(timespec="seconds")
+
+    def add(trade_id, pnl, closed_at):
+        store.record_trade({
+            "trade_id": trade_id, "symbol": SYMBOL, "quantity": 1,
+            "entry_price": 1_000.0, "exit_price": 1_000.0, "fee_paid": 0.0,
+            "entry_fee": 0.0, "exit_fee": 0.0, "gross_pnl": pnl,
+            "pnl_absolute": pnl, "pnl_pct": 0.0, "return_on_cost_pct": 0.0,
+            "contract_size": CONTRACT_SIZE, "opened_at": closed_at,
+            "closed_at": closed_at, "signal_id": None, "close_reason": "manual",
+        })
+
+    add("old1", 900.0, old)
+    add("old2", 100.0, old)
+    add("new1", -110.0, recent)
+
+    windowed = broker.realized_drawdown(days=7)
+
+    assert windowed["opening_balance"] == pytest.approx(1_100.0)
+    assert windowed["max_drawdown_currency"] == pytest.approx(110.0)
+    assert windowed["max_drawdown_pct"] == pytest.approx(10.0)
+
+    # بدون فیلتر، همان حساب از ۱۰۰ شروع می‌شود و افتش همان ۱۱۰ است،
+    # ولی نسبت به قله‌ی ۱۱۰۰ — نه به ۱۰۰.
+    full = broker.realized_drawdown()
+    assert full["opening_balance"] == pytest.approx(100.0)
+    assert full["max_drawdown_pct"] == pytest.approx(10.0)
+
+
+def test_a_rising_account_reports_no_drawdown(tmp_path):
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0), balance=100.0)
+    _seed_trades(broker.store, [10.0, 20.0, 30.0], initial=100.0)
+
+    drawdown = broker.realized_drawdown()
+
+    assert drawdown["max_drawdown_currency"] == 0.0
+    assert drawdown["max_drawdown_pct"] == 0.0
+    assert drawdown["max_drawdown_currency_at"] is None
+
+
+def test_performance_summary_keeps_account_and_signal_metrics_apart(tmp_path):
+    """افتِ حساب و معیارِ سطحِ سیگنال دو چیزند و قاطی نمی‌شوند."""
+    broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0, qty=100))
+    broker.place_order(SYMBOL, "buy", 5)
+    broker.place_order(SYMBOL, "sell", 5)
 
     summary = broker.performance_summary()
-    assert summary["account_drawdown"] == drawdown
+
+    assert summary["account_drawdown"] == broker.realized_drawdown()
+    assert summary["account_drawdown"]["basis"] == "realized_closed_trades"
     assert "signal_level_note" in summary
+    # معیارِ سطحِ سیگنال هنوز سر جایش است و جای افتِ حساب را نمی‌گیرد.
+    assert "max_drawdown_pct" in summary
 
 
 # ======================================================================
@@ -486,3 +597,172 @@ def test_reconciliation_holds_through_a_mixed_sequence(tmp_path):
         + snapshot.realized.net
         + snapshot.unrealized_net
     )
+
+
+# ======================================================================
+# رگرسیون بازبینی دوم PR #5
+# ======================================================================
+def test_settlement_rejects_non_finite_prices(tmp_path):
+    """`inf` و `nan` باید در لایه‌ی مالی رد شوند، نه اینکه پخش شوند.
+
+    `inf` نقد را بی‌نهایت می‌کند و `nan` هر مقایسه‌ای را `False` — یعنی
+    کنترل‌های بعدی بی‌صدا از کار می‌افتند. خرابیِ فوری بهتر است.
+    """
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0))
+    broker.place_order(SYMBOL, "buy", 4)
+    expired = _contract(expiry_days=-1)
+    broker.resolve_contract = lambda s: expired if s == SYMBOL else None
+    cash_before = broker.get_account_balance()["cash"]
+
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError, match="متناهی"):
+            broker.settle_position(SYMBOL, settlement_price=bad)
+
+    assert broker.get_account_balance()["cash"] == pytest.approx(cash_before)
+    assert broker.store.get_position(SYMBOL)["quantity"] == 4
+
+
+def test_settlement_price_is_per_unit_not_per_contract(tmp_path):
+    """واحدِ ورودی همان مبنای بقیه‌ی قیمت‌هاست: پرمیوم هر واحد.
+
+    دستی: تسویه با ۵۰۰ روی ۴ قرارداد × اندازه ۱۰۰۰
+        دریافتی = ۵۰۰ × ۴ × ۱۰۰۰ = ۲٬۰۰۰٬۰۰۰
+        کارمزد خروج = ۲٬۰۰۰٬۰۰۰ × ۰٫۰۰۳ = ۶٬۰۰۰
+    اگر عدد «قیمت هر قرارداد» تفسیر می‌شد، دریافتی ۲٬۰۰۰ می‌شد —
+    هزار برابر کمتر.
+    """
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0))
+    broker.place_order(SYMBOL, "buy", 4)
+    expired = _contract(expiry_days=-1)
+    broker.resolve_contract = lambda s: expired if s == SYMBOL else None
+    cash_before = broker.get_account_balance()["cash"]
+
+    trade = broker.settle_position(SYMBOL, settlement_price=500.0)
+
+    assert trade["exit_price"] == 500.0
+    assert trade["contract_size"] == CONTRACT_SIZE
+    assert trade["exit_fee"] == pytest.approx(6_000.0)
+    assert broker.get_account_balance()["cash"] == pytest.approx(
+        cash_before + 2_000_000.0 - 6_000.0
+    )
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_orders_on_an_expired_contract_are_refused(tmp_path, side):
+    """سفارش عادی روی قرارداد گذشته از سررسید، حتی با دفتر سفارشِ موجود.
+
+    منبع ممکن است هنوز برای نماد سررسیدشده مظنه بدهد؛ پر کردنِ سفارش
+    یعنی حسابی که با قراردادی معامله کرده که دیگر وجود ندارد.
+    """
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0, qty=100))
+    broker.place_order(SYMBOL, "buy", 4)  # موقعیتِ باز، پیش از سررسید
+    expired = _contract(expiry_days=-1)
+    broker.resolve_contract = lambda s: expired if s == SYMBOL else None
+
+    cash_before = broker.get_account_balance()["cash"]
+    position_before = broker.store.get_position(SYMBOL)
+
+    order = broker.place_order(SYMBOL, side, 2)
+
+    assert order.status.value == "rejected"
+    assert "سررسید" in order.metadata["reason"]
+    assert broker.get_account_balance()["cash"] == pytest.approx(cash_before)
+    assert broker.store.get_position(SYMBOL) == position_before
+    assert broker.store.list_trades() == [], "معامله‌ای نباید ثبت شده باشد"
+
+
+def test_the_manual_path_still_works_for_an_expired_contract(tmp_path):
+    """مسیر تعیین تکلیف دستی از سفارش عادی جداست و بسته نمی‌شود."""
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0))
+    broker.place_order(SYMBOL, "buy", 4)
+    expired = _contract(expiry_days=-1)
+    broker.resolve_contract = lambda s: expired if s == SYMBOL else None
+
+    assert broker.place_order(SYMBOL, "sell", 4).status.value == "rejected"
+    trade = broker.settle_position(SYMBOL, settlement_price=0.0)
+
+    assert trade["exit_price"] == 0.0
+    assert broker.get_positions() == []
+
+
+def test_todays_rate_does_not_make_yesterdays_unknown_cost_known(tmp_path):
+    """تنظیم نرخ امروز نباید هزینه‌ی نامعلومِ معامله‌ی قدیمی را معلوم کند.
+
+    معامله‌ی مهاجرت‌شده `entry_fee IS NULL` دارد. با نرخِ **تنظیم‌شده**،
+    رفتار قبلی `costs_known` را `True` می‌کرد و «خالص»ی نشان می‌داد که
+    یک جزء ناشناخته داشت.
+    """
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0))
+    broker.store.record_trade({
+        "trade_id": "legacy", "symbol": SYMBOL, "quantity": 1,
+        "entry_price": 1_000.0, "exit_price": 1_200.0, "fee_paid": 30.0,
+        "entry_fee": None, "exit_fee": 30.0, "gross_pnl": 200_000.0,
+        "pnl_absolute": 199_970.0, "pnl_pct": 0.0, "return_on_cost_pct": None,
+        "contract_size": CONTRACT_SIZE, "opened_at": "2026-01-01T09:00:00",
+        "closed_at": "2026-01-02T12:00:00", "signal_id": None,
+        "close_reason": "manual",
+    })
+
+    snapshot = broker.account_snapshot()
+
+    assert snapshot.rates_configured is True, "نرخ امروز تنظیم شده است"
+    assert snapshot.costs_known is False, "ولی هزینه‌ی آن معامله دانسته نیست"
+    assert snapshot.realized.net is None, "خالصِ قطعی نباید داده شود"
+    # ناخالص و هزینه‌های ثبت‌شده همچنان قابل نمایش‌اند.
+    assert snapshot.realized.gross == pytest.approx(200_000.0)
+    assert snapshot.realized.costs == pytest.approx(30.0)
+    assert snapshot.reconciliation["applicable"] is False
+
+
+def test_a_migrated_position_never_reports_a_confident_net(tmp_path):
+    """کارمزد ورودِ نامعلومِ یک موقعیت، صفرِ قطعی فرض نمی‌شود."""
+    broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0, qty=100))
+    broker.store.upsert_position(
+        SYMBOL, 5, 1_000.0, "2026-01-01T09:00:00",
+        entry_fees=0.0, entry_fees_known=False,
+    )
+
+    snapshot = broker.account_snapshot()
+    valuation = snapshot.positions[0]
+
+    assert valuation.entry_fees_known is False
+    assert valuation.unrealized_gross == pytest.approx(1_000_000.0), "ناخالص معلوم است"
+    assert valuation.unrealized_net is None, "خالص نه"
+    assert valuation.cost_basis is None
+    assert snapshot.unrealized_net is None
+    assert snapshot.costs_known is False
+    # ارزش کل حساب به هزینه وابسته نیست و همچنان عدد دارد.
+    assert snapshot.equity is not None
+    assert snapshot.reconciliation["applicable"] is False
+
+
+def test_closing_a_migrated_position_keeps_the_cost_unknown(tmp_path):
+    """سهمی از عددی که دانسته نیست، خودش هم دانسته نیست."""
+    broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0, qty=100))
+    broker.store.upsert_position(
+        SYMBOL, 10, 1_000.0, "2026-01-01T09:00:00",
+        entry_fees=0.0, entry_fees_known=False,
+    )
+
+    broker.place_order(SYMBOL, "sell", 4)
+
+    trade = broker.store.list_trades()[0]
+    assert trade["entry_fee"] is None
+    assert trade["gross_pnl"] == pytest.approx(800_000.0)
+    # موقعیتِ باقی‌مانده هم همچنان نامعلوم می‌ماند.
+    assert broker.store.get_position(SYMBOL)["entry_fees_known"] == 0
+    assert broker.account_snapshot().costs_known is False
+
+
+def test_buying_into_a_migrated_position_keeps_the_cost_unknown(tmp_path):
+    """خرید تازه روی موقعیتِ نامعلوم، جمع را معلوم نمی‌کند."""
+    broker = _broker(tmp_path, _book(bid=950.0, ask=1_000.0, qty=100))
+    broker.store.upsert_position(
+        SYMBOL, 5, 1_000.0, "2026-01-01T09:00:00",
+        entry_fees=0.0, entry_fees_known=False,
+    )
+
+    broker.place_order(SYMBOL, "buy", 5)
+
+    assert broker.store.get_position(SYMBOL)["entry_fees_known"] == 0
+    assert broker.account_snapshot().costs_known is False

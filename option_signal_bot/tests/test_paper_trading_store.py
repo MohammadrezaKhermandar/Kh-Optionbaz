@@ -221,7 +221,7 @@ def test_migration_keeps_existing_rows(tmp_path):
 
     store = PaperTradingStore(path)
 
-    assert store.schema_version == 2
+    assert store.schema_version == 3
     assert store.get_account()["cash"] == 900.0
     assert store.get_account()["initial_balance"] == 1000.0
     position = store.get_position("ضخود7001")
@@ -247,7 +247,11 @@ def test_migration_rebuilds_what_is_derivable_and_leaves_the_rest_unknown(tmp_pa
     assert trade["exit_fee"] == 30.0, "کارمزد خروج همان fee_paid قدیمی است"
     assert trade["gross_pnl"] == 100.0, "۷۰ + ۳۰ = ناخالص"
     assert trade["entry_fee"] is None, "دانسته نیست، پس صفر هم نمی‌شود"
-    assert store.get_position("ضخود7001")["entry_fees"] == 0.0
+    position = store.get_position("ضخود7001")
+    assert position["entry_fees"] == 0.0
+    assert position["entry_fees_known"] == 0, (
+        "صفرِ پیش‌فرضِ مهاجرت نباید صفرِ قطعی خوانده شود"
+    )
     store.close()
 
 
@@ -257,7 +261,7 @@ def test_migration_is_idempotent(tmp_path):
     PaperTradingStore(path).close()
 
     store = PaperTradingStore(path)
-    assert store.schema_version == 2
+    assert store.schema_version == 3
     assert len(store.list_trades()) == 1
     assert store.get_account()["cash"] == 900.0
     store.close()
@@ -265,7 +269,7 @@ def test_migration_is_idempotent(tmp_path):
 
 def test_a_fresh_database_starts_at_the_current_version(tmp_path):
     store = PaperTradingStore(tmp_path / "fresh.db")
-    assert store.schema_version == 2
+    assert store.schema_version == 3
     store.close()
 
 
