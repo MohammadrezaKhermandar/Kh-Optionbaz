@@ -239,13 +239,20 @@ async function scan(quiet = false) {
     const r = await api("/api/scan", { method: "POST" });
     const when = new Date().toLocaleTimeString("fa-IR");
     $("#scan-result").innerHTML = "";
+    // «هیچ سیگنالی نبود» با «سیگنال بود ولی غربال نشد» یکی نیست: اولی
+    // یعنی شرایط استراتژی برقرار نبود، دومی یعنی فرصت بود و قابل معامله
+    // نبود. قاطی کردنشان کاربر را دنبال اشکالِ ناموجود می‌فرستد.
+    const screened = (r.screening && r.screening.records || []).length;
+    const message = r.generated
+      ? `پاس رصد تمام شد: ${fmt(r.generated)} سیگنال تولید شد.`
+      : screened
+        ? `پاس رصد تمام شد: ${fmt(screened)} فرصت پیدا شد ولی هیچ‌کدام از ` +
+          "غربال قابلیت معامله رد نشد — جزئیاتش پایین است."
+        : "پاس رصد تمام شد؛ شرایط هیچ استراتژی برقرار نبود.";
     $("#scan-result").append(
-      el("div", r.generated ? "ok-box" : "hint",
-        (r.generated
-          ? `پاس رصد تمام شد: ${fmt(r.generated)} سیگنال تولید شد.`
-          : "پاس رصد تمام شد؛ شرایط هیچ استراتژی برقرار نبود.") +
-        (quiet ? `  (${when})` : ""))
+      el("div", r.generated ? "ok-box" : "hint", message + (quiet ? `  (${when})` : ""))
     );
+    renderScreening(r.screening);
     await Promise.all([loadSignals(), loadStatus()]);
     return r.generated || 0;
   } catch (err) {
@@ -263,6 +270,140 @@ async function scan(quiet = false) {
     btn.textContent = label;
   }
 }
+
+// --------------------------------------------------- غربال قابلیت معامله
+const VERDICT_STYLE = {
+  tradable: { cls: "v-gain", title: "پذیرفته‌شده" },
+  needs_review: { cls: "", title: "نیازمند بررسی" },
+  rejected: { cls: "v-loss", title: "رد شده" },
+};
+
+/** یک سنجه با عدد و آستانه‌اش — تا «چرا» قابل فهم باشد. */
+function checkLine(check) {
+  const mark = check.passed === true ? "✓" : check.passed === false ? "✗" : "؟";
+  const cls = check.passed === true ? "v-gain" : check.passed === false ? "v-loss" : "";
+  const line = el("div", "check-line");
+  line.append(el("span", "check-mark " + cls, mark));
+  line.append(el("span", "", check.text));
+  return line;
+}
+
+function screeningGroup(title, records, open) {
+  const box = el("details", "screen-group");
+  if (open) box.open = true;
+  const summary = el("summary", "", `${title} — ${fmt(records.length)} مورد`);
+  box.append(summary);
+  if (!records.length) {
+    box.append(el("p", "empty", "موردی نیست."));
+    return box;
+  }
+  records.forEach((rec) => {
+    const item = el("div", "screen-item");
+    const head = el("div", "screen-head");
+    head.append(el("strong", "", rec.symbol));
+    head.append(el("span", "note", `${rec.strategy} · ${rec.side} · ${fmt(rec.quantity)} قرارداد`));
+    if (rec.leg_group_id) head.append(el("span", "note", "پایه‌ی ساختار چندپایه"));
+    head.append(el("span", "note", `سمت خروج: ${rec.exit_side === "bid" ? "خرید بازار" : "فروش بازار"}`));
+    item.append(head);
+    rec.checks.forEach((c) => item.append(checkLine(c)));
+    item.append(el("div", "note", `داده در ${rec.observed_at.replace("T", " ")}`));
+    box.append(item);
+  });
+  return box;
+}
+
+function renderScreening(screening) {
+  const box = $("#screening");
+  box.innerHTML = "";
+  if (!screening) return;
+
+  if (!screening.enabled) {
+    box.append(el("div", "warnbar",
+      "غربال قابلیت معامله خاموش است: هیچ سیگنالی بابت نقدشوندگی رد نشده. " +
+      "این با «همه قبول شدند» یکی نیست."));
+    return;
+  }
+
+  const counts = screening.counts || {};
+  const row = el("div", "stat-row");
+  [["tradable", "پذیرفته"], ["needs_review", "نیازمند بررسی"], ["rejected", "رد شده"]]
+    .forEach(([key, label]) => {
+      const c = el("div", "stat");
+      c.append(el("div", "stat-v " + (VERDICT_STYLE[key].cls || ""), fmt(counts[key] || 0)));
+      c.append(el("div", "stat-k", label));
+      row.append(c);
+    });
+  box.append(row);
+
+  // نبودِ تاریخچه باید دیده شود: بدون آن، «تداوم معامله» هرگز سنجیده
+  // نمی‌شود و همه‌چیز «نیازمند بررسی» می‌ماند.
+  const h = screening.history || {};
+  if (!h.available) {
+    box.append(el("div", "warnbar",
+      `تاریخچه‌ی نقدشوندگی در دسترس نیست (${h.reason || "بدون دلیل"}). ` +
+      "تداوم معامله سنجیده نمی‌شود، پس گزینه‌ها «نیازمند بررسی» می‌مانند — " +
+      "این تأیید کیفیت نیست. با scripts/record_market.py --loop تاریخچه بسازید."));
+  }
+
+  const records = screening.records || [];
+  const by = (v) => records.filter((r) => r.verdict === v);
+  box.append(screeningGroup("رد شده — علت", by("rejected"), true));
+  box.append(screeningGroup("نیازمند بررسی — داده‌ی ناقص", by("needs_review"), false));
+  box.append(screeningGroup("پذیرفته‌شده", by("tradable"), false));
+
+  (screening.dropped_groups || []).forEach((g) => {
+    box.append(el("div", "warnbar",
+      `ساختار «${g.strategy}» کنار رفت: پایه‌ی ${g.blocked_by} غربال نشد. ` +
+      `پایه‌ها: ${(g.legs || []).join("، ")}. یک پایه‌ی نقدشونده ضعف پایه‌ی دیگر را نمی‌پوشاند.`));
+  });
+}
+
+async function loadTradability() {
+  try {
+    const d = await api("/api/tradability");
+    const box = $("#tradability-fields");
+    box.innerHTML = "";
+    const s = d.settings || {};
+    $("#tradability-state").textContent = s.enabled === false ? "خاموش" : "روشن";
+    d.fields.forEach((f) => {
+      const field = el("div", "field");
+      field.append(el("label", "", f.label));
+      const input = el("input");
+      input.type = "number";
+      input.min = "0";
+      input.step = String(f.step);
+      input.id = "trd-" + f.key;
+      input.value = s[f.key] ?? "";
+      field.append(input);
+      field.append(el("span", "note", f.unit));
+      box.append(field);
+    });
+  } catch (err) {
+    $("#tradability-note").className = "note bad";
+    $("#tradability-note").textContent = err.message;
+  }
+}
+
+$("#btn-save-tradability").addEventListener("click", async () => {
+  const note = $("#tradability-note");
+  note.className = "note";
+  note.textContent = "در حال ذخیره…";
+  try {
+    const d = await api("/api/tradability");
+    const body = {};
+    d.fields.forEach((f) => {
+      const raw = $("#trd-" + f.key).value;
+      if (raw !== "") body[f.key] = Number(raw);
+    });
+    await api("/api/tradability", { method: "PUT", body: JSON.stringify(body) });
+    note.className = "note ok";
+    note.textContent = "ذخیره شد؛ از پاس بعدی اعمال می‌شود.";
+    toast("آستانه‌های غربال ذخیره شد.", "ok");
+  } catch (err) {
+    note.className = "note bad";
+    note.textContent = err.message;
+  }
+});
 
 // ------------------------------------------------------------------ live
 // رصد زنده = پولینگ خودکار. بازار تهران فقط ۹:۰۰ تا ۱۲:۳۰ باز است، پس
@@ -1740,4 +1881,5 @@ async function loadPaperTab() {
 // ------------------------------------------------------------------ boot
 loadStatus();
 refreshPaperTradingFlag().then(loadSignals);
+loadTradability();
 setInterval(loadStatus, 60000);

@@ -298,19 +298,25 @@ async def run_scan() -> dict[str, Any]:
     async with _scan_lock:
         settings = _settings()
 
-        def _work() -> list[Signal]:
+        def _work() -> tuple[list[Signal], dict[str, Any]]:
             # از run_cycle خودِ main.py استفاده می‌کنیم تا منطق پاس رصد
             # در دو جا تکرار (و با هم واگرا) نشود.
             from main import run_cycle
 
             context = create_app(settings, dry_run=False, as_json=False)
             try:
-                return run_cycle(context)
+                produced = run_cycle(context)
+                generator = context.generator
+                screening = generator.screening.to_dict()
+                # «غربال خاموش بود» با «همه قبول شدند» یکی نیست.
+                screening["enabled"] = generator.tradability is not None
+                screening["history"] = _history_state(generator.tradability)
+                return produced, screening
             finally:
                 context.close()
 
         try:
-            signals = await asyncio.to_thread(_work)
+            signals, screening = await asyncio.to_thread(_work)
         except Exception as exc:  # پیام خطا به UI برگردانده می‌شود
             logger.exception("پاس رصد ناموفق بود.")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -318,7 +324,83 @@ async def run_scan() -> dict[str, Any]:
     return {
         "generated": len(signals),
         "signals": [_signal_dict(s) for s in signals],
+        "screening": screening,
     }
+
+
+def _history_state(screener: Any | None) -> dict[str, Any]:
+    """وضعیت تاریخچه‌ی نقدشوندگی — تا «نداریم» با «خوب است» اشتباه نشود."""
+    history = getattr(screener, "history", None)
+    if history is None:
+        return {"available": False, "reason": "تاریخچه‌ای به غربالگر داده نشده"}
+    return {
+        "available": bool(history.available),
+        "reason": history.unavailable_reason,
+        "db_path": str(getattr(history, "db_path", "")),
+        "lookback_sessions": getattr(history, "lookback_sessions", None),
+    }
+
+
+class TradabilityUpdate(BaseModel):
+    """ویرایش آستانه‌های غربال. هر فیلد اختیاری است."""
+
+    enabled: bool | None = None
+    min_open_interest_contracts: int | None = Field(default=None, ge=0)
+    min_trades_today_count: int | None = Field(default=None, ge=0)
+    max_relative_spread_pct: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    min_exit_depth_ratio: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    min_sessions_with_trades_pct: float | None = Field(
+        default=None, ge=0, le=100, allow_inf_nan=False
+    )
+    min_history_sessions: int | None = Field(default=None, ge=1)
+    min_days_to_expiry: int | None = Field(default=None, ge=0)
+    max_quote_age_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+#: واحد و توضیح هر آستانه — رابط از همین می‌خواند تا واحدها در یک جا
+#: بمانند و با کد واگرا نشوند.
+TRADABILITY_FIELDS: tuple[dict[str, Any], ...] = (
+    {"key": "min_open_interest_contracts", "label": "حداقل موقعیت باز",
+     "unit": "قرارداد", "step": 10},
+    {"key": "min_trades_today_count", "label": "حداقل معاملات امروز",
+     "unit": "معامله", "step": 1},
+    {"key": "max_relative_spread_pct", "label": "حداکثر اسپرد نسبی",
+     "unit": "٪ از میانه‌ی مظنه", "step": 1},
+    {"key": "min_exit_depth_ratio", "label": "حداقل عمق سمت خروج",
+     "unit": "برابرِ اندازه‌ی سفارش", "step": 0.5},
+    {"key": "min_sessions_with_trades_pct", "label": "حداقل تداوم معامله",
+     "unit": "٪ از جلسه‌های ثبت‌شده", "step": 5},
+    {"key": "min_history_sessions", "label": "حداقل جلسه برای قضاوت",
+     "unit": "جلسه (کمتر = نیازمند بررسی)", "step": 1},
+    {"key": "min_days_to_expiry", "label": "حداقل فاصله تا سررسید",
+     "unit": "روز", "step": 1},
+    {"key": "max_quote_age_seconds", "label": "حداکثر کهنگی مظنه",
+     "unit": "ثانیه", "step": 30},
+)
+
+
+@app.get("/api/tradability")
+def get_tradability() -> dict[str, Any]:
+    """آستانه‌های غربال، همراه واحد و هشدارِ اثبات‌نشده بودن."""
+    config = section(_settings(), "tradability")
+    return {
+        "settings": config,
+        "fields": list(TRADABILITY_FIELDS),
+        "note": (
+            "این آستانه‌ها اثبات‌شده نیستند؛ نقطه‌ی شروعی محافظه‌کارانه‌اند. "
+            "با تاریخچه‌ی خودتان تنظیمشان کنید."
+        ),
+    }
+
+
+@app.put("/api/tradability")
+def update_tradability(update: TradabilityUpdate) -> dict[str, Any]:
+    """ویرایش آستانه‌های غربال؛ از پاس بعدی اعمال می‌شود."""
+    patch = {k: v for k, v in update.model_dump().items() if v is not None}
+    if not patch:
+        raise HTTPException(status_code=400, detail="هیچ مقداری برای تغییر داده نشد.")
+    _patch_settings({"tradability": patch})
+    return {"ok": True, "applied": patch}
 
 
 # ----------------------------------------------------------------------

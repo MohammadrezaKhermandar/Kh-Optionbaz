@@ -157,6 +157,21 @@ def parse_tsetmc_date(value: str | int) -> date:
     return date(int(text[:4]), int(text[4:6]), int(text[6:]))
 
 
+def _optional_int(value: Any) -> int | None:
+    """عدد صحیح، یا `None` وقتی منبع اصلاً چیزی نداده.
+
+    برخلاف `_positive`، صفر اینجا **مقدارِ معتبر** است: «امروز هیچ
+    معامله‌ای نشد» با «نمی‌دانیم چند معامله شد» یکی نیست، و غربالگر
+    روی همین تفاوت تصمیم می‌گیرد.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _positive(value: Any) -> float | None:
     """صفر یا None در فیلد مظنه یعنی «مظنه‌ای نیست»، نه قیمت صفر."""
     try:
@@ -303,6 +318,12 @@ class TsetmcOptionChainClient(OptionChainClient):
             volume=int(row.get(f"qTotTran5J_{side}") or 0),
             contract_size=int(row.get("contractSize") or DEFAULT_CONTRACT_SIZE),
             ins_code=str(row.get(f"insCode_{side}") or "").strip(),
+            # سه سنجه‌ای که در همین پاسخ هست و تا امروز نگاشت نمی‌شد.
+            # `_optional_int` نبودِ کلید را `None` نگه می‌دارد تا از صفرِ
+            # واقعی جدا بماند — غربالگر روی همین تمایز تصمیم می‌گیرد.
+            trade_count=_optional_int(row.get(f"zTotTran_{side}")),
+            bid_quantity=_optional_int(row.get(f"qTitMeDem_{side}")),
+            ask_quantity=_optional_int(row.get(f"qTitMeOf_{side}")),
         )
 
     def _accept(

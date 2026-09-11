@@ -386,6 +386,49 @@ def build_generator(
         config=build_generator_config(settings),
         holdings_provider=build_holdings_provider(account_source),
         iv_history=build_iv_history(settings),
+        tradability=build_tradability_screener(settings, option_chain),
+    )
+
+
+def build_tradability_screener(
+    settings: dict[str, Any], option_chain: OptionChainClient
+) -> Any | None:
+    """غربالِ قابلیت معامله. `None` یعنی در تنظیمات خاموش است.
+
+    تاریخچه‌ی تداوم معامله از پایگاه **خام** recorder می‌آید و
+    `MarketHistoryReader` آن را فقط‌خواندنی باز می‌کند. نبودِ آن پایگاه
+    خطا نیست: تداوم «نامعلوم» می‌ماند و سیگنال به‌جای «پذیرفته»،
+    «نیازمند بررسی» می‌شود.
+    """
+    config = section(settings, "tradability")
+    if not config.get("enabled", True):
+        logger.info("غربال قابلیت معامله خاموش است؛ هیچ سیگنالی بابت نقدشوندگی رد نمی‌شود.")
+        return None
+
+    from data.order_book import OrderBookClient
+    from market.tradability import Thresholds
+    from market.tradability_screener import TradabilityScreener
+    from storage.market_history import MarketHistoryReader
+
+    thresholds = Thresholds(**{
+        key: config[key]
+        for key in (
+            "min_open_interest_contracts", "min_trades_today_count",
+            "max_relative_spread_pct", "min_exit_depth_ratio",
+            "min_sessions_with_trades_pct", "min_history_sessions",
+            "min_days_to_expiry", "max_quote_age_seconds",
+        )
+        if key in config
+    })
+    history = MarketHistoryReader(
+        resolve_path(config.get("history_db_path", "var/recorder/market.db")),
+        lookback_sessions=int(config.get("history_lookback_sessions", 20)),
+    )
+    return TradabilityScreener(
+        resolve_contract=option_chain.get_contract,
+        thresholds=thresholds,
+        order_book_client=OrderBookClient(),
+        history=history,
     )
 
 

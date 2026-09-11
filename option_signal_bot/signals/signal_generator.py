@@ -17,6 +17,7 @@ from typing import Any
 
 from data.market_data_client import MarketDataClient
 from data.option_chain_client import OptionChainClient
+from market.tradability import ScreeningRecord, ScreeningSummary, Verdict
 from risk.risk_calculator import RiskCalculator
 from signals.signal_model import Signal
 from strategies.base_strategy import BaseStrategy, StrategyContext
@@ -50,12 +51,20 @@ class SignalGenerator:
         config: GeneratorConfig | None = None,
         holdings_provider: Callable[[], dict[str, int]] | None = None,
         iv_history: Any | None = None,
+        tradability: Any | None = None,
     ) -> None:
         self.market_data = market_data
         self.option_chain = option_chain
         self.strategies = strategies
         self.risk_calculator = risk_calculator or RiskCalculator()
         self.config = config or GeneratorConfig()
+        #: غربالِ قابلیت معامله (`TradabilityScreener`). `None` یعنی خاموش —
+        #: آن‌وقت هیچ سیگنالی به‌خاطر نقدشوندگی رد نمی‌شود و این در
+        #: خلاصه‌ی پاس هم اعلام می‌شود، تا «غربال نشد» با «همه قبول شدند»
+        #: اشتباه نشود.
+        self.tradability = tradability
+        #: نتیجه‌ی غربالِ آخرین پاس — رابط از همین می‌خواند.
+        self.screening = ScreeningSummary()
         self._last_emitted: dict[str, datetime] = {}
         #: تابعی که «نام نماد → تعداد سهم» می‌دهد. عمداً یک callable است و
         #: نه کلاینت کارگزاری: این لایه هم مثل استراتژی‌ها نباید بداند
@@ -112,6 +121,7 @@ class SignalGenerator:
         self.reset_holdings_cache()
         self.failed_symbols = []
         self.strategy_errors = {}
+        self.screening = ScreeningSummary()
 
         signals: list[Signal] = []
         for symbol in symbols or self.config.symbols:
@@ -200,6 +210,14 @@ class SignalGenerator:
                     "(اجرای ناقص بدتر از اجرا نکردن است).",
                     leg.symbol, legs[0].strategy_name,
                 )
+                # یک پایه‌ی نقدشونده نباید ضعف پایه‌ی دیگر را بپوشاند:
+                # کنار گذاشتنِ کل ساختار در رابط هم دیده می‌شود.
+                self.screening.dropped_groups.append({
+                    "leg_group_id": group_id,
+                    "strategy": legs[0].strategy_name,
+                    "legs": [s.symbol for s in legs],
+                    "blocked_by": leg.symbol,
+                })
                 return []
             sized.append(final)
 
@@ -319,12 +337,51 @@ class SignalGenerator:
             minutes=self.config.signal_validity_minutes
         )
 
+        # ⚠️ غربالِ قابلیت معامله **پس از** اندازه‌گیری ریسک می‌آید و پیش
+        # از انتشار: عمقِ لازم به همین `suggested_qty` بستگی دارد، پس
+        # پیش از دانستن تعداد نمی‌شد سنجیدش. امتیاز استراتژی اینجا هیچ
+        # وزنی ندارد — نبودِ امکان خروج جبران‌شدنی نیست.
+        if self.tradability is not None and not self._is_tradable(sized):
+            return None
+
         if allow_dedupe:
             if self._is_duplicate(sized):
                 logger.debug("سیگنال تکراری %s نادیده گرفته شد.", sized.symbol)
                 return None
             self._last_emitted[self._dedupe_key(sized)] = sized.created_at
         return sized
+
+    def _is_tradable(self, signal: Signal) -> bool:
+        """غربال یک سیگنال و ثبت نتیجه برای رابط.
+
+        فقط `tradable` عبور می‌کند. `needs_review` هم رد می‌شود چون
+        «حداقل قابلیت معامله» شرط ورود است و نبودِ داده تأییدش نمی‌کند —
+        ولی جدا از `rejected` ثبت می‌شود تا کاربر بداند مسئله کمبود
+        داده بوده، نه نقدشوندگیِ بد.
+        """
+        try:
+            report = self.tradability.evaluate_signal(signal)
+        except Exception:
+            logger.exception(
+                "غربال قابلیت معامله برای %s شکست خورد؛ سیگنال رد شد.", signal.symbol
+            )
+            return False
+        group_id = signal.metadata.get("leg_group_id")
+        self.screening.records.append(ScreeningRecord(
+            symbol=signal.symbol,
+            strategy=signal.strategy_name,
+            side=signal.side.value,
+            quantity=signal.suggested_qty,
+            report=report,
+            leg_group_id=str(group_id) if group_id else None,
+        ))
+        if report.verdict is Verdict.TRADABLE:
+            return True
+        logger.info(
+            "سیگنال %s غربال نشد (%s): %s",
+            signal.symbol, report.verdict_label, report.reason,
+        )
+        return False
 
     @staticmethod
     def _dedupe_key(signal: Signal) -> str:
