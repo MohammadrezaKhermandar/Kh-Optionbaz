@@ -349,6 +349,7 @@ class TradabilityUpdate(BaseModel):
     min_trades_today_count: int | None = Field(default=None, ge=0)
     max_relative_spread_pct: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     min_exit_depth_ratio: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    max_exit_slippage_pct: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     min_sessions_with_trades_pct: float | None = Field(
         default=None, ge=0, le=100, allow_inf_nan=False
     )
@@ -368,14 +369,16 @@ TRADABILITY_FIELDS: tuple[dict[str, Any], ...] = (
      "unit": "٪ از میانه‌ی مظنه", "step": 1},
     {"key": "min_exit_depth_ratio", "label": "حداقل عمق سمت خروج",
      "unit": "برابرِ اندازه‌ی سفارش", "step": 0.5},
+    {"key": "max_exit_slippage_pct", "label": "حداکثر لغزش خروج",
+     "unit": "٪ فاصله‌ی قیمتِ پرشدن از بهترین مظنه", "step": 1},
     {"key": "min_sessions_with_trades_pct", "label": "حداقل تداوم معامله",
      "unit": "٪ از جلسه‌های ثبت‌شده", "step": 5},
     {"key": "min_history_sessions", "label": "حداقل جلسه برای قضاوت",
      "unit": "جلسه (کمتر = نیازمند بررسی)", "step": 1},
     {"key": "min_days_to_expiry", "label": "حداقل فاصله تا سررسید",
      "unit": "روز", "step": 1},
-    {"key": "max_quote_age_seconds", "label": "حداکثر کهنگی مظنه",
-     "unit": "ثانیه", "step": 30},
+    {"key": "max_quote_age_seconds", "label": "حداکثر عمر دادهٔ دریافتی",
+     "unit": "ثانیه — نه زمان بازار", "step": 30},
 )
 
 

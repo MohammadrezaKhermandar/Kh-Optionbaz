@@ -198,6 +198,9 @@ def default_settings() -> dict[str, Any]:
             "min_trades_today_count": 1,
             "max_relative_spread_pct": 25.0,
             "min_exit_depth_ratio": 1.0,
+            # عمقی که فقط در قیمت‌های دور هست، سفارش را پر می‌کند ولی
+            # «ظرفیت خروج» نیست.
+            "max_exit_slippage_pct": 10.0,
             "min_sessions_with_trades_pct": 60.0,
             "min_history_sessions": 5,
             "min_days_to_expiry": 3,

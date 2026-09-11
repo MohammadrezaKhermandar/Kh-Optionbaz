@@ -105,10 +105,14 @@ class TradabilityScreener:
             )
 
         exit_side = "sell" if position_side.lower() == "buy" else "buy"
-        depth, book_bid, book_ask = self._depth(contract, exit_side, quantity)
+        book_data = self._exit_book(contract, exit_side, quantity)
         # مظنه‌ی دفترِ چندسطحی تازه‌تر از زنجیره است؛ اگر بود، همان.
-        bid = book_bid if book_bid is not None else getattr(contract, "bid", None)
-        ask = book_ask if book_ask is not None else getattr(contract, "ask", None)
+        bid = book_data["bid"] if book_data["bid"] is not None else getattr(
+            contract, "bid", None
+        )
+        ask = book_data["ask"] if book_data["ask"] is not None else getattr(
+            contract, "ask", None
+        )
 
         return LiquidityObservation(
             symbol=symbol,
@@ -117,20 +121,33 @@ class TradabilityScreener:
             observed_at=moment,
             bid=bid,
             ask=ask,
-            exit_depth_contracts=depth,
+            exit_depth_contracts=book_data["depth"],
+            exit_fill_price=book_data["fill_price"],
+            best_exit_price=book_data["best_exit"],
             open_interest=getattr(contract, "open_interest", None),
             trades_today=self._trades_today(contract),
             days_to_expiry=self._days_to_expiry(contract, moment),
-            # داده از همین لحظه آمده؛ کهنگی‌اش صفر است. عددِ واقعیِ کهنگی
-            # وقتی معنا دارد که کش عمر داشته باشد — آن را منبع می‌داند،
-            # نه اینجا.
-            quote_age_seconds=0.0,
+            # عمرِ **واقعیِ** نسخه‌ای که به ما رسید — از کشِ کلاینت.
+            # پیش از این صفر ثابت بود، پس آستانه‌ی کهنگی هرگز اثر
+            # نمی‌کرد و سنجه‌ای بود که همیشه می‌گذشت.
+            quote_age_seconds=book_data["age"],
+            # ⚠️ منبع مهر زمانی نمی‌دهد؛ زمانِ دریافت جایش گذاشته نمی‌شود.
+            source_time=self._source_time(contract),
         )
 
-    def _depth(
-        self, contract: Any, exit_side: str, quantity: int
-    ) -> tuple[int | None, float | None, float | None]:
-        """عمقِ قابل اجرا در سمت خروج، به‌علاوه‌ی بهترین مظنه‌های دفتر."""
+    def _exit_book(self, contract: Any, exit_side: str, quantity: int) -> dict[str, Any]:
+        """ظرفیت و قیمتِ سمت خروج.
+
+        سه عدد که با هم معنا دارند:
+
+        * `depth` — عمقِ **کل** آن سمت. عمداً به اندازه‌ی سفارش بریده
+          نمی‌شود (اشکالِ نسخه‌ی قبل، که نسبت را هرگز بالای ۱ نمی‌برد).
+        * `fill_price` — میانگین وزنیِ پرشدنِ **همین** سفارش.
+        * `best_exit` — بهترین مظنه‌ی همان سمت.
+
+        اختلاف دو عددِ آخر همان لغزش است: عمقی که فقط در قیمت‌های دور
+        وجود دارد، سفارش را پر می‌کند ولی «ظرفیت خروج» نیست.
+        """
         ins_code = getattr(contract, "ins_code", "")
         if self.order_book_client is not None and ins_code:
             try:
@@ -139,21 +156,58 @@ class TradabilityScreener:
                 logger.warning("دفتر سفارش %s خوانده نشد: %s", contract.symbol, exc)
                 book = None
             if book is not None:
-                # `fill_price` می‌گوید چه تعدادی واقعاً پر می‌شود — همان
-                # چیزی که «امکان خروج» یعنی آن.
-                _, fillable = book.fill_price(exit_side, max(quantity, 1))
-                return int(fillable), book.best_bid, book.best_ask
+                fill_price, filled = book.fill_price(exit_side, max(quantity, 1))
+                best_exit = book.best_bid if exit_side == "sell" else book.best_ask
+                return {
+                    "depth": int(book.real_depth(exit_side)),
+                    # قیمتِ پرشدن فقط وقتی معنا دارد که سفارش **کامل** پر
+                    # شود؛ میانگینِ یک پرشدنِ ناقص، لغزشِ واقعی را
+                    # کم‌برآورد می‌کند.
+                    "fill_price": fill_price if filled >= max(quantity, 1) else None,
+                    "best_exit": best_exit,
+                    "bid": book.best_bid,
+                    "ask": book.best_ask,
+                    "age": self._book_age(ins_code),
+                }
 
-        # بدون دفترِ چندسطحی، فقط سطح اولِ زنجیره در دست است. اگر حجمش
-        # هم نباشد، عمق **نامعلوم** می‌ماند و صفر فرض نمی‌شود.
+        # بدون دفترِ چندسطحی فقط سطح اولِ زنجیره در دست است: عمق همان
+        # سطح، و چون تک‌سطحی است لغزشی هم ندارد (قیمت پرشدن = بهترین
+        # مظنه) — مشروط بر اینکه سفارش در همان سطح جا شود.
         level_one = getattr(
             contract, "bid_quantity" if exit_side == "sell" else "ask_quantity", None
         )
-        return (
-            None if level_one is None else int(level_one),
-            getattr(contract, "bid", None),
-            getattr(contract, "ask", None),
-        )
+        best_exit = getattr(contract, "bid" if exit_side == "sell" else "ask", None)
+        fits = level_one is not None and level_one >= max(quantity, 1)
+        return {
+            "depth": None if level_one is None else int(level_one),
+            "fill_price": best_exit if fits else None,
+            "best_exit": best_exit,
+            "bid": getattr(contract, "bid", None),
+            "ask": getattr(contract, "ask", None),
+            # زنجیره عمرِ کش را اعلام نمی‌کند؛ «نامعلوم» می‌ماند، نه صفر.
+            "age": None,
+        }
+
+    def _book_age(self, ins_code: str) -> float | None:
+        """عمرِ واقعیِ نسخه‌ی کش‌شده‌ی دفتر، اگر کلاینت اعلامش کند."""
+        getter = getattr(self.order_book_client, "cache_age_seconds", None)
+        if getter is None:
+            return None
+        try:
+            return getter(ins_code)
+        except Exception as exc:
+            logger.warning("عمر کش دفتر %s خوانده نشد: %s", ins_code, exc)
+            return None
+
+    @staticmethod
+    def _source_time(contract: Any) -> Any | None:
+        """مهر زمانیِ بازار، فقط اگر منبع واقعاً بدهد.
+
+        دیده‌بان اختیار TSETMC نمی‌دهد — همان دلیلی که در recorder هم
+        `source_time` همیشه `NULL` است. اینجا هیچ‌چیز جایش ساخته
+        نمی‌شود.
+        """
+        return getattr(contract, "source_time", None)
 
     @staticmethod
     def _trades_today(contract: Any) -> int | None:

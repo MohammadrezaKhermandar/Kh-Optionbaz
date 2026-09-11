@@ -247,7 +247,7 @@ async function scan(quiet = false) {
       ? `پاس رصد تمام شد: ${fmt(r.generated)} سیگنال تولید شد.`
       : screened
         ? `پاس رصد تمام شد: ${fmt(screened)} فرصت پیدا شد ولی هیچ‌کدام از ` +
-          "غربال قابلیت معامله رد نشد — جزئیاتش پایین است."
+          "غربال قابلیت معامله عبور نکرد — علتش پایین آمده."
         : "پاس رصد تمام شد؛ شرایط هیچ استراتژی برقرار نبود.";
     $("#scan-result").append(
       el("div", r.generated ? "ok-box" : "hint", message + (quiet ? `  (${when})` : ""))
@@ -306,7 +306,10 @@ function screeningGroup(title, records, open) {
     head.append(el("span", "note", `سمت خروج: ${rec.exit_side === "bid" ? "خرید بازار" : "فروش بازار"}`));
     item.append(head);
     rec.checks.forEach((c) => item.append(checkLine(c)));
+    // زمانِ دریافت با زمانِ بازار یکی نیست و این جمله همان را می‌گوید.
     item.append(el("div", "note", `داده در ${rec.observed_at.replace("T", " ")}`));
+    item.append(el("div", "note " + (rec.source_time_known ? "" : "v-loss"),
+      rec.source_time_note));
     box.append(item);
   });
   return box;
@@ -338,6 +341,21 @@ function renderScreening(screening) {
   // نبودِ تاریخچه باید دیده شود: بدون آن، «تداوم معامله» هرگز سنجیده
   // نمی‌شود و همه‌چیز «نیازمند بررسی» می‌ماند.
   const h = screening.history || {};
+  // تأییدنشده بودنِ جلسه‌ها با نبودِ پایگاه فرق دارد و هر دو باید دیده شوند.
+  const unverified = (screening.records || []).find(
+    (r) => r.history && r.history.known && !r.history.sessions_verified);
+  if (unverified) {
+    box.append(el("div", "warnbar",
+      "روز معاملاتی بودنِ جلسه‌های ثبت‌شده تأیید نشد (تقویم در دسترس نبود). " +
+      "روزِ تقویمیِ ثبت، جلسه‌ی معاملاتی نیست: recorder در روز تعطیل هم " +
+      "snapshot می‌گیرد و مقادیرش ماندهٔ جلسه‌ی قبل است."));
+  }
+  const skipped = (screening.records || []).reduce(
+    (m, r) => Math.max(m, (r.history && r.history.skipped_non_trading_days) || 0), 0);
+  if (skipped) {
+    box.append(el("div", "hint",
+      `${fmt(skipped)} روزِ غیرمعاملاتی از تاریخچه کنار گذاشته شد.`));
+  }
   if (!h.available) {
     box.append(el("div", "warnbar",
       `تاریخچه‌ی نقدشوندگی در دسترس نیست (${h.reason || "بدون دلیل"}). ` +

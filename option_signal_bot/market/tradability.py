@@ -117,7 +117,13 @@ class Thresholds:
     min_history_sessions: int = 5
     #: روز تا سررسید؛ خیلی نزدیک به سررسید یعنی ریسک تسویه و افت نقدشوندگی
     min_days_to_expiry: int = 3
-    #: عکسِ مظنه از این کهنه‌تر باشد، قابل اتکا نیست (ثانیه)
+    #: عمقِ سمت خروج از این بدتر قیمت بدهد، «ظرفیت» نیست (درصد).
+    #: عمق در قیمت‌های دور، سفارش را پر می‌کند ولی با زیانی که خودش
+    #: معامله را بی‌معنا می‌کند — پس عمق بدون قیدِ قیمت، عدد گمراه‌کننده
+    #: است.
+    max_exit_slippage_pct: float = 10.0
+    #: دادهٔ دریافتیِ ما از این کهنه‌تر باشد، قابل اتکا نیست (ثانیه).
+    #: ⚠️ این عمرِ دریافت است، نه زمانِ بازار — بخش `source_time` را ببینید.
     max_quote_age_seconds: float = 120.0
 
 
@@ -137,14 +143,28 @@ class LiquidityObservation:
     observed_at: datetime
     bid: float | None = None
     ask: float | None = None
-    #: عمقِ قابل اجرا در سمت خروج، به تعداد قرارداد (از دفتر چندسطحی؛
-    #: اگر فقط سطح اول را داریم، همان)
+    #: عمقِ **کلِ** سمت خروج، به تعداد قرارداد (از دفتر چندسطحی؛ اگر فقط
+    #: سطح اول را داریم، همان). عمداً به اندازه‌ی سفارش **بریده
+    #: نمی‌شود**: با بریدن، نسبت هرگز از ۱ بالاتر نمی‌رفت و «دو برابرِ
+    #: سفارش عمق دارد» از «دقیقاً به اندازه‌ی سفارش» قابل تشخیص نبود.
     exit_depth_contracts: int | None = None
+    #: میانگین وزنیِ قیمتی که سفارشِ خروج با آن پر می‌شود
+    exit_fill_price: float | None = None
+    #: بهترین قیمتِ سمت خروج (سطح اول)
+    best_exit_price: float | None = None
     open_interest: int | None = None
     trades_today: int | None = None
     days_to_expiry: int | None = None
-    #: عمر داده در لحظه‌ی ارزیابی (ثانیه)؛ `None` یعنی نمی‌دانیم
+    #: عمرِ **دریافتِ خودِ ما** در لحظه‌ی ارزیابی (ثانیه)؛ `None` یعنی
+    #: نمی‌دانیم. این با «چقدر از زمان بازار گذشته» فرق دارد.
     quote_age_seconds: float | None = None
+    #: مهر زمانیِ **بازار** روی این داده، اگر منبع بدهد.
+    #:
+    #: ⚠️ دیده‌بان اختیار TSETMC و دفتر سفارشش هیچ مهر زمانی نمی‌دهند،
+    #: پس این تقریباً همیشه `None` است. زمانِ دریافت جایش گذاشته
+    #: **نمی‌شود**: داده‌ای که ما همین حالا گرفتیم می‌تواند ساعت‌ها پیش
+    #: در بازار ساخته شده باشد (مثلاً روز غیرمعاملاتی).
+    source_time: datetime | None = None
 
     @property
     def exit_side(self) -> str:
@@ -163,10 +183,38 @@ class LiquidityObservation:
 
     @property
     def exit_depth_ratio(self) -> float | None:
-        """عمقِ سمت خروج تقسیم بر اندازه‌ی سفارش."""
+        """عمقِ کلِ سمت خروج تقسیم بر اندازه‌ی سفارش.
+
+        می‌تواند از ۱ بزرگ‌تر باشد و باید بتواند — «سه برابرِ سفارش عمق
+        دارد» اطلاعاتِ متفاوتی از «دقیقاً به اندازه‌ی سفارش» است.
+        """
         if self.exit_depth_contracts is None or self.quantity <= 0:
             return None
         return self.exit_depth_contracts / self.quantity
+
+    @property
+    def exit_slippage_pct(self) -> float | None:
+        """فاصله‌ی قیمتِ پرشدنِ خروج از بهترین مظنه، درصد.
+
+        `None` وقتی سفارش اصلاً کامل پر نمی‌شود (آن‌وقت خودِ عمق رد
+        می‌کند) یا داده‌ای نیست.
+        """
+        if not self.exit_fill_price or not self.best_exit_price:
+            return None
+        if self.best_exit_price <= 0:
+            return None
+        # خروجِ long روی مظنه‌ی خرید پر می‌شود، پس قیمتِ بدتر یعنی
+        # **پایین‌تر**؛ خروجِ short روی مظنه‌ی فروش، پس بدتر یعنی بالاتر.
+        if self.exit_side == "bid":
+            drop = self.best_exit_price - self.exit_fill_price
+        else:
+            drop = self.exit_fill_price - self.best_exit_price
+        return max(drop / self.best_exit_price * 100.0, 0.0)
+
+    @property
+    def source_time_known(self) -> bool:
+        """آیا مهر زمانیِ بازار روی این داده هست؟"""
+        return self.source_time is not None
 
 
 @dataclass(frozen=True)
@@ -182,6 +230,15 @@ class HistoryStats:
     first_session: str | None = None
     last_session: str | None = None
     known: bool = False
+    #: آیا روزهای شمرده‌شده **روز معاملاتی** بودنشان تأیید شده است؟
+    #:
+    #: ⚠️ روزِ تقویمیِ ثبت، جلسه‌ی معاملاتی نیست. recorder در روز تعطیل
+    #: هم snapshot می‌گیرد و مقادیرش ماندهٔ جلسه‌ی قبل است؛ منبع هم مهر
+    #: زمانی نمی‌دهد که بشود خلافش را ثابت کرد. بدون تأیید تقویم، این
+    #: آمار «نامعلوم» است نه «خوب».
+    sessions_verified: bool = False
+    #: روزهایی که ثبت شده‌اند ولی روز معاملاتی نبودند و کنار گذاشته شدند
+    skipped_non_trading_days: int = 0
 
     @property
     def sessions_with_trades_pct(self) -> float | None:
@@ -207,6 +264,21 @@ class TradabilityReport:
     @property
     def verdict_label(self) -> str:
         return VERDICT_LABELS[self.verdict]
+
+    @property
+    def source_time_note(self) -> str:
+        """جمله‌ای که نبودِ زمان بازار را صریح می‌گوید.
+
+        بدون این، کاربر «عمر دادهٔ دریافتی: ۰ ثانیه» را «بازار همین حالا
+        این را ساخته» می‌خواند — که ادعای نادرستی است.
+        """
+        if self.observation.source_time is not None:
+            return f"زمان بازار: {self.observation.source_time.isoformat(timespec='seconds')}"
+        return (
+            "زمان بازار نامعلوم است: منبع مهر زمانی نمی‌دهد. عددِ «عمر داده» "
+            "فقط می‌گوید چند ثانیه از دریافتِ ما گذشته، نه اینکه بازار کِی "
+            "این قیمت را ساخته."
+        )
 
     @property
     def failed(self) -> tuple[Check, ...]:
@@ -294,14 +366,25 @@ def evaluate(
             higher_is_better=True, detail="عمق سمت خروج در دسترس نیست",
         ),
         _check(
-            "quote_age", "کهنگی مظنه",
+            "exit_slippage", "لغزش خروج تا پرشدن کامل",
+            observation.exit_slippage_pct, thresholds.max_exit_slippage_pct,
+            "٪ از بهترین مظنه", higher_is_better=False,
+            detail="سفارش کامل پر نمی‌شود یا مظنه‌ای نیست",
+        ),
+        _check(
+            "quote_age", "عمر دادهٔ دریافتی (نه زمان بازار)",
             observation.quote_age_seconds, thresholds.max_quote_age_seconds, "ثانیه",
-            higher_is_better=False, detail="زمان داده نامعلوم",
+            higher_is_better=False, detail="عمر داده نامعلوم است",
         ),
     ]
 
-    # تاریخچه: کمتر از حداقلِ جلسه یعنی «نمی‌دانیم»، نه «بد».
-    if not history.known or history.sessions < thresholds.min_history_sessions:
+    # تاریخچه: کمتر از حداقلِ جلسه یعنی «نمی‌دانیم»، نه «بد». روزی که
+    # معاملاتی بودنش تأیید نشده هم شمرده نمی‌شود.
+    if (
+        not history.known
+        or not history.sessions_verified
+        or history.sessions < thresholds.min_history_sessions
+    ):
         checks.append(Check(
             key="trading_continuity",
             label="تداوم معامله",
@@ -310,10 +393,19 @@ def evaluate(
             unit="٪ از جلسه‌ها",
             passed=None,
             detail=(
-                f"فقط {history.sessions} جلسه ثبت شده "
-                f"(حداقل {thresholds.min_history_sessions} لازم است)"
-                if history.known
-                else "تاریخچه‌ی ثبت‌شده‌ای در دسترس نیست"
+                "تاریخچه‌ی ثبت‌شده‌ای در دسترس نیست"
+                if not history.known
+                else "روز معاملاتی بودنِ جلسه‌های ثبت‌شده تأیید نشد "
+                     "(تقویم در دسترس نبود)"
+                if not history.sessions_verified
+                else f"فقط {history.sessions} جلسه‌ی معاملاتی ثبت شده "
+                     f"(حداقل {thresholds.min_history_sessions} لازم است)"
+                     + (
+                         f"؛ {history.skipped_non_trading_days} روز غیرمعاملاتی "
+                         "کنار گذاشته شد"
+                         if history.skipped_non_trading_days
+                         else ""
+                     )
             ),
         ))
     else:
@@ -367,7 +459,12 @@ class ScreeningRecord:
             "observed_at": self.report.observation.observed_at.isoformat(
                 timespec="seconds"
             ),
+            "source_time_known": self.report.observation.source_time_known,
+            "source_time_note": self.report.source_time_note,
             "exit_side": self.report.observation.exit_side,
+            "exit_depth_contracts": self.report.observation.exit_depth_contracts,
+            "exit_fill_price": self.report.observation.exit_fill_price,
+            "best_exit_price": self.report.observation.best_exit_price,
             "checks": [
                 {
                     "key": c.key,
@@ -383,6 +480,8 @@ class ScreeningRecord:
             ],
             "history": {
                 "known": self.report.history.known,
+                "sessions_verified": self.report.history.sessions_verified,
+                "skipped_non_trading_days": self.report.history.skipped_non_trading_days,
                 "sessions": self.report.history.sessions,
                 "sessions_with_trades": self.report.history.sessions_with_trades,
                 "sessions_without_trades": self.report.history.sessions_without_trades,

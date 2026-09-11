@@ -37,6 +37,7 @@ INS_CODE = "12345"
 HEALTHY = HistoryStats(
     sessions=20, sessions_with_trades=18, sessions_with_both_quotes=20,
     first_session="2026-08-01", last_session="2026-09-10", known=True,
+    sessions_verified=True,
 )
 
 
@@ -49,10 +50,13 @@ def _observation(**overrides) -> LiquidityObservation:
         "bid": 1_000.0,
         "ask": 1_050.0,
         "exit_depth_contracts": 100,
+        # خروج دقیقاً روی بهترین مظنه پر می‌شود → لغزش صفر
+        "exit_fill_price": 1_000.0,
+        "best_exit_price": 1_000.0,
         "open_interest": 5_000,
         "trades_today": 40,
         "days_to_expiry": 30,
-        "quote_age_seconds": 0.0,
+        "quote_age_seconds": 5.0,
     }
     base.update(overrides)
     return LiquidityObservation(**base)
@@ -69,7 +73,8 @@ def test_a_contract_with_no_exit_bid_is_rejected(tmp_path):
     """
     del tmp_path
     report = evaluate(
-        _observation(bid=None, exit_depth_contracts=0),
+        _observation(bid=None, exit_depth_contracts=0, exit_fill_price=None,
+                     best_exit_price=None),
         HEALTHY,
         Thresholds(),
     )
@@ -93,7 +98,7 @@ def test_a_high_score_cannot_buy_its_way_past_the_gate():
     """
     report = evaluate(
         _observation(open_interest=1_000_000, trades_today=5_000,
-                     exit_depth_contracts=0),
+                     exit_depth_contracts=0, exit_fill_price=None),
         HEALTHY,
         Thresholds(),
     )
@@ -111,7 +116,8 @@ def test_the_same_contract_passes_small_and_fails_large():
         _observation(quantity=5, exit_depth_contracts=10), HEALTHY, thresholds
     )
     large = evaluate(
-        _observation(quantity=50, exit_depth_contracts=10), HEALTHY, thresholds
+        _observation(quantity=50, exit_depth_contracts=10, exit_fill_price=None),
+        HEALTHY, thresholds
     )
 
     assert small.verdict is Verdict.TRADABLE
@@ -140,7 +146,8 @@ def test_missing_history_is_needs_review_not_tradable():
 
 def test_thin_history_is_needs_review_not_tradable():
     """تاریخچه‌ی کوتاه‌تر از حداقل هم قضاوت‌پذیر نیست."""
-    thin = HistoryStats(sessions=2, sessions_with_trades=2, known=True)
+    thin = HistoryStats(sessions=2, sessions_with_trades=2, known=True,
+                        sessions_verified=True)
     report = evaluate(_observation(), thin, Thresholds(min_history_sessions=5))
 
     assert report.verdict is Verdict.NEEDS_REVIEW
@@ -149,7 +156,8 @@ def test_thin_history_is_needs_review_not_tradable():
 
 def test_history_with_many_silent_sessions_is_rejected():
     """تاریخچه‌ی موجود ولی پر از روزِ بدون معامله = رد، نه نامعلوم."""
-    silent = HistoryStats(sessions=20, sessions_with_trades=4, known=True)
+    silent = HistoryStats(sessions=20, sessions_with_trades=4, known=True,
+                          sessions_verified=True)
     report = evaluate(_observation(), silent, Thresholds())
 
     assert report.verdict is Verdict.REJECTED
@@ -160,7 +168,8 @@ def test_history_with_many_silent_sessions_is_rejected():
 def test_unknown_and_failed_together_still_rejects():
     """یک سنجه‌ی ردشده، حتی کنار سنجه‌ی نامعلوم، حکم را رد می‌کند."""
     report = evaluate(
-        _observation(exit_depth_contracts=0), HistoryStats(known=False), Thresholds()
+        _observation(exit_depth_contracts=0, exit_fill_price=None),
+        HistoryStats(known=False), Thresholds()
     )
     assert report.verdict is Verdict.REJECTED
 
@@ -232,6 +241,21 @@ def _recorder_db(path, sessions: list[tuple[str, int]]) -> None:
             "INSERT INTO quotes VALUES (?, ?, 100.0, 110.0, ?)",
             (f"s{index}", INS_CODE, trades),
         )
+    connection.commit()
+    connection.close()
+
+
+def _append_session(path, day: str, trades: int) -> None:
+    """یک جلسه‌ی تازه به پایگاه اضافه می‌کند — شبیه‌سازی کارِ recorder."""
+    connection = sqlite3.connect(str(path))
+    connection.execute(
+        "INSERT INTO snapshots VALUES (?, ?, 'complete')",
+        (f"s-{day}", f"{day}T10:00:00+03:30"),
+    )
+    connection.execute(
+        "INSERT INTO quotes VALUES (?, ?, 100.0, 110.0, ?)",
+        (f"s-{day}", INS_CODE, trades),
+    )
     connection.commit()
     connection.close()
 
@@ -355,7 +379,7 @@ def test_screener_uses_multi_level_depth_for_the_exit_side():
     report = screener.evaluate_symbol(SYMBOL, position_side="buy", quantity=10)
 
     depth = next(c for c in report.checks if c.key == "exit_depth")
-    assert depth.value == pytest.approx(1.0), "۳+۱۲ سطح، ۱۰ تا پر می‌شود"
+    assert depth.value == pytest.approx(1.5), "عمق کل ۱۵ است، تقسیم بر ۱۰"
 
 
 def test_screener_falls_back_to_level_one_without_an_order_book():
@@ -370,6 +394,8 @@ def test_screener_falls_back_to_level_one_without_an_order_book():
     report = screener.evaluate_symbol(SYMBOL, position_side="buy", quantity=7)
     depth = next(c for c in report.checks if c.key == "exit_depth")
     assert depth.value == pytest.approx(1.0)
+    slippage = next(c for c in report.checks if c.key == "exit_slippage")
+    assert slippage.value == pytest.approx(0.0), "تک‌سطحی، پس بدون لغزش"
 
 
 def test_screener_treats_a_missing_field_as_unknown_not_zero():
@@ -399,3 +425,210 @@ def test_screener_rejects_an_unknown_symbol_without_raising():
     report = screener.evaluate_symbol("ناشناخته", position_side="buy", quantity=1)
     assert report.verdict is Verdict.NEEDS_REVIEW
     assert report.unknown
+
+
+# ======================================================================
+# رگرسیون بازبینی دوم PR #6
+# ======================================================================
+class _AgingBooks:
+    """کلاینتی که هم دفتر می‌دهد هم عمرِ کش را اعلام می‌کند."""
+
+    def __init__(self, book: OrderBook | None, age: float | None) -> None:
+        self.book = book
+        self.age = age
+
+    def try_get_order_book(self, ins_code: str, symbol: str = "") -> OrderBook | None:
+        del ins_code, symbol
+        return self.book
+
+    def cache_age_seconds(self, ins_code: str) -> float | None:
+        del ins_code
+        return self.age
+
+
+def _deep_book(bid_levels, ask_levels=((1_050.0, 100),)) -> OrderBook:
+    return OrderBook(
+        SYMBOL,
+        bids=tuple(BookLevel(p, q) for p, q in bid_levels),
+        asks=tuple(BookLevel(p, q) for p, q in ask_levels),
+    )
+
+
+def _screener(book, age=0.0, **threshold_overrides) -> TradabilityScreener:
+    defaults = {"min_history_sessions": 1}
+    defaults.update(threshold_overrides)
+    return TradabilityScreener(
+        resolve_contract=lambda s: _contract(),
+        thresholds=Thresholds(**defaults),
+        order_book_client=_AgingBooks(book, age=age),
+        history=None,
+    )
+
+
+# --- ۱. تازگی واقعی ---------------------------------------------------
+def test_quote_age_comes_from_the_real_cache_age_not_a_constant():
+    """پیش از این صفرِ ثابت بود، پس آستانه‌ی کهنگی هرگز اثر نمی‌کرد."""
+    report = _screener(_deep_book([(1_000.0, 100)]), age=42.0).evaluate_symbol(
+        SYMBOL, "buy", 1
+    )
+    age = next(c for c in report.checks if c.key == "quote_age")
+
+    assert age.value == pytest.approx(42.0), "عمر واقعی، نه صفرِ ثابت"
+
+
+def test_the_staleness_threshold_actually_changes_the_verdict():
+    """همان دادهٔ کهنه، با آستانه‌ی سخت‌گیرانه رد می‌شود."""
+    book = _deep_book([(1_000.0, 100)])
+
+    lenient = _screener(book, age=90.0, max_quote_age_seconds=120.0).evaluate_symbol(
+        SYMBOL, "buy", 1
+    )
+    strict = _screener(book, age=90.0, max_quote_age_seconds=30.0).evaluate_symbol(
+        SYMBOL, "buy", 1
+    )
+
+    assert next(c for c in lenient.checks if c.key == "quote_age").passed is True
+    assert strict.verdict is Verdict.REJECTED
+    assert "quote_age" in {c.key for c in strict.failed}
+
+
+def test_an_unknown_cache_age_is_unknown_not_fresh():
+    """کلاینتی که عمر نمی‌دهد، «تازه» تفسیر نمی‌شود."""
+    report = _screener(_deep_book([(1_000.0, 100)]), age=None).evaluate_symbol(
+        SYMBOL, "buy", 1
+    )
+    age = next(c for c in report.checks if c.key == "quote_age")
+
+    assert age.is_unknown
+    assert report.verdict is Verdict.NEEDS_REVIEW
+
+
+def test_missing_market_timestamp_is_stated_explicitly():
+    """زمانِ دریافت جای زمانِ بازار معرفی نمی‌شود."""
+    report = evaluate(_observation(), HEALTHY, Thresholds())
+
+    assert report.observation.source_time_known is False
+    assert "زمان بازار نامعلوم" in report.source_time_note
+    age = next(c for c in report.checks if c.key == "quote_age")
+    assert "نه زمان بازار" in age.label
+
+
+# --- ۲. ظرفیت خروج با قیمت قابل‌قبول ---------------------------------
+def test_depth_ratio_is_not_capped_at_one():
+    """عمقِ سه‌برابرِ سفارش باید ۳ گزارش شود، نه ۱.
+
+    پیش از این `fill_price` مبنا بود که حداکثر به اندازه‌ی سفارش پر
+    می‌کند، پس نسبت هرگز از ۱ بالاتر نمی‌رفت و حاشیه‌ی اطمینان دیده
+    نمی‌شد.
+    """
+    report = _screener(_deep_book([(1_000.0, 30)])).evaluate_symbol(SYMBOL, "buy", 10)
+    depth = next(c for c in report.checks if c.key == "exit_depth")
+
+    assert depth.value == pytest.approx(3.0), "۳۰ ÷ ۱۰"
+
+
+def test_depth_far_from_the_touch_does_not_count_as_capacity():
+    """حجم در قیمت‌های دور، سفارش را پر می‌کند ولی ظرفیت خروج نیست.
+
+    بهترین مظنه ۱۰۰۰ ولی فقط ۱ قرارداد؛ بقیه در ۵۰۰. سفارش ۱۰تایی پر
+    می‌شود، با میانگین ۵۵۰ — یعنی ۴۵٪ لغزش.
+    """
+    book = _deep_book([(1_000.0, 1), (500.0, 100)])
+    report = _screener(book, max_exit_slippage_pct=10.0).evaluate_symbol(
+        SYMBOL, "buy", 10
+    )
+    slippage = next(c for c in report.checks if c.key == "exit_slippage")
+
+    assert report.verdict is Verdict.REJECTED
+    assert slippage.passed is False
+    assert slippage.value == pytest.approx(45.0, abs=0.1)
+    # عمق «کافی» بود — رد فقط به‌خاطر قیمت است.
+    assert next(c for c in report.checks if c.key == "exit_depth").passed is True
+
+
+def test_a_generous_slippage_threshold_accepts_the_same_book():
+    """همان دفتر با آستانه‌ی بازتر پذیرفته می‌شود — آستانه واقعاً اثر دارد."""
+    book = _deep_book([(1_000.0, 1), (500.0, 100)])
+    report = _screener(book, max_exit_slippage_pct=50.0).evaluate_symbol(
+        SYMBOL, "buy", 10
+    )
+
+    assert next(c for c in report.checks if c.key == "exit_slippage").passed is True
+
+
+def test_slippage_direction_follows_the_exit_side():
+    """خروجِ long با قیمتِ پایین‌تر بد است؛ بازخریدِ short با بالاتر."""
+    long_exit = _observation(
+        position_side="buy", best_exit_price=1_000.0, exit_fill_price=900.0
+    )
+    short_exit = _observation(
+        position_side="sell", best_exit_price=1_000.0, exit_fill_price=1_100.0
+    )
+
+    assert long_exit.exit_slippage_pct == pytest.approx(10.0)
+    assert short_exit.exit_slippage_pct == pytest.approx(10.0)
+
+
+# --- ۳. تاریخچه‌ی زنده و روز معاملاتی --------------------------------
+_TRADING = {date(2026, 9, 8), date(2026, 9, 9), date(2026, 9, 10)}
+
+
+def test_a_non_trading_day_is_not_counted_as_a_session(tmp_path):
+    """۲۰۲۶-۰۹-۱۱ جمعه بود؛ snapshotش ماندهٔ جلسه‌ی قبل است.
+
+    شمردنش به‌عنوان «روزِ دارای معامله» همان ادعای نادرستی است که این
+    اصلاح جلویش را می‌گیرد.
+    """
+    db = tmp_path / "market.db"
+    _recorder_db(db, [("2026-09-10", 5), ("2026-09-11", 5)])
+
+    with MarketHistoryReader(db, is_trading_day=lambda d: d in _TRADING) as reader:
+        stats = reader.stats_for(INS_CODE)
+
+    assert stats.sessions == 1, "فقط پنج‌شنبه، نه جمعه"
+    assert stats.skipped_non_trading_days == 1
+    assert stats.sessions_verified is True
+
+
+def test_without_a_calendar_the_history_is_unverified(tmp_path):
+    """بدون تقویم هیچ روزی حذف نمی‌شود، ولی تأیید هم نمی‌شود."""
+    db = tmp_path / "market.db"
+    _recorder_db(db, [(f"2026-09-{d:02d}", 5) for d in range(1, 11)])
+
+    with MarketHistoryReader(db) as reader:
+        stats = reader.stats_for(INS_CODE)
+
+    assert stats.known is True
+    assert stats.sessions_verified is False
+    report = evaluate(_observation(), stats, Thresholds(min_history_sessions=1))
+    assert report.verdict is Verdict.NEEDS_REVIEW, "تأییدنشده = نامعلوم"
+    assert "تأیید نشد" in report.reason
+
+
+def test_new_snapshots_are_seen_without_a_restart(tmp_path):
+    """داده‌ای که در طول اجرا اضافه شود، بدون راه‌اندازی مجدد دیده شود."""
+    db = tmp_path / "market.db"
+    _recorder_db(db, [("2026-09-08", 5)])
+    reader = MarketHistoryReader(db, is_trading_day=lambda d: d in _TRADING)
+    assert reader.stats_for(INS_CODE).sessions == 1
+
+    _append_session(db, "2026-09-09", 7)
+    _append_session(db, "2026-09-10", 3)
+
+    assert reader.stats_for(INS_CODE).sessions == 3, "بدون راه‌اندازی مجدد"
+    reader.close()
+
+
+def test_a_database_created_later_is_picked_up(tmp_path):
+    """پایگاهی که اول نبود و بعد ساخته شد، همان لحظه وصل می‌شود."""
+    db = tmp_path / "later.db"
+    reader = MarketHistoryReader(db, is_trading_day=lambda d: d in _TRADING)
+
+    assert reader.available is False
+    assert reader.stats_for(INS_CODE).known is False
+
+    _recorder_db(db, [("2026-09-09", 4)])
+
+    assert reader.available is True, "بدون راه‌اندازی مجدد"
+    assert reader.stats_for(INS_CODE).sessions == 1
+    reader.close()
