@@ -1212,6 +1212,7 @@ async function loadPaperSettings() {
     $("#paper-fee-sell").value = fees.sell_rate ?? 0;
     $("#paper-fee-tax").value = fees.sell_tax_rate ?? 0;
     $("#paper-fee-per-order").value = fees.per_order ?? 0;
+    $("#paper-fee-declared").checked = !!fees.declared;
   } catch (err) {
     const note = $("#paper-settings-note");
     note.className = "note bad";
@@ -1234,6 +1235,7 @@ $("#btn-save-paper-settings").addEventListener("click", async () => {
           sell_rate: Number($("#paper-fee-sell").value),
           sell_tax_rate: Number($("#paper-fee-tax").value),
           per_order: Number($("#paper-fee-per-order").value),
+          declared: $("#paper-fee-declared").checked,
         },
       }),
     });
@@ -1361,11 +1363,17 @@ function paperNotices(a) {
     if ((a.positions_with_unknown_cost || []).length) {
       parts.push(`موقعیت ${a.positions_with_unknown_cost.join("، ")}`);
     }
+    if (!parts.length) parts.push("بخشی از عملیات حساب");
+    // دو علتِ ممکن، و هر دو واقعی‌اند: نرخی که هنگام آن عملیات تنظیم
+    // نشده بود، یا ردیفی که پیش از تفکیک هزینه‌ها ثبت شده.
+    const why = a.rates_configured
+      ? "ثبت‌شده پیش از تفکیک هزینه‌ها"
+      : "هنگام آن عملیات نرخی تنظیم نشده بود";
     box.append(el(
       "div", "warnbar",
-      `هزینه‌ی ${parts.join(" و ")} دانسته نیست (ثبت‌شده پیش از تفکیک ` +
-      "هزینه‌ها). تا آن موقع «خالص» به‌عنوان عدد قطعی نمایش داده نمی‌شود؛ " +
-      "ناخالص و هزینه‌های ثبت‌شده همچنان درست‌اند.",
+      `هزینه‌ی ${parts.join(" و ")} دانسته نیست (${why}). ` +
+      "«خالص» برایشان عدد قطعی نمی‌گیرد؛ ناخالص و هزینه‌های ثبت‌شده " +
+      "همچنان درست‌اند. تنظیم نرخ از این به بعد اثر دارد، نه بر گذشته.",
     ));
   }
 

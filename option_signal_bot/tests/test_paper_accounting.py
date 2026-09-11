@@ -350,29 +350,114 @@ def test_insufficient_exit_depth_is_not_marked_at_a_partial_price(tmp_path):
 # ======================================================================
 # سناریو ۶ — هزینه‌ی مشخص‌نشده
 # ======================================================================
-def test_zero_rates_are_recorded_costs_not_unknown_costs(tmp_path):
-    """نرخ صفر یعنی هزینه **صفر بوده**، نه اینکه دانسته نیست.
+def test_unset_rates_make_the_cost_unknown_not_zero(tmp_path):
+    """صفرِ **پیش‌فرضِ** نرخ، هزینه‌ی دانسته نیست.
 
-    این دو با هم فرق دارند: هزینه‌ی ثبت‌شده‌ی صفر یک واقعیت است و خالص
-    را معنادار می‌گذارد؛ «دانسته نیست» یعنی نمی‌شود خالص داد. پرچمِ
-    جدا (`rates_configured`) فقط می‌گوید برای معامله‌های **بعدی** نرخی
-    وارد نشده.
+    پیش از این، معامله‌ای که با `FeeSchedule()` انجام می‌شد کارمزدش صفر
+    ثبت می‌شد و همان صفر «دانسته» خوانده می‌شد — پس «خالص» عددِ قطعی
+    می‌گرفت در حالی که هیچ نرخی وارد نشده بود.
     """
+    broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0), fees=FeeSchedule())
+    broker.place_order(SYMBOL, "buy", 5)
+
+    snapshot = broker.account_snapshot()
+    valuation = snapshot.positions[0]
+
+    assert snapshot.rates_configured is False
+    assert valuation.entry_fees_known is False
+    assert valuation.unrealized_gross == pytest.approx(1_000_000.0), "ناخالص معلوم است"
+    assert valuation.unrealized_net is None, "خالص نه"
+    assert snapshot.costs_known is False
+    assert snapshot.unrealized_net is None
+    assert snapshot.equity is not None, "ارزش حساب به هزینه وابسته نیست"
+
+
+def test_unset_rates_keep_both_fees_unknown_through_a_close(tmp_path):
+    """خروج هم همان قاعده را دارد: کارمزد خروجِ نامعلوم، `NULL` می‌ماند."""
     broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0), fees=FeeSchedule())
     broker.place_order(SYMBOL, "buy", 5)
     broker.place_order(SYMBOL, "sell", 5)
 
+    trade = broker.store.list_trades()[0]
+    assert trade["entry_fee"] is None
+    assert trade["exit_fee"] is None
+    assert trade["gross_pnl"] == pytest.approx(1_000_000.0), "ناخالص درست است"
+    assert trade["return_on_cost_pct"] is None
+
     snapshot = broker.account_snapshot()
-    assert snapshot.rates_configured is False
-    assert snapshot.costs_known is True
+    assert snapshot.costs_known is False
+    assert snapshot.realized.net is None
     assert snapshot.realized.gross == pytest.approx(1_000_000.0)
-    assert snapshot.realized.costs == 0.0
+    assert snapshot.realized.trades_missing_entry_cost == 1
+    assert snapshot.realized.trades_missing_exit_cost == 1
+
+
+def test_unset_rates_keep_the_cost_unknown_through_a_partial_exit(tmp_path):
+    """خروج جزئی هم نامعلومی را نگه می‌دارد، هم روی معامله و هم روی مانده."""
+    broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0, qty=50), fees=FeeSchedule())
+    broker.place_order(SYMBOL, "buy", 10)
+    broker.place_order(SYMBOL, "sell", 4)
+
+    trade = broker.store.list_trades()[0]
+    assert trade["entry_fee"] is None and trade["exit_fee"] is None
+    assert broker.store.get_position(SYMBOL)["entry_fees_known"] == 0
+    assert broker.account_snapshot().costs_known is False
+
+
+def test_an_explicitly_declared_zero_rate_is_a_known_cost(tmp_path):
+    """صفرِ **اعلام‌شده** با صفرِ پیش‌فرض یکی نیست.
+
+    اگر کاربر بگوید «کارمزد من واقعاً صفر است»، هزینه دانسته است و خالص
+    عددِ قطعی می‌گیرد. بدون این تفکیک، حسابِ بی‌کارمزد هرگز نمی‌توانست
+    خالص نشان بدهد.
+    """
+    broker = _broker(
+        tmp_path, _book(bid=1_200.0, ask=1_000.0), fees=FeeSchedule(declared=True)
+    )
+    broker.place_order(SYMBOL, "buy", 5)
+    broker.place_order(SYMBOL, "sell", 5)
+
+    snapshot = broker.account_snapshot()
+    trade = broker.store.list_trades()[0]
+
+    assert snapshot.rates_configured is True
+    assert snapshot.costs_known is True
+    assert trade["entry_fee"] == 0.0 and trade["exit_fee"] == 0.0
     assert snapshot.realized.net == pytest.approx(1_000_000.0)
+    assert snapshot.reconciliation["ok"] is True
 
 
-def test_rates_configured_is_reported_separately(tmp_path):
-    broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0))
-    assert broker.account_snapshot().rates_configured is True
+def test_setting_a_rate_later_does_not_make_past_costs_known(tmp_path):
+    """تنظیم نرخ بعدی نباید سابقه‌ی نامعلوم را معلوم کند.
+
+    پرچمِ «دانسته بودن» هنگام **همان عملیات** روی ردیف می‌نشیند، پس
+    تغییر بعدیِ تنظیمات چیزی را بازنویسی نمی‌کند.
+    """
+    broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0, qty=100), fees=FeeSchedule())
+    broker.place_order(SYMBOL, "buy", 5)  # زیر نرخِ نامعلوم
+
+    # کاربر حالا نرخ واقعی را وارد می‌کند.
+    broker.fees = FEES
+
+    assert broker.rates_configured() is True
+    assert broker.account_snapshot().costs_known is False, "سابقه نباید معلوم شود"
+
+    # خریدِ تازه دانسته است، ولی جمعِ موقعیت همچنان نامعلوم می‌ماند.
+    broker.place_order(SYMBOL, "buy", 5)
+    assert broker.store.get_position(SYMBOL)["entry_fees_known"] == 0
+
+
+def test_a_later_close_of_an_unknown_position_stays_unknown(tmp_path):
+    """حتی با نرخِ تازه، بستنِ موقعیتِ نامعلوم خالصِ قطعی نمی‌دهد."""
+    broker = _broker(tmp_path, _book(bid=1_200.0, ask=1_000.0, qty=100), fees=FeeSchedule())
+    broker.place_order(SYMBOL, "buy", 5)
+    broker.fees = FEES
+    broker.place_order(SYMBOL, "sell", 5)
+
+    trade = broker.store.list_trades()[0]
+    assert trade["entry_fee"] is None, "ورودش زیر نرخِ نامعلوم بود"
+    assert trade["exit_fee"] == pytest.approx(18_000.0), "خروجش دانسته است"
+    assert broker.account_snapshot().costs_known is False
 
 
 # ======================================================================

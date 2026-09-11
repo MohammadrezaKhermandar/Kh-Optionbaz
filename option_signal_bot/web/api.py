@@ -126,6 +126,9 @@ def _paper_broker(settings: dict[str, Any]):
         sell_rate=fee_config.get("sell_rate", 0.0),
         sell_tax_rate=fee_config.get("sell_tax_rate", 0.0),
         per_order=fee_config.get("per_order", 0.0),
+        # صفرِ اعلام‌شده از صفرِ پیش‌فرض جدا می‌ماند: اولی هزینه‌ی دانسته
+        # است، دومی یعنی «نمی‌دانیم».
+        declared=bool(fee_config.get("declared", False)),
     )
 
     context = create_app(settings, dry_run=True, as_json=False)
@@ -783,7 +786,8 @@ class BrokerUpdate(BaseModel):
 class PaperTradingUpdate(BaseModel):
     enabled: bool | None = None
     initial_balance: float | None = None
-    fees: dict[str, float] | None = None
+    #: نرخ‌ها به‌علاوه‌ی پرچم بولیِ `declared`، پس مقدارها هم‌جنس نیستند.
+    fees: dict[str, float | bool] | None = None
 
 
 class PaperOrderRequest(BaseModel):

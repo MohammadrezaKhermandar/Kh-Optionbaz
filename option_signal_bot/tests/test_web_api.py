@@ -274,7 +274,14 @@ def paper_order_book(monkeypatch):
 def _enable_paper_trading(client) -> None:
     response = client.put(
         "/api/paper-trading/settings",
-        json={"enabled": True, "initial_balance": PAPER_BALANCE},
+        json={
+            "enabled": True,
+            "initial_balance": PAPER_BALANCE,
+            # صفرِ **اعلام‌شده**: بدون آن هزینه‌ها نامعلوم‌اند و «خالص»
+            # عدد نمی‌گیرد، که موضوع این تست‌ها نیست.
+            "fees": {"buy_rate": 0.0, "sell_rate": 0.0, "sell_tax_rate": 0.0,
+                     "per_order": 0.0, "declared": True},
+        },
     )
     assert response.status_code == 200
 

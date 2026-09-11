@@ -303,9 +303,17 @@ class PaperBroker(OrderExecutorInterface):
         notional = avg_price * filled_qty * contract.contract_size
         self.store.update_cash(account["cash"] - notional - fee)
 
+        # ⚠️ «دانسته بودن» در همان لحظه‌ی عملیات قفل می‌شود. اگر نرخی
+        # تنظیم نشده باشد، عددِ صفرِ `fee` پیش‌فرضِ پروژه است نه هزینه‌ی
+        # واقعی — پس نامعلوم ثبت می‌شود. تنظیم نرخ در آینده این سابقه را
+        # معلوم نمی‌کند.
+        fee_known = self.fees.rates_known
         existing = self.store.get_position(symbol)
         if existing is None:
-            self.store.upsert_position(symbol, filled_qty, avg_price, now, entry_fees=fee)
+            self.store.upsert_position(
+                symbol, filled_qty, avg_price, now,
+                entry_fees=fee, entry_fees_known=fee_known,
+            )
             return
         new_qty = existing["quantity"] + filled_qty
         old_cost = existing["quantity"] * existing["average_price"]
@@ -318,7 +326,9 @@ class PaperBroker(OrderExecutorInterface):
             new_avg,
             existing["opened_at"],
             entry_fees=self._entry_fees_of(existing) + fee,
-            entry_fees_known=self._entry_fees_known_of(existing),
+            # خرید افزایشی: جمع فقط وقتی دانسته است که **هر دو** بخشش
+            # دانسته باشند.
+            entry_fees_known=self._entry_fees_known_of(existing) and fee_known,
         )
 
     def _apply_sell(
@@ -363,7 +373,7 @@ class PaperBroker(OrderExecutorInterface):
             exit_price=avg_price,
             # سهمی از عددی که دانسته نیست، خودش هم دانسته نیست.
             entry_fee=entry_fee_share if entry_fees_known else None,
-            exit_fee=fee,
+            exit_fee=fee if self.fees.rates_known else None,
             contract_size=contract.contract_size,
             opened_at=opened_at,
             closed_at=now,
@@ -379,7 +389,7 @@ class PaperBroker(OrderExecutorInterface):
         entry_price: float,
         exit_price: float,
         entry_fee: float | None,
-        exit_fee: float,
+        exit_fee: float | None,
         contract_size: int,
         opened_at: str,
         closed_at: str,
@@ -388,13 +398,17 @@ class PaperBroker(OrderExecutorInterface):
     ) -> dict[str, object]:
         """ثبت یک معامله‌ی بسته‌شده با تفکیک کاملِ ناخالص و هزینه‌ها."""
         gross = (exit_price - entry_price) * quantity * contract_size
-        # `entry_fee is None` یعنی سهمِ کارمزد ورود دانسته نیست (موقعیتِ
-        # مهاجرت‌شده). آن‌وقت خالص و درصدش هم دانسته نیستند و `None`
-        # ثبت می‌شوند — صفر گرفتنشان یعنی ادعای بی‌هزینه بودن.
-        net = None if entry_fee is None else gross - entry_fee - exit_fee
+        # `None` در هرکدام از دو هزینه یعنی دانسته نیست — چه موقعیتِ
+        # مهاجرت‌شده باشد و چه نرخی که هنگام عملیات تنظیم نشده بود.
+        # آن‌وقت خالص و درصدش هم دانسته نیستند و صفر گرفتنشان یعنی ادعای
+        # بی‌هزینه بودن.
+        costs_known = entry_fee is not None and exit_fee is not None
+        recorded_costs = (entry_fee or 0.0) + (exit_fee or 0.0)
+        net = gross - recorded_costs if costs_known else None
         cost_basis = (
-            None if entry_fee is None
-            else entry_price * quantity * contract_size + entry_fee
+            entry_price * quantity * contract_size + entry_fee
+            if entry_fee is not None
+            else None
         )
         trade = {
             "trade_id": str(uuid.uuid4()),
@@ -404,14 +418,16 @@ class PaperBroker(OrderExecutorInterface):
             "exit_price": exit_price,
             # `fee_paid` برای سازگاری با ردیف‌های قدیمی می‌ماند و حالا
             # **کل** هزینه‌ی همین معامله است، نه فقط کارمزد خروج.
-            "fee_paid": (0.0 if entry_fee is None else entry_fee) + exit_fee,
+            # `fee_paid` فقط هزینه‌های **ثبت‌شده** را جمع می‌زند.
+            "fee_paid": recorded_costs,
             "entry_fee": entry_fee,
             "exit_fee": exit_fee,
             "gross_pnl": gross,
             # ستون `pnl_absolute` در اسکیما NOT NULL است؛ وقتی خالص
             # دانسته نیست، **ناخالص منهای هزینه‌های ثبت‌شده** می‌نشیند —
-            # همان کفِ زیان. `entry_fee IS NULL` علامتِ ناقص بودنش است.
-            "pnl_absolute": gross - exit_fee if net is None else net,
+            # همان کفِ زیان. `NULL` بودنِ یکی از دو ستون هزینه، علامتِ
+            # ناقص بودنش است.
+            "pnl_absolute": gross - recorded_costs if net is None else net,
             # درصدِ معنادار: نسبت به پولی که واقعاً درگیر شد.
             "pnl_pct": return_on_cost_pct(net, cost_basis) or 0.0,
             "return_on_cost_pct": return_on_cost_pct(net, cost_basis),
@@ -557,7 +573,7 @@ class PaperBroker(OrderExecutorInterface):
         محاسبه‌ی «هزینه دانسته است یا نه» دخالت نمی‌کند: نرخی که امروز
         وارد شده، چیزی درباره‌ی هزینه‌ی معامله‌ی دیروز نمی‌گوید.
         """
-        return not self.fees.is_zero
+        return self.fees.rates_known
 
     def account_snapshot(self, today: date | None = None) -> AccountSnapshot:
         """عکسِ کامل و قابل تطبیق حساب — همان چیزی که داشبورد نشان می‌دهد."""
@@ -637,6 +653,9 @@ class PaperBroker(OrderExecutorInterface):
         fee = self.fees.exit_cost(notional, was_buy=True)
         now = datetime.now().isoformat(timespec="seconds")
         entry_fees_total = self._entry_fees_of(position)
+        # تسویه هم یک خروج است و همان قاعده را دارد: نه هزینه‌ی ورودِ
+        # نامعلوم را معلوم می‌کند، نه صفرِ پیش‌فرضِ نرخ را هزینه‌ی دانسته.
+        entry_fees_known = self._entry_fees_known_of(position)
 
         with self.store.transaction():
             account = self.store.get_account()
@@ -647,8 +666,8 @@ class PaperBroker(OrderExecutorInterface):
                 quantity=quantity,
                 entry_price=float(position["average_price"]),
                 exit_price=settlement_price,
-                entry_fee=entry_fees_total,
-                exit_fee=fee,
+                entry_fee=entry_fees_total if entry_fees_known else None,
+                exit_fee=fee if self.fees.rates_known else None,
                 contract_size=contract_size,
                 opened_at=str(position["opened_at"]),
                 closed_at=now,

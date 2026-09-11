@@ -58,6 +58,10 @@ def _contract(expiry_days: int = 30, last_price: float = 1000.0) -> OptionContra
 
 
 def _broker(tmp_path, book: OrderBook, contract: OptionContract | None = None, fees=None):
+    # نرخِ صفرِ **اعلام‌شده**: این فایل موضوعش fill و میانگین‌گیری است، نه
+    # «هزینه دانسته است یا نه». صفرِ پیش‌فرض هزینه را نامعلوم می‌کرد و
+    # معیارهای عملکرد را هم بی‌عدد — که ربطی به موضوع این تست‌ها ندارد.
+    fees = fees or FeeSchedule(declared=True)
     store = PaperTradingStore(tmp_path / "paper.db")
     contract = contract or _contract()
     resolve_contract = lambda symbol: contract if symbol == SYMBOL else None  # noqa: E731
