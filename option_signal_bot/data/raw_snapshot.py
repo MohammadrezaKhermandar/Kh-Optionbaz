@@ -22,7 +22,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 #: نسخه‌ی نگاشت این ماژول. با هر تغییر در معنا یا واحد فیلدها بالا
@@ -109,6 +110,9 @@ class ContractQuote:
     previous_open_interest: int | None
     notional_value: float | None
     remained_day: int | None
+    #: فیلدهایی که منبع داد ولی معتبر نبودند (NaN، بی‌نهایت، کسر برای
+    #: فیلد صحیح، …). مقدارشان `None` شده ولی **علتشان گم نمی‌شود**.
+    invalid_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,22 +130,62 @@ class UnderlyingQuote:
     last_price: float | None
     close_price: float | None
     previous_close: float | None
+    #: مثل `ContractQuote.invalid_fields` — خطای تبدیل قیمت پایه هم
+    #: دور ریخته نمی‌شود.
+    invalid_fields: tuple[str, ...] = ()
 
 
 @dataclass
 class ExtractionResult:
-    """نتیجه‌ی استخراج یک payload کامل."""
+    """نتیجه‌ی استخراج یک payload کامل.
+
+    `quotes` فقط شامل مشاهده‌هایی است که **واقعاً ثبت می‌شوند**، پس
+    `contract_count` با تعداد ردیف‌های نوشته‌شده در پایگاه یکی است.
+    مشاهده‌ی متعارض از این فهرست بیرون می‌ماند و در `conflicts` می‌نشیند.
+    """
 
     quotes: list[ContractQuote] = field(default_factory=list)
     underlyings: list[UnderlyingQuote] = field(default_factory=list)
     #: ردیف‌هایی که استخراج نشدند، با دلیل. **بی‌صدا حذف نمی‌شوند** —
     #: در پایگاه ثبت می‌شوند تا بعداً از payload خام قابل بازیابی باشند.
     rejected: list[RejectedRow] = field(default_factory=list)
+    #: تعارض‌ها: یک شناسه با **مقادیر متفاوت** در همان پاسخ. هیچ‌کدام
+    #: ثبت نمی‌شوند تا انتخابِ بی‌صدا رخ ندهد.
+    conflicts: list[ConflictingRow] = field(default_factory=list)
+    #: تکرارِ **کاملاً یکسان**: بار دوم چیزی به داده اضافه نمی‌کند، پس
+    #: کنار گذاشته می‌شود و فقط شمرده می‌شود. این تعارض نیست.
+    duplicate_count: int = 0
     row_count: int = 0
 
     @property
     def contract_count(self) -> int:
+        """تعداد مشاهده‌ای که ثبت می‌شود — نه تعداد ردیف دیده‌شده."""
         return len(self.quotes)
+
+    @property
+    def has_conflicts(self) -> bool:
+        return bool(self.conflicts)
+
+    @property
+    def invalid_field_count(self) -> int:
+        """شمار کل فیلدهای نامعتبر، در قراردادها و نمادهای پایه."""
+        return sum(len(q.invalid_fields) for q in self.quotes) + sum(
+            len(u.invalid_fields) for u in self.underlyings
+        )
+
+    @property
+    def is_clean(self) -> bool:
+        """آیا استخراج بدون هیچ مشکلی تمام شد؟
+
+        فیلد عددیِ نامعتبر هم مشکل است: مقدارش `NULL` شده و آن ستون در
+        این مشاهده داده‌ای ندارد. چنین snapshotای نباید `complete`
+        معمولی معرفی شود.
+        """
+        return (
+            not self.conflicts
+            and not self.rejected
+            and self.invalid_field_count == 0
+        )
 
 
 @dataclass(frozen=True)
@@ -154,6 +198,22 @@ class RejectedRow:
     ins_code: str | None = None
 
 
+@dataclass(frozen=True)
+class ConflictingRow:
+    """یک شناسه که در همان پاسخ با **مقادیر متفاوت** تکرار شده.
+
+    فرق مهمش با `RejectedRow`: ردیف ردشده قابل استخراج نبود؛ اینجا هر
+    دو نسخه قابل استخراج بودند ولی با هم نمی‌خوانند و **معلوم نیست
+    کدام درست است**. پس هیچ‌کدام ثبت نمی‌شوند.
+    """
+
+    kind: str  # "contract" | "underlying"
+    key: str  # ins_code یا نماد پایه
+    row_index: int
+    side: str
+    reason: str
+
+
 def _text(value: Any) -> str | None:
     """رشته‌ی تمیز، یا `None` اگر خالی باشد."""
     if value is None:
@@ -162,20 +222,53 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
-def _number(value: Any) -> float | None:
-    """عدد اعشاری، یا `None`. صفر **حفظ می‌شود** و به `None` تبدیل نمی‌شود."""
-    if value is None or isinstance(value, bool):
-        return None
+#: نتیجه‌ی تبدیل یک فیلد عددی: (مقدار، علتِ نامعتبربودن).
+#: هر دو `None` یعنی «منبع این فیلد را نداد» — که با «صفر داد» و با
+#: «چیزی داد که عدد نبود» سه حالت **متفاوت**اند.
+FieldResult = tuple[float | int | None, str | None]
+
+
+def _number(value: Any, field: str) -> FieldResult:
+    """عدد اعشاری.
+
+    سه حالت جدا:
+
+    * `(None, None)` — منبع این فیلد را نداد.
+    * `(0.0, None)` — منبع **صفر** داد. صفر حفظ می‌شود.
+    * `(None, "...")` — منبع چیزی داد که عدد معتبر نیست. مقدار وارد
+      ستون نمی‌شود ولی **علتش ثبت می‌گردد**، نه اینکه بی‌صدا `None` شود.
+
+    `NaN` و `Infinity` نامعتبرند: SQLite `Infinity` را می‌پذیرد و
+    `NaN` را بی‌صدا به `NULL` تبدیل می‌کند، پس هر دو باید همین‌جا
+    گرفته شوند وگرنه یا ستون آلوده می‌شود یا اطلاعات بی‌صدا می‌رود.
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, f"{field}: مقدار بولی برای فیلد عددی ({value!r})"
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
-        return None
+        return None, f"{field}: عدد نیست ({value!r})"
+    if math.isnan(number):
+        return None, f"{field}: NaN"
+    if math.isinf(number):
+        return None, f"{field}: بی‌نهایت ({value!r})"
+    return number, None
 
 
-def _integer(value: Any) -> int | None:
-    """عدد صحیح، یا `None`. صفر **حفظ می‌شود**."""
-    number = _number(value)
-    return None if number is None else int(number)
+def _integer(value: Any, field: str) -> FieldResult:
+    """عدد صحیح. کسر **بی‌صدا بریده نمی‌شود**.
+
+    اگر منبع برای فیلدی که باید صحیح باشد عدد کسری بدهد، آن یک تغییر
+    معنادار در داده است: `truncate` کردنش یعنی پنهان‌کردن همان تغییر.
+    """
+    number, reason = _number(value, field)
+    if reason is not None or number is None:
+        return None, reason
+    if float(number) != int(number):
+        return None, f"{field}: عدد صحیح نیست ({value!r})"
+    return int(number), None
 
 
 def extract(payload: dict[str, Any]) -> ExtractionResult:
@@ -203,7 +296,11 @@ def extract(payload: dict[str, Any]) -> ExtractionResult:
         )
 
     result = ExtractionResult(row_count=len(rows))
-    seen: dict[str, tuple] = {}
+    #: ins_code → (فهرستِ ایندکس در result.quotes، امضای کامل مشاهده)
+    seen: dict[str, tuple[int, tuple]] = {}
+    conflicted: set[str] = set()
+    seen_underlying: dict[str, tuple] = {}
+    conflicted_underlying: set[str] = set()
 
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
@@ -212,46 +309,162 @@ def extract(payload: dict[str, Any]) -> ExtractionResult:
             )
             continue
 
-        underlying = _extract_underlying(row)
-        if underlying is not None:
-            result.underlyings.append(underlying)
-
+        _collect_underlying(
+            row, index, result, seen_underlying, conflicted_underlying
+        )
         for side in ("C", "P"):
-            quote, rejection = _extract_side(row, side, index)
-            if rejection is not None:
-                result.rejected.append(rejection)
-                continue
+            _collect_side(row, side, index, result, seen, conflicted)
 
-            # شناسه‌ی تکراری با مشخصات **متعارض** نباید بی‌صدا
-            # overwrite شود؛ هر دو نگه داشته و تعارض ثبت می‌شود.
-            identity = quote.spec.identity()
-            previous = seen.get(quote.spec.ins_code)
-            if previous is not None and previous != identity:
-                result.rejected.append(
-                    RejectedRow(
-                        index,
-                        side,
-                        "کد یکتای تکراری با مشخصات متعارض در همین پاسخ",
-                        quote.spec.ins_code,
-                    )
-                )
-            else:
-                seen[quote.spec.ins_code] = identity
-            result.quotes.append(quote)
-
+    # مشاهده‌های متعارض از فهرست ثبت بیرون می‌روند تا `contract_count`
+    # با تعداد ردیف‌های واقعاً نوشته‌شده یکی بماند.
+    if conflicted:
+        result.quotes = [q for q in result.quotes if q.spec.ins_code not in conflicted]
+    if conflicted_underlying:
+        result.underlyings = [
+            u for u in result.underlyings if u.symbol not in conflicted_underlying
+        ]
     return result
+
+
+def _collect_side(
+    row: dict[str, Any],
+    side: str,
+    index: int,
+    result: ExtractionResult,
+    seen: dict[str, tuple[int, tuple]],
+    conflicted: set[str],
+) -> None:
+    """یک سمت را استخراج و در برابر تکرار/تعارض بررسی می‌کند."""
+    quote, rejection = _extract_side(row, side, index)
+    if rejection is not None:
+        result.rejected.append(rejection)
+        return
+    assert quote is not None
+
+    key = quote.spec.ins_code
+    signature = _signature(quote)
+    previous = seen.get(key)
+
+    if previous is None:
+        seen[key] = (index, signature)
+        result.quotes.append(quote)
+        return
+
+    if previous[1] == signature:
+        # تکرارِ کاملاً یکسان: بار دوم هیچ اطلاعاتی اضافه نمی‌کند.
+        # این تعارض نیست و snapshot را «مشکوک» نمی‌کند.
+        result.duplicate_count += 1
+        return
+
+    # تعارض: همان شناسه با مقادیر متفاوت. کدام درست است؟ نمی‌دانیم.
+    # پس **هیچ‌کدام** ثبت نمی‌شود و هر دو رخداد گزارش می‌شوند.
+    if key not in conflicted:
+        conflicted.add(key)
+        result.conflicts.append(
+            ConflictingRow(
+                "contract", key, previous[0], side,
+                "همین شناسه پیش‌تر در این پاسخ با مقادیر دیگری آمده بود",
+            )
+        )
+    result.conflicts.append(
+        ConflictingRow(
+            "contract", key, index, side,
+            f"شناسه‌ی تکراری با مقادیر متفاوت: {_first_difference(previous[1], signature)}",
+        )
+    )
+
+
+def _collect_underlying(
+    row: dict[str, Any],
+    index: int,
+    result: ExtractionResult,
+    seen: dict[str, tuple],
+    conflicted: set[str],
+) -> None:
+    """نماد پایه.
+
+    ⚠️ تکرارِ **یکسان** نماد پایه بین ردیف‌های استرایک کاملاً طبیعی است
+    (هر استرایک همان پایه را حمل می‌کند) و تعارض شمرده نمی‌شود. فقط
+    وقتی همان نماد با **قیمت متفاوت** بیاید، یعنی پاسخ با خودش
+    نمی‌خواند.
+    """
+    underlying = _extract_underlying(row)
+    if underlying is None:
+        return
+    signature = (
+        underlying.ins_code,
+        underlying.last_price,
+        underlying.close_price,
+        underlying.previous_close,
+        underlying.invalid_fields,
+    )
+    previous = seen.get(underlying.symbol)
+    if previous is None:
+        seen[underlying.symbol] = signature
+        result.underlyings.append(underlying)
+        return
+    if previous == signature:
+        return  # طبیعی: همان پایه در استرایک دیگر
+    if underlying.symbol not in conflicted:
+        conflicted.add(underlying.symbol)
+        result.conflicts.append(
+            ConflictingRow(
+                "underlying", underlying.symbol, index, "UA",
+                f"نماد پایه با مقادیر متفاوت در همین پاسخ: "
+                f"{_first_difference(previous, signature)}",
+            )
+        )
+
+
+def _signature(quote: ContractQuote) -> tuple:
+    """امضای کامل یک مشاهده: مشخصات، مقادیر قیمتی، و خطاهای تبدیل.
+
+    تعارض فقط اختلاف مشخصات نیست؛ همان قرارداد با قیمت یا حجم متفاوت
+    در یک پاسخ هم یعنی معلوم نیست کدام درست است.
+
+    `invalid_fields` عمداً جزو امضاست: هر دو حالتِ «منبع نداد» و
+    «منبع چیز نامعتبری داد» مقدار `None` می‌سازند، ولی یکی نیستند.
+    بدون این، یک ردیف با `NaN` و ردیفی که همان فیلد را اصلاً ندارد
+    «تکرارِ یکسان» شمرده می‌شدند و تعارض واقعی پنهان می‌ماند.
+    """
+    return (
+        *quote.spec.identity(),
+        quote.bid, quote.bid_qty, quote.ask, quote.ask_qty,
+        quote.last_price, quote.close_price, quote.previous_close,
+        quote.volume, quote.value, quote.trade_count,
+        quote.open_interest, quote.previous_open_interest,
+        quote.notional_value, quote.remained_day,
+        quote.invalid_fields,
+    )
+
+
+def _first_difference(left: tuple, right: tuple) -> str:
+    """اولین موقعیتی که دو امضا فرق دارند — برای اینکه علت خوانا بماند."""
+    for position, (a, b) in enumerate(zip(left, right, strict=False)):
+        if a != b:
+            return f"موقعیت {position}: {a!r} در برابر {b!r}"
+    return "طول امضا متفاوت است"
 
 
 def _extract_underlying(row: dict[str, Any]) -> UnderlyingQuote | None:
     symbol = _text(row.get("lval30_UA"))
     if symbol is None:
         return None
+    problems: list[str] = []
+
+    def num(key: str) -> float | None:
+        value, reason = _number(row.get(key), key)
+        if reason:
+            problems.append(reason)
+        return value
+
     return UnderlyingQuote(
         symbol=symbol,
         ins_code=_text(row.get("uaInsCode")),
-        last_price=_number(row.get("pDrCotVal_UA")),
-        close_price=_number(row.get("pClosing_UA")),
-        previous_close=_number(row.get("priceYesterday_UA")),
+        last_price=num("pDrCotVal_UA"),
+        close_price=num("pClosing_UA"),
+        previous_close=num("priceYesterday_UA"),
+        invalid_fields=tuple(problems),
     )
 
 
@@ -270,33 +483,50 @@ def _extract_side(
     if symbol is None:
         return None, RejectedRow(index, side, "نماد قرارداد خالی است", ins_code)
 
+    #: علتِ هر فیلدی که منبع داد ولی معتبر نبود. مقدارش وارد ستون
+    #: نمی‌شود، ولی **کل ردیف هم دور ریخته نمی‌شود**: بقیه‌ی فیلدهای
+    #: همان مشاهده هنوز ارزش دارند.
+    problems: list[str] = []
+
+    def num(key: str) -> float | None:
+        value, reason = _number(row.get(key), key)
+        if reason:
+            problems.append(reason)
+        return value
+
+    def integer(key: str) -> int | None:
+        value, reason = _integer(row.get(key), key)
+        if reason:
+            problems.append(reason)
+        return value
+
     spec = ContractSpec(
         ins_code=ins_code,
         symbol=symbol,
         option_type="call" if side == "C" else "put",
         underlying=_text(row.get("lval30_UA")),
         underlying_ins_code=_text(row.get("uaInsCode")),
-        strike=_number(row.get("strikePrice")),
+        strike=num("strikePrice"),
         expiry=_text(row.get("endDate")),
-        contract_size=_integer(row.get("contractSize")),
+        contract_size=integer("contractSize"),
         begin_date=_text(row.get("beginDate")),
         full_name=_text(row.get(f"lVal30_{side}")),
     )
     quote = ContractQuote(
         spec=spec,
-        bid=_number(row.get(f"pMeDem_{side}")),
-        bid_qty=_integer(row.get(f"qTitMeDem_{side}")),
-        ask=_number(row.get(f"pMeOf_{side}")),
-        ask_qty=_integer(row.get(f"qTitMeOf_{side}")),
-        last_price=_number(row.get(f"pDrCotVal_{side}")),
-        close_price=_number(row.get(f"pClosing_{side}")),
-        previous_close=_number(row.get(f"priceYesterday_{side}")),
-        volume=_integer(row.get(f"qTotTran5J_{side}")),
-        value=_number(row.get(f"qTotCap_{side}")),
-        trade_count=_integer(row.get(f"zTotTran_{side}")),
-        open_interest=_integer(row.get(f"oP_{side}")),
-        previous_open_interest=_integer(row.get(f"yesterdayOP_{side}")),
-        notional_value=_number(row.get(f"notionalValue_{side}")),
-        remained_day=_integer(row.get("remainedDay")),
+        bid=num(f"pMeDem_{side}"),
+        bid_qty=integer(f"qTitMeDem_{side}"),
+        ask=num(f"pMeOf_{side}"),
+        ask_qty=integer(f"qTitMeOf_{side}"),
+        last_price=num(f"pDrCotVal_{side}"),
+        close_price=num(f"pClosing_{side}"),
+        previous_close=num(f"priceYesterday_{side}"),
+        volume=integer(f"qTotTran5J_{side}"),
+        value=num(f"qTotCap_{side}"),
+        trade_count=integer(f"zTotTran_{side}"),
+        open_interest=integer(f"oP_{side}"),
+        previous_open_interest=integer(f"yesterdayOP_{side}"),
+        notional_value=num(f"notionalValue_{side}"),
+        remained_day=integer("remainedDay"),
     )
-    return quote, None
+    return replace(quote, invalid_fields=tuple(problems)), None
