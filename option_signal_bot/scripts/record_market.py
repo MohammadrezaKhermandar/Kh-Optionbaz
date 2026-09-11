@@ -27,7 +27,12 @@
   نمی‌شود** — انتظار با خرابی اشتباه نمی‌شود.
 * خطای موقت حلقه را نمی‌خواباند؛ خطای تنظیمات، نسخه‌ی پایگاه و قفل
   **پیش از** ورود به حلقه متوقف می‌کنند.
-* قفل بین‌پردازه‌ای مانع اجرای دو نمونه روی یک پایگاه می‌شود.
+
+**قفل نویسنده** (`storage/process_lock.py`): هر اجرای **نوشتنی** —
+`--once` و `--loop`، هر دو — پیش از دریافت یک قفل انحصاری کنار پایگاه
+می‌گیرد. پس دو نویسنده روی یک پایگاه ممکن نیست و نمونه‌ی دوم بی‌آنکه
+به شبکه دست بزند با کد ۲ رد می‌شود. `--status` قفل نمی‌گیرد: فقط
+می‌خواند و نباید پشت یک حلقه‌ی در حال اجرا بماند.
 
 تاریخچه‌ی ازدست‌رفته بازسازی **نمی‌شود**: اگر ماشین یک روز خاموش
 بماند، آن روز رفته و snapshot امروز جایش را نمی‌گیرد.
@@ -87,6 +92,17 @@ EXIT_MISUSE = 2
 def _now() -> datetime:
     """اکنون، **با منطقه‌ی زمانی محلی صریح**. زمان بدون منطقه ثبت نمی‌شود."""
     return datetime.now().astimezone()
+
+
+def _now_in(zone: Any) -> datetime:
+    """اکنون، در منطقه‌ی زمانیِ تصمیم‌گیری.
+
+    حلقه ساعت را **فقط** از همین‌جا می‌خواند. بدون این یک نقطه، رفتار
+    حلقه به ساعت واقعیِ ماشین گره می‌خورد و تستش بیرون ساعت بازار
+    معنای دیگری پیدا می‌کند: هیچ نوبتی اجرا نمی‌شود و شرط توقف هرگز
+    نمی‌رسد. با تزریق این تابع، تست لحظه را خودش تعیین می‌کند.
+    """
+    return datetime.now(zone)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,8 +223,43 @@ def _build_source(args: argparse.Namespace, options: dict) -> Any:
     )
 
 
+def _lock_path(db: Path | str) -> Path:
+    """مسیر قفلِ **نویسنده**، کنار خودِ پایگاه.
+
+    هر دو مسیر نوشتنی همین یک قفل را می‌گیرند، پس نه دو حلقه، نه دو
+    نوبتِ تکی، و نه ترکیب این دو نمی‌توانند هم‌زمان روی یک پایگاه
+    بنویسند. مسیر از خودِ پایگاه ساخته می‌شود، نه از حالت اجرا —
+    وگرنه `--once` و `--loop` دو قفل جدا می‌گرفتند و قفل بی‌اثر بود.
+    """
+    return Path(f"{db}.lock")
+
+
+def _open_recorder(
+    args: argparse.Namespace, options: dict
+) -> tuple[MarketRecorder | None, int]:
+    """پایگاه را باز می‌کند؛ در خطا `(None, کد خروجی)` برمی‌گرداند.
+
+    نوع و نسخه‌ی اسکیما همین‌جا بررسی می‌شوند: پیش از هر نوشتن و، در
+    حالت `--loop`، پیش از ورود به حلقه.
+    """
+    try:
+        return MarketRecorder(options["db"], kind=args.kind), EXIT_OK
+    except (DatabaseKindMismatch, SchemaVersionMismatch) as exc:
+        print(f"خطا: {exc}", file=sys.stderr)
+        return None, EXIT_MISUSE
+    except sqlite3.Error as exc:
+        print(f"خطا: پایگاه باز نشد: {exc}", file=sys.stderr)
+        return None, EXIT_FAILED
+
+
 def run_once(args: argparse.Namespace, options: dict) -> int:
-    """یک نوبت دریافت و ثبت. کد خروجی: ۰ موفق، ۱ ناموفق، ۲ استفاده‌ی نادرست."""
+    """یک نوبت دریافت و ثبت. کد خروجی: ۰ موفق، ۱ ناموفق، ۲ استفاده‌ی نادرست.
+
+    قفل **پیش از** دریافت و پیش از باز کردن پایگاه گرفته می‌شود. اگر
+    نویسنده‌ی دیگری در کار باشد، این اجرا بی‌آنکه درخواستی بزند یا
+    فایلی بسازد رد می‌شود — ساختِ `source` هیچ I/O ندارد و `fetch`
+    فقط داخل قفل صدا زده می‌شود.
+    """
     is_live = args.fixture is None
     guard = _guard_kind_combination(args, is_live)
     if guard is not None:
@@ -218,18 +269,19 @@ def run_once(args: argparse.Namespace, options: dict) -> int:
     endpoint = args.fixture or OPTION_WATCH_URL.format(market=options["market"])
 
     try:
-        recorder = MarketRecorder(options["db"], kind=args.kind)
-    except (DatabaseKindMismatch, SchemaVersionMismatch) as exc:
+        with ProcessLock(_lock_path(options["db"])):
+            recorder, code = _open_recorder(args, options)
+            if recorder is None:
+                return code
+            try:
+                return _record_once(
+                    args, options, recorder, source, endpoint, is_live
+                )
+            finally:
+                recorder.close()
+    except LockUnavailable as exc:
         print(f"خطا: {exc}", file=sys.stderr)
         return EXIT_MISUSE
-    except sqlite3.Error as exc:
-        print(f"خطا: پایگاه باز نشد: {exc}", file=sys.stderr)
-        return EXIT_FAILED
-
-    try:
-        return _record_once(args, options, recorder, source, endpoint, is_live)
-    finally:
-        recorder.close()
 
 
 def _record_once(
@@ -430,8 +482,8 @@ def run_loop(args: argparse.Namespace, options: dict) -> int:
     * **خطای موقت متوقف نمی‌کند** — شکست دریافت در پایگاه ثبت می‌شود و
       حلقه به نوبت بعدی می‌رود. `fetch_json` از قبل تلاش مجدد دارد و
       اینجا لایه‌ی دومی روی آن گذاشته **نمی‌شود**.
-    * **خطای غیرقابل ادامه متوقف می‌کند** — تنظیمات، نسخه‌ی پایگاه و
-      قفل، همه **پیش از** ورود به حلقه بررسی می‌شوند.
+    * **خطای غیرقابل ادامه متوقف می‌کند** — تنظیمات، قفل، و نسخه‌ی
+      پایگاه، همه **پیش از** ورود به حلقه بررسی می‌شوند.
     """
     is_live = args.fixture is None
     guard = _guard_kind_combination(args, is_live)
@@ -451,30 +503,27 @@ def run_loop(args: argparse.Namespace, options: dict) -> int:
         print("خطا: فاصله‌ی ثبت باید مثبت باشد.", file=sys.stderr)
         return EXIT_MISUSE
 
-    # نسخه و نوع پایگاه پیش از حلقه بررسی می‌شوند: خطای اسکیما در
-    # نوبت پنجاهم، نیمه‌شب، بدتر از خطای فوری است.
+    # قفل **پیش از** باز کردن پایگاه و ساخت تقویم گرفته می‌شود: نمونه‌ی
+    # دومی که رد می‌شود نباید نه فایل پایگاه را ساخته باشد و نه تاریخچه‌ی
+    # تقویم را از شبکه کشیده باشد. همین قفل را `--once` هم می‌گیرد.
     try:
-        recorder = MarketRecorder(options["db"], kind=args.kind)
-    except (DatabaseKindMismatch, SchemaVersionMismatch) as exc:
-        print(f"خطا: {exc}", file=sys.stderr)
-        return EXIT_MISUSE
-    except sqlite3.Error as exc:
-        print(f"خطا: پایگاه باز نشد: {exc}", file=sys.stderr)
-        return EXIT_FAILED
-
-    calendar = _trading_calendar(args)
-    lock_path = Path(f"{options['db']}.lock")
-    try:
-        with ProcessLock(lock_path):
-            return _loop_forever(
-                args, options, recorder, source, endpoint, is_live,
-                zone, interval, calendar,
-            )
+        with ProcessLock(_lock_path(options["db"])):
+            # نسخه و نوع پایگاه پیش از حلقه بررسی می‌شوند: خطای اسکیما در
+            # نوبت پنجاهم، نیمه‌شب، بدتر از خطای فوری است.
+            recorder, code = _open_recorder(args, options)
+            if recorder is None:
+                return code
+            calendar = _trading_calendar(args)
+            try:
+                return _loop_forever(
+                    args, options, recorder, source, endpoint, is_live,
+                    zone, interval, calendar,
+                )
+            finally:
+                recorder.close()
     except LockUnavailable as exc:
         print(f"خطا: {exc}", file=sys.stderr)
         return EXIT_MISUSE
-    finally:
-        recorder.close()
 
 
 def _loop_forever(
@@ -496,10 +545,10 @@ def _loop_forever(
     recorded = failed = 0
     try:
         while True:
-            target = next_tick(datetime.now(zone), interval)
+            target = next_tick(_now_in(zone), interval)
             _sleep_until(target, zone)
 
-            moment = datetime.now(zone)
+            moment = _now_in(zone)
             missed = skipped_ticks(target, moment, interval)
             if missed:
                 # خوابِ ویندوز، نوبت طولانی، یا جهش ساعت. جبران
@@ -543,7 +592,7 @@ def _sleep_until(target: datetime, zone: Any) -> None:
     یک انتظار پنج‌دقیقه‌ای.
     """
     while True:
-        remaining = (target - datetime.now(zone)).total_seconds()
+        remaining = (target - _now_in(zone)).total_seconds()
         if remaining <= 0:
             return
         time_module.sleep(min(remaining, 1.0))

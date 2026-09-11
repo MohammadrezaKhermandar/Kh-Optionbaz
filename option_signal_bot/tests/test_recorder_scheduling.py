@@ -37,6 +37,32 @@ def _at(hour: int, minute: int = 0, second: int = 0) -> datetime:
     return datetime(2026, 9, 12, hour, minute, second, tzinfo=TEHRAN)
 
 
+def _freeze_loop_clock(monkeypatch, record_market, moment: datetime) -> None:
+    """ساعتِ حلقه را روی یک لحظه‌ی معین قفل می‌کند.
+
+    بدون این، `decide` با ساعت واقعیِ ماشین تصمیم می‌گیرد و تست بیرون
+    ۰۹:۰۰–۱۲:۳۵ تهران معنای دیگری پیدا می‌کند: هیچ نوبتی اجرا نمی‌شود
+    و شرطی که به اجرای نوبت‌ها بسته باشد هرگز نمی‌رسد.
+    """
+    monkeypatch.setattr(record_market, "_now_in", lambda zone: moment)
+
+
+def _stop_after(ticks: int, counter: dict):
+    """جایگزینِ `_sleep_until` که حلقه را پس از `ticks` نوبت می‌بندد.
+
+    حدِ توقف روی **تعداد نوبت** است، نه موفقیت دریافت. پس حلقه چه ثبت
+    کند و چه بیرون بازه فقط منتظر بماند، تست در همان چند میلی‌ثانیه و
+    به‌طور قطعی تمام می‌شود — در هر ساعتی از شبانه‌روز.
+    """
+
+    def sleep_until(*args, **kwargs) -> None:
+        counter["n"] += 1
+        if counter["n"] > ticks:
+            raise KeyboardInterrupt
+
+    return sleep_until
+
+
 # ----------------------------------------------------------------------
 # تیکِ مطلق: بدون هم‌پوشانی، بدون جبران انبوه
 # ----------------------------------------------------------------------
@@ -162,6 +188,75 @@ def test_the_lock_is_released_for_the_next_run(tmp_path):
         pass
 
 
+@pytest.mark.parametrize("mode", ["--once", "--loop"])
+def test_a_second_writer_is_refused_before_fetching_or_recording(
+    tmp_path, monkeypatch, mode
+):
+    """با قفلِ در اختیارِ نویسنده‌ی اول، نویسنده‌ی دوم رد می‌شود.
+
+    هر دو مسیر نوشتنی پوشش داده می‌شوند: `--once` و `--loop` روی یک
+    پایگاه یک قفل مشترک دارند. رد شدن باید **پیش از** دریافت و ثبت
+    باشد، و سه شاهد همین را نشان می‌دهند: `_record_once` اصلاً صدا زده
+    نمی‌شود، فایل پایگاه ساخته نمی‌شود، و کد خروجی «استفاده‌ی نادرست»
+    است.
+
+    مسیر قفل عمداً اینجا دوباره نوشته شده (`<پایگاه>.lock`) و از خودِ
+    کد گرفته نشده: تست باید قرارداد را تثبیت کند، نه پیاده‌سازی را
+    تکرار.
+    """
+    from scripts import record_market
+
+    def never_records(*args, **kwargs):
+        raise AssertionError("نویسنده‌ی دوم نباید دریافت یا ثبتی انجام دهد")
+
+    monkeypatch.setattr(record_market, "_record_once", never_records)
+    monkeypatch.setattr(record_market, "_trading_calendar", lambda *a, **k: None)
+    # اگر قفل روزی بی‌اثر شود، `--loop` نباید تست را معلق بگذارد؛ همان
+    # نوبت اول بسته می‌شود و تست با پیام روشن می‌افتد، نه با timeout.
+    monkeypatch.setattr(record_market, "_sleep_until", _stop_after(0, {"n": 0}))
+
+    db = tmp_path / "market.db"
+    held = ProcessLock(Path(f"{db}.lock"))
+    held.__enter__()
+    try:
+        code = record_market.main(
+            [mode, "--kind", "test", "--fixture", str(FIXTURE), "--db", str(db)]
+        )
+    finally:
+        held.__exit__(None, None, None)
+
+    assert code == record_market.EXIT_MISUSE
+    assert not db.exists(), "نویسنده‌ی دوم نباید حتی پایگاه را ساخته باشد"
+
+
+def test_status_still_works_while_a_writer_holds_the_lock(tmp_path, capsys):
+    """`--status` فقط می‌خواند؛ نباید پشت قفلِ نویسنده بماند.
+
+    اجرای موفق `--once` در ابتدای تست خودش دو چیز را نشان می‌دهد: قفل
+    مانع نویسنده‌ی **تنها** نمی‌شود، و پس از پایان کار آزاد می‌شود —
+    وگرنه تست نمی‌توانست خودش همان قفل را بگیرد.
+    """
+    from scripts import record_market
+
+    db = tmp_path / "market.db"
+    assert (
+        record_market.main(
+            ["--once", "--kind", "test", "--fixture", str(FIXTURE), "--db", str(db)]
+        )
+        == record_market.EXIT_OK
+    )
+
+    held = ProcessLock(Path(f"{db}.lock"))
+    held.__enter__()
+    try:
+        code = record_market.main(["--status", "--kind", "test", "--db", str(db)])
+    finally:
+        held.__exit__(None, None, None)
+
+    assert code == record_market.EXIT_OK
+    assert "تعداد نوبت ثبت" in capsys.readouterr().out
+
+
 # ----------------------------------------------------------------------
 # رفتار حلقه در برابر خطا — با ساعت و منبع ساختگی
 # ----------------------------------------------------------------------
@@ -189,23 +284,25 @@ def test_loop_refuses_live_data_into_a_test_database(tmp_path):
 def test_a_transient_failure_does_not_stop_the_loop(tmp_path, monkeypatch):
     """یک نوبت ناموفق، حلقه را نمی‌خواباند؛ نوبت بعدی اجرا می‌شود.
 
-    حلقه پس از سه نوبت با `KeyboardInterrupt` بسته می‌شود تا تست
-    منتظر زمان واقعی نماند.
+    دو چیز از ساعت واقعی جدا شده‌اند تا تست در هر ساعتی یک معنا داشته
+    باشد: لحظه‌ی تصمیم (وسط جلسه، تزریق‌شده) و حدِ توقف (تعداد نوبت،
+    نه موفقیت دریافت). خودِ `_record_once` دیگر حلقه را نمی‌بندد، پس
+    شمارشش شاهدِ مستقلِ «ادامه داد» است.
     """
     from scripts import record_market
 
     calls = {"n": 0}
+    ticks = {"n": 0}
 
     def flaky(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             return record_market.EXIT_FAILED  # خطای موقت
-        if calls["n"] >= 3:
-            raise KeyboardInterrupt
         return record_market.EXIT_OK
 
+    _freeze_loop_clock(monkeypatch, record_market, _at(11, 0))
     monkeypatch.setattr(record_market, "_record_once", flaky)
-    monkeypatch.setattr(record_market, "_sleep_until", lambda *a, **k: None)
+    monkeypatch.setattr(record_market, "_sleep_until", _stop_after(3, ticks))
     monkeypatch.setattr(record_market, "_trading_calendar", lambda *a, **k: None)
 
     code = record_market.main(
@@ -216,6 +313,7 @@ def test_a_transient_failure_does_not_stop_the_loop(tmp_path, monkeypatch):
     )
     assert code == record_market.EXIT_OK      # Ctrl+C خروج تمیز است
     assert calls["n"] == 3, "پس از نوبت ناموفق باید ادامه داده باشد"
+    assert ticks["n"] == 4, "حلقه باید دقیقاً روی حدِ تعیین‌شده بسته شود"
 
 
 def test_waiting_outside_the_window_writes_nothing(tmp_path, monkeypatch):
@@ -223,6 +321,11 @@ def test_waiting_outside_the_window_writes_nothing(tmp_path, monkeypatch):
 
     نه snapshot ثبت می‌شود نه failure — وگرنه تاریخچه پر می‌شد از
     شکست‌های ساختگی.
+
+    به‌جای ساختنِ پنجره‌ای که «الان» بیرونش باشد، خودِ لحظه تزریق
+    می‌شود: ۰۳:۰۰ با پنجره‌ی **واقعیِ** تنظیمات سنجیده می‌شود، پس تست
+    نه به ساعت اجرا وابسته است و نه پنجره‌ی ساختگی جای قرارداد واقعی
+    را می‌گیرد.
     """
     from scripts import record_market
 
@@ -231,28 +334,17 @@ def test_waiting_outside_the_window_writes_nothing(tmp_path, monkeypatch):
     def never_records(*args, **kwargs):
         raise AssertionError("بیرون بازه نباید دریافتی انجام شود")
 
-    def stop_after_two(*args, **kwargs):
-        ticks["n"] += 1
-        if ticks["n"] > 2:
-            raise KeyboardInterrupt
-
+    _freeze_loop_clock(monkeypatch, record_market, _at(3, 0))
     monkeypatch.setattr(record_market, "_record_once", never_records)
-    monkeypatch.setattr(record_market, "_sleep_until", stop_after_two)
+    monkeypatch.setattr(record_market, "_sleep_until", _stop_after(2, ticks))
     monkeypatch.setattr(record_market, "_trading_calendar", lambda *a, **k: None)
-    # پنجره‌ای که «الان» قطعاً بیرونش است
-    monkeypatch.setattr(
-        record_market,
-        "RecordingWindow",
-        lambda **kw: RecordingWindow(
-            start=time(0, 1), end=time(0, 2), closing_grace_seconds=0
-        ),
-    )
 
     db = tmp_path / "idle.db"
     code = record_market.main(
         ["--loop", "--kind", "test", "--fixture", str(FIXTURE), "--db", str(db)]
     )
     assert code == record_market.EXIT_OK
+    assert ticks["n"] == 3, "حلقه باید دقیقاً روی حدِ تعیین‌شده بسته شود"
 
     connection = sqlite3.connect(str(db))
     try:
