@@ -61,8 +61,22 @@ from data.raw_snapshot import CURRENCY, SCHEMA_VERSION, ExtractionResult
 logger = logging.getLogger(__name__)
 
 #: نسخه‌ی اسکیمای همین جدول‌ها (جدا از `SCHEMA_VERSION` نگاشت فیلدها).
-#: ۲ = افزودن جدول `conflicts`، ستون‌های اثر انگشت و فیلدهای نامعتبر.
-DB_SCHEMA_VERSION = 2
+#:
+#: تاریخچه:
+#:   ۱ — اسکیمای اولیه
+#:   ۲ — افزودن `conflicts`، `invalid_fields(ins_code)`، و ستون‌های
+#:       اثر انگشت و شمارش
+#:   ۳ — `invalid_fields` ستون‌های `kind`/`key` گرفت (به‌جای `ins_code`)
+#:       تا خطای فیلدِ نماد پایه را هم بپوشاند، و `invalid_field_count`
+#:       به `snapshots` اضافه شد
+#:
+#: ⚠️ **قاعده: هر تغییر در `_SCHEMA` یعنی این عدد باید بالا برود.**
+#: یک بار نرفت و نتیجه‌اش این بود: دو پایگاه هر دو «نسخه ۲» ولی با
+#: ستون‌های متفاوت، پس بررسی نسخه سازگارشان می‌دید و اولین نوشتن با
+#: `no such column: key` می‌شکست. تستِ
+#: `test_a_real_v2_database_is_rejected_not_silently_accepted`
+#: همین را می‌پاید.
+DB_SCHEMA_VERSION = 3
 
 #: انواع مجاز پایگاه. مخلوط‌شدنشان ممنوع است.
 KIND_LIVE = "live"

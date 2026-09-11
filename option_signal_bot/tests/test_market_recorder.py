@@ -36,6 +36,7 @@ from data.tsetmc_option_chain_client import (
     TsetmcOptionChainClient,
 )
 from storage.market_recorder import (
+    DB_SCHEMA_VERSION,
     KIND_LIVE,
     KIND_TEST,
     STATUS_COMPLETE,
@@ -47,6 +48,7 @@ from storage.market_recorder import (
     SchemaVersionMismatch,
     SnapshotConflict,
 )
+from tests.legacy_schemas import LEGACY_SCHEMAS, build_legacy_db
 
 TEHRAN = timezone(timedelta(hours=3, minutes=30))
 
@@ -722,45 +724,85 @@ def test_invalid_value_and_missing_value_are_not_the_same_observation(recorder):
     assert any(q.spec.ins_code == "20229" for q in extraction.quotes)
 
 
-def test_opening_a_v1_database_changes_neither_schema_nor_data(tmp_path):
-    """رد نسخه‌ی ناسازگار باید **پیش از هر DDL** باشد.
-
-    قبلاً `executescript` اول اجرا می‌شد، پس بازکردن یک پایگاه نسخه‌ی ۱
-    جدول‌های نسخه‌ی ۲ را به آن اضافه می‌کرد — خطا می‌داد ولی پایگاه را
-    هم عوض کرده بود.
-    """
-    path = tmp_path / "v1.db"
-    legacy = sqlite3.connect(str(path))
-    legacy.executescript(
-        """
-        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE snapshots (snapshot_id TEXT PRIMARY KEY);
-        INSERT INTO meta VALUES ('kind', 'test'), ('db_schema_version', '1');
-        INSERT INTO snapshots VALUES ('old-snap');
-        """
-    )
-    legacy.commit()
-    legacy.close()
-
-    def snapshot_of(db: Path) -> tuple:
-        conn = sqlite3.connect(str(db))
-        tables = [
-            r[0]
+def _fingerprint_of(db: Path) -> tuple:
+    """اثر ساختاری و داده‌ای یک پایگاه — برای اثباتِ «دست نخورد»."""
+    conn = sqlite3.connect(str(db))
+    try:
+        schema = [
+            (r[0], r[1])
             for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                "SELECT name, sql FROM sqlite_master ORDER BY name"
             )
         ]
         rows = [r[0] for r in conn.execute("SELECT snapshot_id FROM snapshots")]
         meta = dict(conn.execute("SELECT key, value FROM meta"))
+    finally:
         conn.close()
-        return tables, rows, meta
+    return schema, rows, meta
 
-    before = snapshot_of(path)
+
+@pytest.mark.parametrize("version", sorted(LEGACY_SCHEMAS))
+def test_a_real_legacy_database_is_rejected_without_any_change(tmp_path, version):
+    """پایگاه نسخه‌ی قدیمی با **ساختار واقعی** رد می‌شود و تغییر نمی‌کند.
+
+    ساختار از `tests/legacy_schemas.py` می‌آید که کپیِ عینیِ اسکیمای
+    همان کامیت‌هاست — نه یک پایگاه تازه با عدد نسخه‌ی دستکاری‌شده.
+    آن روش فقط متادیتا را عوض می‌کند و تفاوت **ستون‌ها** را نمی‌سازد،
+    پس دقیقاً همان باگی را از دست می‌دهد که این تست باید بگیرد.
+    """
+    path = build_legacy_db(tmp_path / f"v{version}.db", version)
+    before = _fingerprint_of(path)
+
+    with pytest.raises(SchemaVersionMismatch) as caught:
+        MarketRecorder(path, kind=KIND_TEST)
+
+    assert str(version) in str(caught.value)
+    assert _fingerprint_of(path) == before, "پایگاه ناسازگار نباید تغییر کند"
+
+
+def test_a_real_v2_database_is_rejected_not_silently_accepted(tmp_path):
+    """نسخه ۲ ستون‌های `kind`/`key` را ندارد و نباید سازگار دیده شود.
+
+    رگرسیون یک باگ واقعی: اسکیما عوض شد ولی `DB_SCHEMA_VERSION` روی ۲
+    ماند، پس بررسی نسخه پایگاه قدیمی را «سازگار» می‌دید و اولین
+    نوشتن با `no such column: key` می‌شکست.
+    """
+    path = build_legacy_db(tmp_path / "real_v2.db", 2)
+
+    columns = _columns_of(path, "invalid_fields")
+    assert columns == ["snapshot_id", "ins_code", "reason"]
+    assert "key" not in columns, "این fixture باید واقعاً ساختار v2 باشد"
+
     with pytest.raises(SchemaVersionMismatch):
         MarketRecorder(path, kind=KIND_TEST)
 
-    assert snapshot_of(path) == before, "پایگاه ناسازگار نباید تغییر کند"
-    assert "conflicts" not in before[0]
+    # و ستون‌ها هنوز همان‌اند — یعنی هیچ DDL اجرا نشده.
+    assert _columns_of(path, "invalid_fields") == columns
+
+
+def test_a_fresh_database_is_created_and_reopens_cleanly(tmp_path):
+    """پایگاه تازه با نسخه‌ی جاری ساخته و دوباره باز می‌شود."""
+    path = tmp_path / "fresh.db"
+    first = MarketRecorder(path, kind=KIND_TEST)
+    _record(first, _payload(_row("3030")), "snap-fresh")
+    first.close()
+
+    again = MarketRecorder(path, kind=KIND_TEST)  # نباید خطا بدهد
+    try:
+        assert again.status().total_snapshots == 1
+        assert "key" in _columns_of(path, "invalid_fields")
+        stored = dict(again._connection.execute("SELECT key, value FROM meta"))
+        assert int(stored["db_schema_version"]) == DB_SCHEMA_VERSION
+    finally:
+        again.close()
+
+
+def _columns_of(db: Path, table: str) -> list[str]:
+    conn = sqlite3.connect(str(db))
+    try:
+        return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+    finally:
+        conn.close()
 
 
 def test_raw_payload_survives_a_storage_failure(tmp_path, monkeypatch):
