@@ -15,8 +15,27 @@
     # وضعیت محلی (بدون هیچ درخواست شبکه‌ای)
     python scripts/record_market.py --status
 
-⚠️ **حلقه‌ی زمان‌بندی در این نسخه نیست.** هر اجرا یک نوبت ثبت می‌کند.
-اجرای مداوم با تناوب ۵ دقیقه در مرحله‌ی بعد اضافه می‌شود.
+    # ثبت منظم تا وقتی با Ctrl+C متوقفش کنید
+    python scripts/record_market.py --loop
+
+**`--loop` چه تضمین‌هایی دارد** (جزئیات در `market/schedule.py`):
+
+* نوبت‌ها روی **ساعت دیوار** هم‌تراز می‌شوند، نه از پایان نوبت قبلی —
+  پس هم‌پوشانی ممکن نیست و نوبت‌های ازدست‌رفته (خوابِ ویندوز، جهش
+  ساعت) **پرش** می‌شوند، نه اینکه پشت سر هم اجرا شوند.
+* بیرون بازه‌ی فعالیت هیچ دریافتی انجام نمی‌شود و **هیچ ردیفی هم ثبت
+  نمی‌شود** — انتظار با خرابی اشتباه نمی‌شود.
+* خطای موقت حلقه را نمی‌خواباند؛ خطای تنظیمات، نسخه‌ی پایگاه و قفل
+  **پیش از** ورود به حلقه متوقف می‌کنند.
+
+**قفل نویسنده** (`storage/process_lock.py`): هر اجرای **نوشتنی** —
+`--once` و `--loop`، هر دو — پیش از دریافت یک قفل انحصاری کنار پایگاه
+می‌گیرد. پس دو نویسنده روی یک پایگاه ممکن نیست و نمونه‌ی دوم بی‌آنکه
+به شبکه دست بزند با کد ۲ رد می‌شود. `--status` قفل نمی‌گیرد: فقط
+می‌خواند و نباید پشت یک حلقه‌ی در حال اجرا بماند.
+
+تاریخچه‌ی ازدست‌رفته بازسازی **نمی‌شود**: اگر ماشین یک روز خاموش
+بماند، آن روز رفته و snapshot امروز جایش را نمی‌گیرد.
 
 **درباره‌ی کش:** این ابزار عمداً مستقیم `HttpPayloadSource.fetch()` را
 صدا می‌زند و از `TsetmcOptionChainClient` رد می‌شود. آن کلاینت هم
@@ -31,7 +50,8 @@ import argparse
 import logging
 import sqlite3
 import sys
-from datetime import datetime
+import time as time_module
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +65,13 @@ from data.tsetmc_option_chain_client import (
     FilePayloadSource,
     HttpPayloadSource,
 )
+from market.schedule import (
+    RecordingWindow,
+    decide,
+    next_tick,
+    resolve_timezone,
+    skipped_ticks,
+)
 from storage.market_recorder import (
     KIND_LIVE,
     KIND_TEST,
@@ -53,6 +80,7 @@ from storage.market_recorder import (
     SchemaVersionMismatch,
     SnapshotConflict,
 )
+from storage.process_lock import LockUnavailable, ProcessLock
 
 logger = logging.getLogger("record_market")
 
@@ -66,6 +94,17 @@ def _now() -> datetime:
     return datetime.now().astimezone()
 
 
+def _now_in(zone: Any) -> datetime:
+    """اکنون، در منطقه‌ی زمانیِ تصمیم‌گیری.
+
+    حلقه ساعت را **فقط** از همین‌جا می‌خواند. بدون این یک نقطه، رفتار
+    حلقه به ساعت واقعیِ ماشین گره می‌خورد و تستش بیرون ساعت بازار
+    معنای دیگری پیدا می‌کند: هیچ نوبتی اجرا نمی‌شود و شرط توقف هرگز
+    نمی‌رسد. با تزریق این تابع، تست لحظه را خودش تعیین می‌کند.
+    """
+    return datetime.now(zone)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="ثبت یک نوبت داده‌ی خام بازار آپشن (بدون فیلتر کیفیت)"
@@ -74,6 +113,11 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--once", action="store_true", help="یک نوبت ثبت و خروج")
     mode.add_argument(
         "--status", action="store_true", help="وضعیت محلی؛ هیچ درخواست شبکه‌ای نمی‌زند"
+    )
+    mode.add_argument(
+        "--loop",
+        action="store_true",
+        help="ثبت منظم تا وقتی با Ctrl+C متوقفش کنید",
     )
     parser.add_argument("--config", type=Path, default=None, help="مسیر settings.yaml")
     # پیش‌فرضِ `None` عمدی است: تشخیص «کاربر صریحاً داد» از «نداد» تنها
@@ -95,6 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market", type=int, default=None, help="0=همه، 1=بورس، 2=فرابورس")
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--retries", type=int, default=None)
+    parser.add_argument(
+        "--interval", type=int, default=None, help="فاصله‌ی نوبت‌ها (ثانیه)"
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -115,14 +162,34 @@ def resolve_options(args: argparse.Namespace) -> dict:
         "market": config["market"] if args.market is None else args.market,
         "timeout": config["timeout"] if args.timeout is None else args.timeout,
         "retries": config["retries"] if args.retries is None else args.retries,
+        "interval": (
+            config["interval_seconds"] if args.interval is None else args.interval
+        ),
+        "timezone": config["timezone"],
+        "window": RecordingWindow(
+            start=_clock(config["session_start"], "session_start"),
+            end=_clock(config["session_end"], "session_end"),
+            closing_grace_seconds=int(config["closing_grace_seconds"]),
+        ),
     }
 
 
-def run_once(args: argparse.Namespace, options: dict) -> int:
-    """یک نوبت دریافت و ثبت. کد خروجی: ۰ موفق، ۱ ناموفق، ۲ استفاده‌ی نادرست."""
-    is_live = args.fixture is None
+def _clock(value: str, field: str) -> time:
+    """`"09:00"` را به `time` تبدیل می‌کند، با خطای خوانا."""
+    try:
+        hour, minute = (int(part) for part in str(value).split(":", 1))
+        return time(hour, minute)
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(
+            f"مقدار recorder.{field} باید به شکل «HH:MM» باشد، نه {value!r}."
+        ) from exc
 
-    # هر دو قید **پیش از** هر درخواست شبکه و پیش از ساخت پایگاه:
+
+def _guard_kind_combination(args: argparse.Namespace, is_live: bool) -> int | None:
+    """قیدهای نوع پایگاه، **پیش از** هر شبکه و پیش از ساخت پایگاه.
+
+    `None` یعنی ترکیب مجاز است.
+    """
     if not is_live and args.kind != KIND_TEST:
         print(
             "خطا: داده‌ی fixture فقط در پایگاه آزمایشی ثبت می‌شود.\n"
@@ -138,31 +205,83 @@ def run_once(args: argparse.Namespace, options: dict) -> int:
             file=sys.stderr,
         )
         return EXIT_MISUSE
+    return None
 
-    source = (
-        FilePayloadSource(args.fixture)
-        if args.fixture
-        else HttpPayloadSource(
-            market=options["market"],
-            timeout=options["timeout"],
-            retries=options["retries"],
-        )
+
+def _build_source(args: argparse.Namespace, options: dict) -> Any:
+    """منبع پاسخ. یک بار ساخته و در حلقه بازاستفاده می‌شود.
+
+    `HttpPayloadSource` حالت درون‌حافظه‌ای ندارد و هر `fetch` یک
+    درخواست تازه است، پس بازاستفاده‌اش داده‌ی کهنه نمی‌دهد.
+    """
+    if args.fixture:
+        return FilePayloadSource(args.fixture)
+    return HttpPayloadSource(
+        market=options["market"],
+        timeout=options["timeout"],
+        retries=options["retries"],
     )
+
+
+def _lock_path(db: Path | str) -> Path:
+    """مسیر قفلِ **نویسنده**، کنار خودِ پایگاه.
+
+    هر دو مسیر نوشتنی همین یک قفل را می‌گیرند، پس نه دو حلقه، نه دو
+    نوبتِ تکی، و نه ترکیب این دو نمی‌توانند هم‌زمان روی یک پایگاه
+    بنویسند. مسیر از خودِ پایگاه ساخته می‌شود، نه از حالت اجرا —
+    وگرنه `--once` و `--loop` دو قفل جدا می‌گرفتند و قفل بی‌اثر بود.
+    """
+    return Path(f"{db}.lock")
+
+
+def _open_recorder(
+    args: argparse.Namespace, options: dict
+) -> tuple[MarketRecorder | None, int]:
+    """پایگاه را باز می‌کند؛ در خطا `(None, کد خروجی)` برمی‌گرداند.
+
+    نوع و نسخه‌ی اسکیما همین‌جا بررسی می‌شوند: پیش از هر نوشتن و، در
+    حالت `--loop`، پیش از ورود به حلقه.
+    """
+    try:
+        return MarketRecorder(options["db"], kind=args.kind), EXIT_OK
+    except (DatabaseKindMismatch, SchemaVersionMismatch) as exc:
+        print(f"خطا: {exc}", file=sys.stderr)
+        return None, EXIT_MISUSE
+    except sqlite3.Error as exc:
+        print(f"خطا: پایگاه باز نشد: {exc}", file=sys.stderr)
+        return None, EXIT_FAILED
+
+
+def run_once(args: argparse.Namespace, options: dict) -> int:
+    """یک نوبت دریافت و ثبت. کد خروجی: ۰ موفق، ۱ ناموفق، ۲ استفاده‌ی نادرست.
+
+    قفل **پیش از** دریافت و پیش از باز کردن پایگاه گرفته می‌شود. اگر
+    نویسنده‌ی دیگری در کار باشد، این اجرا بی‌آنکه درخواستی بزند یا
+    فایلی بسازد رد می‌شود — ساختِ `source` هیچ I/O ندارد و `fetch`
+    فقط داخل قفل صدا زده می‌شود.
+    """
+    is_live = args.fixture is None
+    guard = _guard_kind_combination(args, is_live)
+    if guard is not None:
+        return guard
+
+    source = _build_source(args, options)
     endpoint = args.fixture or OPTION_WATCH_URL.format(market=options["market"])
 
     try:
-        recorder = MarketRecorder(options["db"], kind=args.kind)
-    except (DatabaseKindMismatch, SchemaVersionMismatch) as exc:
+        with ProcessLock(_lock_path(options["db"])):
+            recorder, code = _open_recorder(args, options)
+            if recorder is None:
+                return code
+            try:
+                return _record_once(
+                    args, options, recorder, source, endpoint, is_live
+                )
+            finally:
+                recorder.close()
+    except LockUnavailable as exc:
         print(f"خطا: {exc}", file=sys.stderr)
         return EXIT_MISUSE
-    except sqlite3.Error as exc:
-        print(f"خطا: پایگاه باز نشد: {exc}", file=sys.stderr)
-        return EXIT_FAILED
-
-    try:
-        return _record_once(args, options, recorder, source, endpoint, is_live)
-    finally:
-        recorder.close()
 
 
 def _record_once(
@@ -352,6 +471,169 @@ def show_status(args: argparse.Namespace, options: dict) -> int:
     return EXIT_OK
 
 
+def run_loop(args: argparse.Namespace, options: dict) -> int:
+    """ثبت منظم تا وقتی کاربر متوقف کند.
+
+    سه قید که رفتار را تعیین می‌کنند:
+
+    * **تیکِ مطلق** — نوبت بعدی از ساعت دیوار حساب می‌شود، نه از پایان
+      نوبت قبلی. پس هم‌پوشانی ممکن نیست و اسلات‌های ازدست‌رفته پرش
+      می‌شوند، نه اینکه پشت سر هم اجرا شوند.
+    * **خطای موقت متوقف نمی‌کند** — شکست دریافت در پایگاه ثبت می‌شود و
+      حلقه به نوبت بعدی می‌رود. `fetch_json` از قبل تلاش مجدد دارد و
+      اینجا لایه‌ی دومی روی آن گذاشته **نمی‌شود**.
+    * **خطای غیرقابل ادامه متوقف می‌کند** — تنظیمات، قفل، و نسخه‌ی
+      پایگاه، همه **پیش از** ورود به حلقه بررسی می‌شوند.
+    """
+    is_live = args.fixture is None
+    guard = _guard_kind_combination(args, is_live)
+    if guard is not None:
+        return guard
+
+    try:
+        zone = resolve_timezone(options["timezone"])
+    except ValueError as exc:
+        print(f"خطا: {exc}", file=sys.stderr)
+        return EXIT_MISUSE
+
+    source = _build_source(args, options)
+    endpoint = args.fixture or OPTION_WATCH_URL.format(market=options["market"])
+    interval = options["interval"]
+    if interval <= 0:
+        print("خطا: فاصله‌ی ثبت باید مثبت باشد.", file=sys.stderr)
+        return EXIT_MISUSE
+
+    # قفل **پیش از** باز کردن پایگاه و ساخت تقویم گرفته می‌شود: نمونه‌ی
+    # دومی که رد می‌شود نباید نه فایل پایگاه را ساخته باشد و نه تاریخچه‌ی
+    # تقویم را از شبکه کشیده باشد. همین قفل را `--once` هم می‌گیرد.
+    try:
+        with ProcessLock(_lock_path(options["db"])):
+            # نسخه و نوع پایگاه پیش از حلقه بررسی می‌شوند: خطای اسکیما در
+            # نوبت پنجاهم، نیمه‌شب، بدتر از خطای فوری است.
+            recorder, code = _open_recorder(args, options)
+            if recorder is None:
+                return code
+            calendar = _trading_calendar(args)
+            try:
+                return _loop_forever(
+                    args, options, recorder, source, endpoint, is_live,
+                    zone, interval, calendar,
+                )
+            finally:
+                recorder.close()
+    except LockUnavailable as exc:
+        print(f"خطا: {exc}", file=sys.stderr)
+        return EXIT_MISUSE
+
+
+def _loop_forever(
+    args: argparse.Namespace,
+    options: dict,
+    recorder: MarketRecorder,
+    source: Any,
+    endpoint: str,
+    is_live: bool,
+    zone: Any,
+    interval: int,
+    calendar: Any,
+) -> int:
+    window = options["window"]
+    logger.info(
+        "ثبت منظم شروع شد: هر %s ثانیه، %s–%s (%s)، پایگاه %s. Ctrl+C برای توقف.",
+        interval, window.start, window.end, options["timezone"], options["db"],
+    )
+    recorded = failed = 0
+    try:
+        while True:
+            target = next_tick(_now_in(zone), interval)
+            _sleep_until(target, zone)
+
+            moment = _now_in(zone)
+            missed = skipped_ticks(target, moment, interval)
+            if missed:
+                # خوابِ ویندوز، نوبت طولانی، یا جهش ساعت. جبران
+                # نمی‌شود — فقط دیده می‌شود.
+                logger.warning(
+                    "%s نوبت جا ماند (بیداری با %.0f ثانیه تأخیر)؛ جبران نمی‌شود.",
+                    missed, (moment - target).total_seconds(),
+                )
+
+            verdict = decide(moment, window, _is_trading_day(calendar, moment))
+            if verdict.is_waiting:
+                # ⚠️ انتظار در پایگاه ثبت نمی‌شود؛ وگرنه تاریخچه پر
+                # می‌شد از شکست‌های ساختگی.
+                logger.info("نوبت %s رد شد: %s", moment.strftime("%H:%M"), verdict.reason)
+                continue
+
+            code = _record_once(
+                args, options, recorder, source, endpoint, is_live
+            )
+            if code == EXIT_MISUSE:
+                # ناسازگاری نوع/شناسه ادامه‌دادنی نیست.
+                return code
+            if code == EXIT_OK:
+                recorded += 1
+            else:
+                failed += 1
+                logger.warning("نوبت ناموفق بود؛ حلقه ادامه می‌دهد.")
+    except KeyboardInterrupt:
+        print(
+            f"\nمتوقف شد. {recorded} نوبت موفق، {failed} ناموفق.",
+            file=sys.stderr,
+        )
+        return EXIT_OK
+
+
+def _sleep_until(target: datetime, zone: Any) -> None:
+    """انتظار تا `target`، در قطعه‌های کوتاه.
+
+    قطعه‌قطعه بودن دو کار می‌کند: Ctrl+C فوری جواب می‌گیرد، و جهشِ
+    ساعت سیستم یا بازگشت از خواب در همان ثانیه دیده می‌شود نه پس از
+    یک انتظار پنج‌دقیقه‌ای.
+    """
+    while True:
+        remaining = (target - _now_in(zone)).total_seconds()
+        if remaining <= 0:
+            return
+        time_module.sleep(min(remaining, 1.0))
+
+
+def _is_trading_day(calendar: Any, moment: datetime) -> bool:
+    """روز معاملاتی؟ شکستِ تقویم نباید ثبت را بخواباند.
+
+    `TradingCalendar` یادگیری را یک بار تلاش می‌کند و در صورت شکست به
+    «فقط آخرهفته» برمی‌گردد — همان رفتار محافظه‌کارانه‌ای که برای ثبت
+    هم درست است: بهتر است یک روز تعطیل چند snapshot اضافه ثبت شود تا
+    اینکه یک روز باز از دست برود.
+    """
+    if calendar is None:
+        return True
+    try:
+        return calendar.is_trading_day(moment.date())
+    except Exception as exc:
+        logger.warning("تقویم معاملاتی جواب نداد (%s)؛ نوبت انجام می‌شود.", exc)
+        return True
+
+
+def _trading_calendar(args: argparse.Namespace) -> Any:
+    """تقویم از تنظیمات پروژه؛ در حالت fixture اصلاً ساخته نمی‌شود.
+
+    ساختِ تقویم می‌تواند یک بار تاریخچه از شبکه بکشد، و اجرای
+    آزمایشی باید کاملاً آفلاین بماند.
+    """
+    if args.fixture is not None:
+        return None
+    from bootstrap import build_market_data, build_trading_calendar
+
+    settings = load_settings(args.config)
+    try:
+        market_data = build_market_data(settings)
+        return build_trading_calendar(settings, market_data)
+    except Exception as exc:
+        logger.warning("تقویم معاملاتی ساخته نشد (%s)؛ فقط آخرهفته لحاظ می‌شود.", exc)
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     force_utf8_stdio()
     args = build_parser().parse_args(argv)
@@ -364,7 +646,11 @@ def main(argv: list[str] | None = None) -> int:
     except SettingsError as exc:
         print(f"خطا در تنظیمات: {exc}", file=sys.stderr)
         return EXIT_MISUSE
-    return show_status(args, options) if args.status else run_once(args, options)
+    if args.status:
+        return show_status(args, options)
+    if args.loop:
+        return run_loop(args, options)
+    return run_once(args, options)
 
 
 if __name__ == "__main__":
