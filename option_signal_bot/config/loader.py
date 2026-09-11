@@ -183,6 +183,33 @@ def default_settings() -> dict[str, Any]:
             # مثل مقدار پیش‌فرض خودِ OrderBookClient
             "order_book_ttl_seconds": 10.0,
         },
+        # غربالِ قابلیت معامله — دروازه‌ی ورود به پیشنهادها.
+        #
+        # ⚠️ این آستانه‌ها **اثبات‌شده نیستند**. هیچ پژوهشی پشتشان نیست؛
+        # نقطه‌ی شروعی محافظه‌کارانه‌اند تا قراردادِ آشکارا مرده پیشنهاد
+        # نشود. واحد هر کدام در نامش آمده. جزئیات در
+        # `docs/strategy-research.md`.
+        "tradability": {
+            "enabled": True,
+            # اندازه‌ی سفارشی که «امکان خروج» با آن سنجیده می‌شود، وقتی
+            # خودِ سیگنال تعدادی پیشنهاد نکرده باشد.
+            "default_order_size_contracts": 1,
+            "min_open_interest_contracts": 50,
+            "min_trades_today_count": 1,
+            "max_relative_spread_pct": 25.0,
+            "min_exit_depth_ratio": 1.0,
+            # عمقی که فقط در قیمت‌های دور هست، سفارش را پر می‌کند ولی
+            # «ظرفیت خروج» نیست.
+            "max_exit_slippage_pct": 10.0,
+            "min_sessions_with_trades_pct": 60.0,
+            "min_history_sessions": 5,
+            "min_days_to_expiry": 3,
+            "max_quote_age_seconds": 120.0,
+            # تاریخچه‌ی تداوم معامله از پایگاه **خام** recorder خوانده
+            # می‌شود — فقط‌خواندنی. نبودش یعنی «نامعلوم»، نه «بد».
+            "history_db_path": "var/recorder/market.db",
+            "history_lookback_sessions": 20,
+        },
         # ثبت تاریخچه‌ی خام بازار (`scripts/record_market.py`).
         #
         # این بخش فقط **پیش‌فرض مسیرها** را نگه می‌دارد؛ خودِ ابزار از CLI
