@@ -1260,20 +1260,119 @@ $("#btn-paper-reset").addEventListener("click", async () => {
   }
 });
 
-function paperStatRow(a) {
+function paperStat(label, value, sub, cls) {
+  const c = el("div", "stat");
+  c.append(el("div", "stat-v " + (cls || ""), value));
+  c.append(el("div", "stat-k", label));
+  if (sub) c.append(el("div", "stat-sub", sub));
+  return c;
+}
+
+// علامتِ سود/زیان فقط وقتی معنا دارد که عدد **دانسته** باشد. برای
+// `null` هیچ رنگی نمی‌گذاریم: رنگِ سبز روی «نامشخص» یعنی ادعای چیزی که
+// نمی‌دانیم.
+const signClass = (v) => (v === null || v === undefined ? "" : v >= 0 ? "v-gain" : "v-loss");
+
+function paperCashRow(a) {
   const row = el("div", "stat-row");
-  const stat = (label, value, cls) => {
-    const c = el("div", "stat");
-    c.append(el("div", "stat-v " + (cls || ""), value));
-    c.append(el("div", "stat-k", label));
-    return c;
-  };
-  row.append(stat("نقد", fmt(a.cash)));
-  row.append(stat("موجودی اولیه", fmt(a.initial_balance)));
-  row.append(stat("سود/زیان شناور", pnl(a.unrealized_pnl / (a.initial_balance || 1) * 100),
-    a.unrealized_pnl >= 0 ? "v-gain" : "v-loss"));
-  row.append(stat("ارزش کل حساب", fmt(a.equity), a.equity >= a.initial_balance ? "v-gain" : "v-loss"));
+  row.append(paperStat("سرمایه اولیه", fmt(a.initial_balance)));
+  row.append(paperStat("وجه نقد", fmt(a.cash)));
+  row.append(paperStat("مبلغ مسدود", fmt(a.blocked), "سفارش معلق و وجه تضمین مدل نشده"));
+  row.append(paperStat("وجه قابل استفاده", fmt(a.available)));
   return row;
+}
+
+function paperValueRow(a) {
+  const row = el("div", "stat-row");
+
+  // ارزش روز: اگر حتی یک موقعیت قیمت نخورده باشد «—» است، نه عددی که
+  // بخشی از دارایی را جا انداخته.
+  row.append(paperStat(
+    "ارزش روز موقعیت‌ها",
+    fmt(a.market_value),
+    a.valuation_complete ? null : `قیمت‌خورده: ${fmt(a.market_value_priced)}`,
+  ));
+
+  row.append(paperStat(
+    "سود/زیان تحقق‌یافته",
+    fmt(a.realized_net),
+    `ناخالص ${fmt(a.realized_gross)} − هزینه ${fmt(a.realized_costs)}`,
+    signClass(a.realized_net),
+  ));
+
+  row.append(paperStat(
+    "سود/زیان تحقق‌نیافته",
+    fmt(a.unrealized_net),
+    a.unrealized_gross === null
+      ? "ارزش‌گذاری ناقص"
+      : `ناخالص ${fmt(a.unrealized_gross)} − کارمزد ورود ${fmt(a.open_entry_costs)}`,
+    signClass(a.unrealized_net),
+  ));
+
+  row.append(paperStat(
+    "ارزش کل حساب",
+    fmt(a.equity),
+    a.equity === null
+      ? `دست‌کم ${fmt(a.equity_priced_part)}`
+      : `بازده ${a.total_return_pct === null ? "—" : a.total_return_pct.toFixed(2) + "٪"}`,
+    a.equity === null ? "" : signClass(a.equity - a.initial_balance),
+  ));
+  return row;
+}
+
+/** نوارهای وضعیت — هر چیزی که عدد بالا را مشروط می‌کند، صریح گفته شود. */
+function paperNotices(a) {
+  const box = el("div", "paper-notices");
+
+  if (!a.valuation_complete) {
+    const names = (a.unpriced || [])
+      .map((p) => `${p.symbol} (${p.status_label})`)
+      .join("، ");
+    box.append(el(
+      "div", "warnbar",
+      `ارزش‌گذاری ناقص: ${fmt(a.unpriced_count)} موقعیت قیمت نخورده — ${names}. ` +
+      "«ارزش کل حساب» تا روشن شدن قیمت نامشخص می‌ماند و با صفر پر نمی‌شود.",
+    ));
+  }
+
+  if (!a.costs_known) {
+    box.append(el(
+      "div", "warnbar",
+      "هزینه مشخص نشده: نرخ کارمزد/مالیات وارد نشده و صفر فرض شده است، پس " +
+      "«خالص» همان «ناخالص» است و هزینه‌ی واقعی کارگزاری در آن نیست. " +
+      "نرخ خودتان را در تنظیمات بالا وارد کنید.",
+    ));
+  }
+
+  if (a.trades_missing_entry_cost > 0) {
+    box.append(el(
+      "div", "warnbar",
+      `${fmt(a.trades_missing_entry_cost)} معامله‌ی قدیمی (پیش از تفکیک هزینه‌ها) ` +
+      "سهم کارمزد ورودشان ثبت نشده است؛ «تحقق‌یافته‌ی خالص» برای آن‌ها " +
+      "خوش‌بینانه است.",
+    ));
+  }
+
+  const rec = a.reconciliation || {};
+  if (rec.applicable && rec.ok === false) {
+    box.append(el(
+      "div", "error",
+      `تطبیق حساب نخواند (اختلاف ${fmt(rec.difference, 2)} ریال). ` +
+      "به اعداد این صفحه تکیه نکنید تا علتش پیدا شود.",
+    ));
+  }
+  return box;
+}
+
+function paperStatRow(a) {
+  const box = el("div");
+  box.append(paperCashRow(a));
+  box.append(paperValueRow(a));
+  box.append(paperNotices(a));
+  if (a.priced_at) {
+    box.append(el("p", "note", `قیمت‌گذاری در ${a.priced_at.replace("T", " ")}`));
+  }
+  return box;
 }
 
 async function loadPaperAccount() {
@@ -1299,24 +1398,90 @@ async function loadPaperPositions() {
       box.append(el("p", "empty", "پوزیشن باز کاغذی ندارید."));
       return;
     }
+    // «قیمت خروج» و «ارزش روز» برای موقعیتِ قیمت‌نخورده «—» می‌مانند.
+    // ستون «وضعیت» می‌گوید چرا — تا خالی بودن با صفر اشتباه نشود.
     const rows = d.positions.map((p) => [
-      p.symbol, fmt(p.quantity), fmt(p.average_price), fmt(p.mark_price), pnl(p.pnl_pct), "",
+      p.symbol,
+      fmt(p.quantity),
+      fmt(p.average_price),
+      p.status_label,
+      fmt(p.mark_price),
+      fmt(p.market_value),
+      fmt(p.unrealized_gross),
+      fmt(p.unrealized_net),
+      "",
     ]);
     const table = buildTable(
-      ["نماد", "تعداد", "میانگین خرید", "قیمت لحظه‌ای", "سود/زیان", ""], rows
+      ["نماد", "تعداد", "میانگین خرید", "وضعیت", "قیمت خروج", "ارزش روز",
+       "شناور ناخالص", "شناور خالص", ""],
+      rows,
     );
     table.querySelectorAll("tbody tr").forEach((tr, i) => {
-      const btn = el("button", "btn btn-ghost", "بستن پوزیشن");
       const position = d.positions[i];
-      btn.addEventListener("click", () => closePaperPosition(position, btn));
+      const cells = tr.children;
+      if (position.status !== "ok") cells[3].classList.add("v-loss");
+      // `signClass` برای مقدار نامشخص رشته‌ی خالی می‌دهد و `classList.add("")`
+      // استثنا پرتاب می‌کند — دقیقاً همان حالتی که این صفحه باید تابش بیاورد.
+      const paint = (cell, value) => {
+        const cls = signClass(value);
+        if (cls) cell.classList.add(cls);
+      };
+      paint(cells[6], position.unrealized_gross);
+      paint(cells[7], position.unrealized_net);
+      if (position.status === "partial_depth" && position.reference_price !== null) {
+        cells[4].textContent = `${fmt(position.reference_price)} (مرجع)`;
+      }
       const lastCell = tr.lastElementChild;
       lastCell.textContent = "";
-      lastCell.append(btn);
+      if (position.status === "expired_unsettled") {
+        const btn = el("button", "btn btn-ghost", "تسویه");
+        btn.addEventListener("click", () => settlePaperPosition(position, btn));
+        lastCell.append(btn);
+      } else {
+        const btn = el("button", "btn btn-ghost", "بستن پوزیشن");
+        btn.addEventListener("click", () => closePaperPosition(position, btn));
+        lastCell.append(btn);
+      }
     });
     box.append(table);
+    if (d.expired_unsettled.length) {
+      box.append(el(
+        "div", "warnbar",
+        `${d.expired_unsettled.join("، ")} سررسید شده و تسویه نشده است. ` +
+        "خودکار با آخرین قیمت معامله‌شده تسویه نمی‌شود؛ قیمت تسویه را " +
+        "خودتان بدهید.",
+      ));
+    }
   } catch (err) {
     box.innerHTML = "";
     box.append(el("div", "error", "خطا: " + err.message));
+  }
+}
+
+async function settlePaperPosition(position, btn) {
+  const raw = prompt(
+    `قیمت تسویه‌ی هر قرارداد ${position.symbol}؟
+` +
+    "صفر هم معتبر است (انقضای بی‌ارزش). حدس زده نمی‌شود، پس خودتان وارد کنید.",
+    "",
+  );
+  if (raw === null) return;
+  const price = Number(raw);
+  if (!Number.isFinite(price) || price < 0) {
+    toast("قیمت تسویه باید یک عدد نامنفی باشد.", "bad");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    await api("/api/paper-trading/settle", {
+      method: "POST",
+      body: JSON.stringify({ symbol: position.symbol, settlement_price: price }),
+    });
+    toast(`${position.symbol} تسویه شد.`, "ok");
+    await loadPaperTab();
+  } catch (err) {
+    toast("تسویه ناموفق بود: " + err.message, "bad");
+    btn.disabled = false;
   }
 }
 

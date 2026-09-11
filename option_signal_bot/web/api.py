@@ -123,6 +123,39 @@ def _require_paper_trading_enabled(settings: dict[str, Any]) -> None:
         )
 
 
+def _is_multi_leg(strategy_name: str) -> bool:
+    """آیا این استراتژی خروجی‌اش یک **ساختار چندپایه** است؟
+
+    از رجیستریِ موجود و سلسله‌مراتب کلاس‌ها خوانده می‌شود، نه از فهرستی
+    دستی که با اضافه شدن استراتژی بعدی بی‌صدا کهنه شود.
+    """
+    from strategies.multi_leg import MultiLegStrategy
+
+    strategy_class = get_strategy_class(strategy_name)
+    return strategy_class is not None and issubclass(strategy_class, MultiLegStrategy)
+
+
+def _reject_multi_leg(strategy_name: str) -> None:
+    """اجرای یک **پایه‌ی تنها** از یک ساختار چندپایه را رد می‌کند.
+
+    ریسک و سرمایه‌ی لازمِ یک استردل یا کولار با ریسکِ یکی از پایه‌هایش
+    یکی نیست، و این کارگزار فقط long تک‌پایه را مدل می‌کند. اجرای نیمِ
+    ساختار، حسابی می‌سازد که عددهایش درست‌اند ولی چیزی را می‌سنجند که
+    کاربر قصدش را نداشته.
+    """
+    if _is_multi_leg(strategy_name):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"سیگنال «{strategy_name}» یک پایه از یک ساختار چندپایه است. "
+                "معاملات کاغذی فعلاً فقط پوزیشن long تک‌پایه را مدل می‌کند؛ "
+                "وجه تضمین و سرمایه‌ی لازمِ ساختار کامل پیاده‌سازی نشده و "
+                "حدس هم زده نمی‌شود. اجرای یک پایه‌ی تنها، ریسکی متفاوت از "
+                "خودِ ساختار دارد."
+            ),
+        )
+
+
 def _serialize_order(order: Any) -> dict[str, Any]:
     return {
         "order_id": order.order_id,
@@ -734,6 +767,15 @@ class PaperOrderRequest(BaseModel):
     quantity: int | None = None
 
 
+class PaperSettleRequest(BaseModel):
+    """تسویه‌ی دستیِ یک موقعیتِ سررسیدشده."""
+
+    symbol: str
+    #: قیمت تسویه‌ی هر قرارداد. صفر مجاز است (انقضای بی‌ارزش) ولی
+    #: پیش‌فرض ندارد: حدس زدنش همان کاری است که این تغییر جلویش را گرفت.
+    settlement_price: float
+
+
 @app.get("/api/datasource")
 def get_datasource() -> dict[str, Any]:
     """منبع داده‌ی فعلی و گزینه‌های موجود."""
@@ -1015,6 +1057,7 @@ async def place_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
             match = next((s for s in log.all_signals(limit=None) if s.signal_id == signal_id), None)
         if match is None:
             raise HTTPException(status_code=404, detail=f"سیگنال {signal_id} یافت نشد.")
+        _reject_multi_leg(match.strategy_name)
         symbol = match.symbol
         side = match.side.value
         if quantity is None:
@@ -1030,7 +1073,6 @@ async def place_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
     def _work() -> dict[str, Any]:
         broker, context = _paper_broker(settings)
         try:
-            broker.settle_expired_positions()
             order = broker.place_order(symbol, side, quantity, signal_id=signal_id)
             return _serialize_order(order)
         finally:
@@ -1055,27 +1097,91 @@ def get_paper_orders(limit: int | None = None) -> dict[str, Any]:
     return {"total": len(orders), "orders": orders}
 
 
+def _serialize_valuation(v: Any) -> dict[str, Any]:
+    """یک موقعیت ارزش‌گذاری‌شده، با وضعیت صریح.
+
+    `market_value` و `unrealized_*` وقتی قیمت نخورده باشد `None` می‌مانند
+    و صفر **نمی‌شوند**: رابط باید بتواند «نمی‌دانم» را از «صفر» جدا کند.
+    """
+    return {
+        "symbol": v.symbol,
+        "quantity": v.quantity,
+        "contract_size": v.contract_size,
+        "average_price": v.average_price,
+        "entry_fees_open": v.entry_fees_open,
+        "cost_basis": v.cost_basis,
+        "status": v.status.value,
+        "status_label": v.status_label,
+        "mark_price": v.mark_price,
+        "reference_price": v.reference_price,
+        "fillable_quantity": v.fillable_quantity,
+        "market_value": v.market_value,
+        "unrealized_gross": v.unrealized_gross,
+        "unrealized_net": v.unrealized_net,
+    }
+
+
+def _serialize_snapshot(snapshot: Any) -> dict[str, Any]:
+    """عکسِ حساب به شکلی که داشبورد مستقیم نشانش می‌دهد."""
+    realized = snapshot.realized
+    return {
+        # --- نقد ---
+        "initial_balance": snapshot.initial_balance,
+        "cash": snapshot.cash,
+        "blocked": snapshot.blocked,
+        "blocked_reason": snapshot.blocked_reason,
+        "available": snapshot.available,
+        # --- موقعیت‌ها ---
+        "market_value": snapshot.market_value,
+        "market_value_priced": snapshot.market_value_priced,
+        "valuation_complete": snapshot.valuation_complete,
+        "unpriced_count": len(snapshot.unpriced_positions),
+        "unpriced": [
+            {"symbol": p.symbol, "status": p.status.value, "status_label": p.status_label}
+            for p in snapshot.unpriced_positions
+        ],
+        "priced_at": snapshot.priced_at,
+        # --- سود و زیان ---
+        "realized_gross": realized.gross,
+        "realized_costs": realized.costs,
+        "realized_entry_costs": realized.entry_costs,
+        "realized_exit_costs": realized.exit_costs,
+        "realized_net": realized.net,
+        "realized_trade_count": realized.trade_count,
+        "realized_costs_complete": realized.costs_complete,
+        "trades_missing_entry_cost": realized.trades_missing_entry_cost,
+        "unrealized_gross": snapshot.unrealized_gross,
+        "unrealized_net": snapshot.unrealized_net,
+        "open_entry_costs": snapshot.open_entry_costs,
+        "total_costs_paid": snapshot.total_costs_paid,
+        "costs_known": snapshot.costs_known,
+        # --- ارزش کل ---
+        "equity": snapshot.equity,
+        "equity_priced_part": snapshot.equity_priced_part,
+        "total_return_pct": snapshot.total_return_pct,
+        "reconciliation": snapshot.reconciliation,
+    }
+
+
 @app.get("/api/paper-trading/positions")
 async def get_paper_positions() -> dict[str, Any]:
-    """پوزیشن‌های باز کاغذی، همراه با P&L شناور روی عمق زنده."""
+    """پوزیشن‌های باز کاغذی، همراه با ارزش روز و **وضعیت ارزش‌گذاری**.
+
+    ⚠️ دیگر هیچ موقعیتی خودکار تسویه نمی‌شود. موقعیتِ سررسیدشده با
+    وضعیت `expired_unsettled` برمی‌گردد تا کاربر خودش تعیین تکلیف کند.
+    """
     settings = _settings()
 
     def _work() -> dict[str, Any]:
         broker, context = _paper_broker(settings)
         try:
-            broker.settle_expired_positions()
-            unrealized = broker.unrealized_pnl()
-            empty_pnl = {"mark_price": None, "pnl_absolute": None, "pnl_pct": None}
-            positions = [
-                {
-                    "symbol": p.symbol,
-                    "quantity": p.quantity,
-                    "average_price": p.average_price,
-                    **unrealized.get(p.symbol, empty_pnl),
-                }
-                for p in broker.get_positions()
-            ]
-            return {"positions": positions}
+            positions = [_serialize_valuation(v) for v in broker.value_positions()]
+            return {
+                "positions": positions,
+                "expired_unsettled": [
+                    p["symbol"] for p in positions if p["status"] == "expired_unsettled"
+                ],
+            }
         finally:
             context.close()
 
@@ -1087,23 +1193,55 @@ async def get_paper_positions() -> dict[str, Any]:
 
 
 @app.get("/api/paper-trading/account")
-def get_paper_account() -> dict[str, Any]:
-    """موجودی و معیارهای کلی حساب کاغذی."""
-    settings = _settings()
-    broker, context = _paper_broker(settings)
-    try:
-        account = broker.store.get_account()
-        balance = broker.get_account_balance()
-        unrealized_total = sum(v["pnl_absolute"] for v in broker.unrealized_pnl().values())
-    finally:
-        context.close()
+async def get_paper_account() -> dict[str, Any]:
+    """وضعیت کامل و **قابل تطبیق** حساب کاغذی.
 
-    return {
-        "cash": balance["cash"],
-        "initial_balance": account["initial_balance"] if account else 0.0,
-        "unrealized_pnl": unrealized_total,
-        "equity": balance["cash"] + unrealized_total,
-    }
+    رابطه‌ی مبنا: `ارزش کل حساب = نقد + ارزش روز موقعیت‌ها`. نسخه‌ی قبلی
+    `نقد + سود شناور` می‌داد که ارزشِ خودِ موقعیت را جا می‌انداخت و
+    لحظه‌ی باز کردن پوزیشن، زیانِ موهوم نشان می‌داد.
+    """
+    settings = _settings()
+
+    def _work() -> dict[str, Any]:
+        broker, context = _paper_broker(settings)
+        try:
+            return _serialize_snapshot(broker.account_snapshot())
+        finally:
+            context.close()
+
+    try:
+        return await asyncio.to_thread(_work)
+    except Exception as exc:
+        logger.exception("خواندن حساب کاغذی ناموفق بود.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/paper-trading/settle")
+async def settle_paper_position(request: PaperSettleRequest) -> dict[str, Any]:
+    """تسویه‌ی دستیِ یک موقعیتِ سررسیدشده، با قیمتی که کاربر می‌دهد.
+
+    قیمت از بیرون گرفته می‌شود چون قواعد رسمی تسویه‌ی بورس تهران در این
+    پروژه نیست و حدس زده نمی‌شود. صفر قیمتِ معتبری است: «اختیار بی‌ارزش
+    منقضی شد» همان تسویه‌ی صفر است.
+    """
+    settings = _settings()
+    _require_paper_trading_enabled(settings)
+
+    def _work() -> dict[str, Any]:
+        broker, context = _paper_broker(settings)
+        try:
+            return broker.settle_position(request.symbol, request.settlement_price)
+        finally:
+            context.close()
+
+    try:
+        trade = await asyncio.to_thread(_work)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("تسویه‌ی موقعیت کاغذی ناموفق بود.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True, "trade": trade}
 
 
 @app.get("/api/paper-trading/report")

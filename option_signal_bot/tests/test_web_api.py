@@ -43,6 +43,9 @@ def client(tmp_path, monkeypatch):
     data["option_chain"]["fixture_path"] = str(fixture)
     # تقویم هم نباید از شبکه یاد بگیرد
     data.setdefault("trading_calendar", {})["learn_from_market"] = False
+    # ⚠️ بدون این، `sqlite_path` نمونه به `var/paper_trading.db` **واقعی**
+    # اشاره می‌کند و اجرای تست‌ها حساب کاغذیِ خودِ کاربر را ریست می‌کند.
+    data.setdefault("paper_trading", {})["sqlite_path"] = str(tmp_path / "paper_trading.db")
 
     settings = tmp_path / "settings.yaml"
     settings.write_text(
@@ -246,6 +249,10 @@ def test_web_layer_only_reaches_execution_through_paper_broker():
 #: نماد و قیمت واقعی از پاسخ ضبط‌شده، برای تست بدون شبکه
 PAPER_SYMBOL = "ضهرم6040"
 PAPER_PRICE = 1000.0
+#: با اندازه‌ی قرارداد ۱۰۰۰، هر قرارداد یک میلیون ریال است. این عدد
+#: عمداً بزرگ است تا این تست‌ها به کنترلِ کفایتِ وجه نخورند؛ خودِ آن
+#: کنترل در tests/test_paper_accounting.py سنجیده می‌شود.
+PAPER_BALANCE = 500_000_000.0
 
 
 @pytest.fixture
@@ -267,7 +274,7 @@ def paper_order_book(monkeypatch):
 def _enable_paper_trading(client) -> None:
     response = client.put(
         "/api/paper-trading/settings",
-        json={"enabled": True, "initial_balance": 1_000_000.0},
+        json={"enabled": True, "initial_balance": PAPER_BALANCE},
     )
     assert response.status_code == 200
 
@@ -338,7 +345,7 @@ def test_paper_reset_clears_positions_and_restores_balance(client, paper_order_b
 
     response = client.post("/api/paper-trading/reset")
     assert response.status_code == 200
-    assert response.json()["account"]["cash"] == 1_000_000.0
+    assert response.json()["account"]["cash"] == PAPER_BALANCE
 
     positions = client.get("/api/paper-trading/positions").json()["positions"]
     assert positions == []
@@ -566,3 +573,112 @@ def test_page_freshness_and_signal_age_are_separate_fields(client):
     """
     body = client.get("/api/status").json()
     assert "server_time" in body and "last_signal_at" in body
+
+
+# ----------------------------------------------------------------------
+# حساب کاغذی: همان عددهایی که رابط نشان می‌دهد
+# ----------------------------------------------------------------------
+def test_account_shows_cash_blocked_available_and_market_value(client, paper_order_book):
+    """چهار عددِ نقد و ارزش روز، همه در پاسخ باشند و با هم بخوانند.
+
+    دستی (اندازه‌ی قرارداد ۱۰۰۰، کارمزد صفرِ پیش‌فرض، خرید ۲ در ۱۰۰۰،
+    مظنه‌ی خرید ۹۹۰):
+        نقد       = ۵۰۰٬۰۰۰٬۰۰۰ − ۲٬۰۰۰٬۰۰۰ = ۴۹۸٬۰۰۰٬۰۰۰
+        ارزش روز  = ۹۹۰ × ۲ × ۱۰۰۰           =   ۱٬۹۸۰٬۰۰۰
+        ارزش حساب = ۴۹۸٬۰۰۰٬۰۰۰ + ۱٬۹۸۰٬۰۰۰  = ۴۹۹٬۹۸۰٬۰۰۰
+    """
+    _enable_paper_trading(client)
+    client.post(
+        "/api/paper-trading/orders",
+        json={"symbol": PAPER_SYMBOL, "side": "buy", "quantity": 2},
+    )
+
+    account = client.get("/api/paper-trading/account").json()
+
+    assert account["initial_balance"] == PAPER_BALANCE
+    assert account["cash"] == pytest.approx(498_000_000.0)
+    assert account["blocked"] == 0.0
+    assert account["blocked_reason"]
+    assert account["available"] == pytest.approx(498_000_000.0)
+    assert account["market_value"] == pytest.approx(1_980_000.0)
+    assert account["equity"] == pytest.approx(499_980_000.0)
+    assert account["valuation_complete"] is True
+    assert account["reconciliation"]["ok"] is True
+
+
+def test_account_equity_is_not_cash_plus_unrealized(client, paper_order_book):
+    """رگرسیون رفتار قبلی: ارزش حساب نباید به اندازه‌ی ارزش موقعیت بپرد."""
+    _enable_paper_trading(client)
+    client.post(
+        "/api/paper-trading/orders",
+        json={"symbol": PAPER_SYMBOL, "side": "buy", "quantity": 2},
+    )
+
+    account = client.get("/api/paper-trading/account").json()
+    wrong = account["cash"] + account["unrealized_net"]
+
+    assert account["equity"] != pytest.approx(wrong)
+    # ارزش حساب باید نزدیک سرمایه‌ی اولیه بماند، نه ۲ میلیون پایین‌تر.
+    assert abs(account["equity"] - PAPER_BALANCE) < 100_000
+
+
+def test_account_separates_gross_from_net(client, paper_order_book):
+    _enable_paper_trading(client)
+    account = client.get("/api/paper-trading/account").json()
+
+    for key in (
+        "realized_gross", "realized_net", "realized_costs",
+        "unrealized_gross", "unrealized_net", "costs_known",
+    ):
+        assert key in account, key
+
+
+def test_positions_carry_an_explicit_valuation_status(client, paper_order_book):
+    _enable_paper_trading(client)
+    client.post(
+        "/api/paper-trading/orders",
+        json={"symbol": PAPER_SYMBOL, "side": "buy", "quantity": 2},
+    )
+
+    position = client.get("/api/paper-trading/positions").json()["positions"][0]
+
+    assert position["status"] == "ok"
+    assert position["status_label"]
+    assert position["mark_price"] == PAPER_PRICE - 10
+    assert position["market_value"] == pytest.approx((PAPER_PRICE - 10) * 2 * 1_000)
+
+
+def test_insufficient_funds_order_is_rejected_through_the_api(client, paper_order_book):
+    """سفارشی که وجه ندارد باید رد شود و حساب دست‌نخورده بماند."""
+    response = client.put(
+        "/api/paper-trading/settings",
+        json={"enabled": True, "initial_balance": 1_000.0},
+    )
+    assert response.status_code == 200
+    client.post("/api/paper-trading/reset")
+
+    body = client.post(
+        "/api/paper-trading/orders",
+        json={"symbol": PAPER_SYMBOL, "side": "buy", "quantity": 5},
+    ).json()
+
+    assert body["status"] == "rejected"
+    assert "وجه قابل استفاده کافی نیست" in body["metadata"]["reason"]
+    account = client.get("/api/paper-trading/account").json()
+    assert account["cash"] == pytest.approx(1_000.0)
+
+
+def test_settle_refuses_a_position_that_has_not_expired(client, paper_order_book):
+    _enable_paper_trading(client)
+    client.post(
+        "/api/paper-trading/orders",
+        json={"symbol": PAPER_SYMBOL, "side": "buy", "quantity": 1},
+    )
+
+    response = client.post(
+        "/api/paper-trading/settle",
+        json={"symbol": PAPER_SYMBOL, "settlement_price": 1_000.0},
+    )
+
+    assert response.status_code == 400
+    assert "سررسید" in response.json()["detail"]
