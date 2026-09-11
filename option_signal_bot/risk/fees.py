@@ -41,6 +41,13 @@ class FeeSchedule:
     sell_tax_rate: float = 0.0
     #: کارمزد ثابت هر سفارش (اگر کارگزاری داشته باشد)
     per_order: float = 0.0
+    #: کاربر **صریحاً** گفته که نرخ‌ها همین‌هاست — حتی اگر همه صفر باشند.
+    #:
+    #: بدون این، «صفرِ پیش‌فرضِ پروژه» از «صفرِ واقعیِ اعلام‌شده» قابل
+    #: تفکیک نبود و هر دو یک‌جور خوانده می‌شدند. معامله‌ای که زیر صفرِ
+    #: پیش‌فرض انجام شود هزینه‌اش **دانسته نیست**؛ زیر صفرِ اعلام‌شده،
+    #: هست و صفر است.
+    declared: bool = False
 
     @property
     def is_zero(self) -> bool:
@@ -48,6 +55,16 @@ class FeeSchedule:
         return not any(
             (self.buy_rate, self.sell_rate, self.sell_tax_rate, self.per_order)
         )
+
+    @property
+    def rates_known(self) -> bool:
+        """آیا هزینه‌ی یک عملیات با این نرخ‌ها **دانسته** است؟
+
+        نرخ ناصفر خودش اعلام است. صفر فقط وقتی اعلام حساب می‌شود که
+        کاربر صریحاً `declared` را داده باشد؛ وگرنه همان پیش‌فرضِ پروژه
+        است و یعنی «نمی‌دانیم»، نه «صفر است».
+        """
+        return self.declared or not self.is_zero
 
     @property
     def round_trip_rate(self) -> float:

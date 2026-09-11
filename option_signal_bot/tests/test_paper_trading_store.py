@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 
 import pytest
@@ -163,3 +164,149 @@ def test_reset_clears_everything_and_restores_balance(store):
     assert store.list_orders() == []
     assert store.list_positions() == []
     assert store.list_trades() == []
+
+
+# ----------------------------------------------------------------------
+# مهاجرت اسکیما — نسخه ۱ به ۲، بدون از دست رفتن داده
+# ----------------------------------------------------------------------
+_V1_SCHEMA = """
+CREATE TABLE paper_account (
+    id INTEGER PRIMARY KEY CHECK (id = 1), cash REAL NOT NULL,
+    initial_balance REAL NOT NULL, created_at TEXT NOT NULL, reset_at TEXT
+);
+CREATE TABLE paper_orders (
+    order_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
+    quantity INTEGER NOT NULL, filled_quantity INTEGER NOT NULL DEFAULT 0,
+    avg_fill_price REAL, status TEXT NOT NULL, fee_paid REAL NOT NULL DEFAULT 0,
+    signal_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, metadata TEXT
+);
+CREATE TABLE paper_positions (
+    symbol TEXT PRIMARY KEY, quantity INTEGER NOT NULL, average_price REAL NOT NULL,
+    opened_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE paper_trades (
+    trade_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, quantity INTEGER NOT NULL,
+    entry_price REAL NOT NULL, exit_price REAL NOT NULL, fee_paid REAL NOT NULL DEFAULT 0,
+    pnl_absolute REAL NOT NULL, pnl_pct REAL NOT NULL, opened_at TEXT NOT NULL,
+    closed_at TEXT NOT NULL, signal_id TEXT, close_reason TEXT NOT NULL
+);
+"""
+
+
+def _legacy_db(path):
+    """یک پایگاه نسخه‌ی ۱ با داده‌ی واقعیِ همان نسخه."""
+    connection = sqlite3.connect(str(path))
+    connection.executescript(_V1_SCHEMA)
+    connection.execute(
+        "INSERT INTO paper_account VALUES (1, 900.0, 1000.0, '2026-01-01T00:00:00', NULL)"
+    )
+    connection.execute(
+        "INSERT INTO paper_positions VALUES ('ضخود7001', 3, 500.0,"
+        " '2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+    )
+    # نسخه‌ی ۱: `pnl_absolute` = ناخالص منهای کارمزد خروج، و `fee_paid`
+    # فقط کارمزد خروج بود.
+    connection.execute(
+        "INSERT INTO paper_trades VALUES ('t1', 'ضخود7001', 2, 100.0, 150.0, 30.0,"
+        " 70.0, 50.0, '2026-01-01T00:00:00', '2026-01-02T00:00:00', NULL, 'manual')"
+    )
+    connection.commit()
+    connection.close()
+    return path
+
+
+def test_migration_keeps_existing_rows(tmp_path):
+    """ارتقا نباید هیچ ردیفی را حذف یا بازنویسی کند."""
+    path = _legacy_db(tmp_path / "legacy.db")
+
+    store = PaperTradingStore(path)
+
+    assert store.schema_version == 3
+    assert store.get_account()["cash"] == 900.0
+    assert store.get_account()["initial_balance"] == 1000.0
+    position = store.get_position("ضخود7001")
+    assert position["quantity"] == 3
+    assert position["average_price"] == 500.0
+    trades = store.list_trades()
+    assert len(trades) == 1
+    assert trades[0]["pnl_absolute"] == 70.0
+    store.close()
+
+
+def test_migration_rebuilds_what_is_derivable_and_leaves_the_rest_unknown(tmp_path):
+    """ناخالص و کارمزد خروج بازسازی‌شدنی‌اند؛ کارمزد ورود نیست.
+
+    `NULL` ماندنِ `entry_fee` عمدی است: صفر گذاشتنش یعنی ادعای اینکه
+    هزینه‌ی ورودی نبوده، که دانسته نیست.
+    """
+    path = _legacy_db(tmp_path / "legacy.db")
+
+    store = PaperTradingStore(path)
+    trade = store.list_trades()[0]
+
+    assert trade["exit_fee"] == 30.0, "کارمزد خروج همان fee_paid قدیمی است"
+    assert trade["gross_pnl"] == 100.0, "۷۰ + ۳۰ = ناخالص"
+    assert trade["entry_fee"] is None, "دانسته نیست، پس صفر هم نمی‌شود"
+    position = store.get_position("ضخود7001")
+    assert position["entry_fees"] == 0.0
+    assert position["entry_fees_known"] == 0, (
+        "صفرِ پیش‌فرضِ مهاجرت نباید صفرِ قطعی خوانده شود"
+    )
+    store.close()
+
+
+def test_migration_is_idempotent(tmp_path):
+    """باز کردن دوباره‌ی همان فایل نباید چیزی را عوض کند."""
+    path = _legacy_db(tmp_path / "legacy.db")
+    PaperTradingStore(path).close()
+
+    store = PaperTradingStore(path)
+    assert store.schema_version == 3
+    assert len(store.list_trades()) == 1
+    assert store.get_account()["cash"] == 900.0
+    store.close()
+
+
+def test_a_fresh_database_starts_at_the_current_version(tmp_path):
+    store = PaperTradingStore(tmp_path / "fresh.db")
+    assert store.schema_version == 3
+    store.close()
+
+
+# ----------------------------------------------------------------------
+# تراکنش
+# ----------------------------------------------------------------------
+def test_transaction_rolls_back_everything_on_failure(store):
+    """شکست وسط عملیات نباید حسابِ نیمه‌تغییرکرده بگذارد."""
+    store.init_account(1000.0)
+
+    with pytest.raises(RuntimeError, match="بوم"), store.transaction():
+        store.update_cash(500.0)
+        store.upsert_position("ضخود7001", 1, 100.0, "2026-01-01T00:00:00")
+        raise RuntimeError("بوم")
+
+    assert store.get_account()["cash"] == 1000.0
+    assert store.list_positions() == []
+
+
+def test_transaction_commits_everything_on_success(store):
+    store.init_account(1000.0)
+
+    with store.transaction():
+        store.update_cash(500.0)
+        store.upsert_position("ضخود7001", 1, 100.0, "2026-01-01T00:00:00")
+
+    assert store.get_account()["cash"] == 500.0
+    assert len(store.list_positions()) == 1
+
+
+def test_nested_transactions_commit_once_with_the_outer_block(store):
+    """تراکنش تودرتو نباید زودتر از بلوک بیرونی commit کند."""
+    store.init_account(1000.0)
+
+    with pytest.raises(RuntimeError), store.transaction():
+        with store.transaction():
+            store.update_cash(500.0)
+        raise RuntimeError("بیرونی شکست")
+
+    assert store.get_account()["cash"] == 1000.0, "بلوک داخلی نباید جدا commit شده باشد"

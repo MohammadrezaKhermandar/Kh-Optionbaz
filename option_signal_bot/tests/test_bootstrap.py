@@ -75,13 +75,19 @@ def test_default_settings_keeps_paper_trading_disabled():
 
 
 def test_default_settings_paper_trading_fees_are_not_guessed():
-    """کارمزد معاملات کاغذی هم از قاعده‌ی «حدس نزدن نرخ» پیروی می‌کند."""
+    """کارمزد معاملات کاغذی هم از قاعده‌ی «حدس نزدن نرخ» پیروی می‌کند.
+
+    `declared: False` جزء همین قاعده است: صفرهای بالا پیش‌فرضِ پروژه‌اند،
+    نه ادعای بی‌هزینه بودن — پس هزینه‌ی معامله‌ای که با آن‌ها انجام شود
+    «نامعلوم» ثبت می‌شود، نه «صفر».
+    """
     fees = default_settings()["paper_trading"]["fees"]
     assert fees == {
         "buy_rate": 0.0,
         "sell_rate": 0.0,
         "sell_tax_rate": 0.0,
         "per_order": 0.0,
+        "declared": False,
     }
 
 
