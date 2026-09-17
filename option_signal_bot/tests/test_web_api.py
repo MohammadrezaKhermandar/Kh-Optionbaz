@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -271,6 +272,75 @@ def paper_order_book(monkeypatch):
     return book
 
 
+@pytest.fixture(scope="module")
+def paper_symbol_expiry() -> date:
+    """سررسیدِ واقعیِ PAPER_SYMBOL، خوانده از همان فیکسچرِ ضبط‌شده.
+
+    عددی ثابت در خودِ تست نیست: اگر فیکسچر روزی با اسنپ‌شاتِ تازه‌تری
+    جایگزین شود، این هم خودکار همراهش می‌رود. تست‌های پایین‌تر «امروز»
+    را نسبت به همین مقدار منجمد می‌کنند، نه نسبت به ساعتِ واقعیِ اجرا —
+    وگرنه با گذشتِ زمان دوباره «سررسیدشده» می‌شود (همان چیزی که این
+    مجموعه‌تست‌ها را شکست).
+    """
+    from bootstrap import create_app
+    from web import api as web_api
+
+    example = Path(web_api.EXAMPLE_PATH)
+    data = yaml.safe_load(example.read_text(encoding="utf-8")) or {}
+    fixture = Path(__file__).parent / "fixtures" / "tsetmc_option_market_watch.json"
+    data.setdefault("option_chain", {})["provider"] = "fixture"
+    data["option_chain"]["fixture_path"] = str(fixture)
+    data.setdefault("market_data", {})["fixture_path"] = str(fixture)
+    data["market_data"]["symbols"] = ["خودرو", "شستا"]
+
+    context = create_app(data, dry_run=True, as_json=False)
+    try:
+        contract = context.option_chain.get_contract(PAPER_SYMBOL)
+    finally:
+        context.close()
+    assert contract is not None, f"{PAPER_SYMBOL} در فیکسچر یافت نشد"
+    return contract.expiry
+
+
+def _freeze_paper_broker_today(monkeypatch, frozen: date) -> None:
+    """«امروز»ی که `execution/paper_broker.py` برای سنجشِ سررسید می‌بیند را ثابت می‌کند.
+
+    فقط نامِ `date` در همان ماژول جایگزین می‌شود؛ خودِ قاعده‌ی سررسید
+    (`contract.expiry < today`) در کدِ عملیاتی دست‌نخورده می‌ماند —
+    تنها چیزی که کنترل می‌شود «امروز» است، نه سنجه‌ای که با آن مقایسه
+    می‌شود.
+    """
+    import execution.paper_broker as paper_broker_module
+
+    class _FrozenDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return frozen
+
+    monkeypatch.setattr(paper_broker_module, "date", _FrozenDate)
+
+
+@pytest.fixture
+def frozen_before_expiry(monkeypatch, paper_symbol_expiry):
+    """«امروز» را چند روز پیش از سررسیدِ PAPER_SYMBOL منجمد می‌کند.
+
+    سناریوهای عادیِ خرید/فروش/ارزش‌گذاری نباید بسته به تاریخِ واقعیِ
+    اجرا گاهی بگذرند و گاهی نه — این تضمین می‌کند قرارداد همیشه، مستقل
+    از تقویمِ سیستم، هنوز باز باشد.
+    """
+    frozen = paper_symbol_expiry - timedelta(days=7)
+    _freeze_paper_broker_today(monkeypatch, frozen)
+    return frozen
+
+
+@pytest.fixture
+def frozen_after_expiry(monkeypatch, paper_symbol_expiry):
+    """«امروز» را یک روز پس از سررسیدِ PAPER_SYMBOL منجمد می‌کند."""
+    frozen = paper_symbol_expiry + timedelta(days=1)
+    _freeze_paper_broker_today(monkeypatch, frozen)
+    return frozen
+
+
 def _enable_paper_trading(client) -> None:
     response = client.put(
         "/api/paper-trading/settings",
@@ -326,7 +396,9 @@ def test_paper_trading_settings_update_preserves_the_rest_of_the_file(client):
     assert after["market_data"] == before["market_data"]
 
 
-def test_paper_order_fills_from_the_real_order_book(client, paper_order_book):
+def test_paper_order_fills_from_the_real_order_book(
+    client, paper_order_book, frozen_before_expiry
+):
     _enable_paper_trading(client)
 
     response = client.post(
@@ -585,7 +657,9 @@ def test_page_freshness_and_signal_age_are_separate_fields(client):
 # ----------------------------------------------------------------------
 # حساب کاغذی: همان عددهایی که رابط نشان می‌دهد
 # ----------------------------------------------------------------------
-def test_account_shows_cash_blocked_available_and_market_value(client, paper_order_book):
+def test_account_shows_cash_blocked_available_and_market_value(
+    client, paper_order_book, frozen_before_expiry
+):
     """چهار عددِ نقد و ارزش روز، همه در پاسخ باشند و با هم بخوانند.
 
     دستی (اندازه‌ی قرارداد ۱۰۰۰، کارمزد صفرِ پیش‌فرض، خرید ۲ در ۱۰۰۰،
@@ -613,7 +687,9 @@ def test_account_shows_cash_blocked_available_and_market_value(client, paper_ord
     assert account["reconciliation"]["ok"] is True
 
 
-def test_account_equity_is_not_cash_plus_unrealized(client, paper_order_book):
+def test_account_equity_is_not_cash_plus_unrealized(
+    client, paper_order_book, frozen_before_expiry
+):
     """رگرسیون رفتار قبلی: ارزش حساب نباید به اندازه‌ی ارزش موقعیت بپرد."""
     _enable_paper_trading(client)
     client.post(
@@ -640,7 +716,9 @@ def test_account_separates_gross_from_net(client, paper_order_book):
         assert key in account, key
 
 
-def test_positions_carry_an_explicit_valuation_status(client, paper_order_book):
+def test_positions_carry_an_explicit_valuation_status(
+    client, paper_order_book, frozen_before_expiry
+):
     _enable_paper_trading(client)
     client.post(
         "/api/paper-trading/orders",
@@ -655,7 +733,9 @@ def test_positions_carry_an_explicit_valuation_status(client, paper_order_book):
     assert position["market_value"] == pytest.approx((PAPER_PRICE - 10) * 2 * 1_000)
 
 
-def test_insufficient_funds_order_is_rejected_through_the_api(client, paper_order_book):
+def test_insufficient_funds_order_is_rejected_through_the_api(
+    client, paper_order_book, frozen_before_expiry
+):
     """سفارشی که وجه ندارد باید رد شود و حساب دست‌نخورده بماند."""
     response = client.put(
         "/api/paper-trading/settings",
@@ -675,7 +755,9 @@ def test_insufficient_funds_order_is_rejected_through_the_api(client, paper_orde
     assert account["cash"] == pytest.approx(1_000.0)
 
 
-def test_settle_refuses_a_position_that_has_not_expired(client, paper_order_book):
+def test_settle_refuses_a_position_that_has_not_expired(
+    client, paper_order_book, frozen_before_expiry
+):
     _enable_paper_trading(client)
     client.post(
         "/api/paper-trading/orders",
@@ -689,6 +771,32 @@ def test_settle_refuses_a_position_that_has_not_expired(client, paper_order_book
 
     assert response.status_code == 400
     assert "سررسید" in response.json()["detail"]
+
+
+def test_order_on_an_expired_contract_is_rejected_and_account_is_unchanged(
+    client, paper_order_book, frozen_after_expiry
+):
+    """مستقل از سناریوی «هنوز سررسید نشده»: اینجا عمداً از سررسید گذشته‌ایم.
+
+    نه سفارش عادی باید اجرا شود، نه حساب باید کوچک‌ترین تغییری کند —
+    نه نقد، نه موقعیت باز. مسیر تعیین‌تکلیف چنین موقعیتی فقط «تسویه»
+    است، نه سفارش خرید/فروش.
+    """
+    _enable_paper_trading(client)
+
+    body = client.post(
+        "/api/paper-trading/orders",
+        json={"symbol": PAPER_SYMBOL, "side": "buy", "quantity": 1},
+    ).json()
+
+    assert body["status"] == "rejected"
+    assert "سررسید شده است" in body["metadata"]["reason"]
+
+    account = client.get("/api/paper-trading/account").json()
+    assert account["cash"] == pytest.approx(PAPER_BALANCE)
+
+    positions = client.get("/api/paper-trading/positions").json()["positions"]
+    assert positions == []
 
 
 def test_settle_rejects_non_finite_prices_at_the_api_boundary(client, paper_order_book):
