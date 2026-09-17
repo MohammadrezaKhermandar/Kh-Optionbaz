@@ -262,8 +262,6 @@ paper_trading:
 # با تاریخچه‌ی خودتان تنظیمشان کنید.
 tradability:
   enabled: true
-  # سفارشِ فرضی وقتی سیگنال تعدادی پیشنهاد نکرده باشد (قرارداد)
-  default_order_size_contracts: 1
   min_open_interest_contracts: 50      # قرارداد
   min_trades_today_count: 1            # تعداد معامله‌ی امروز
   max_relative_spread_pct: 25.0        # درصد نسبت به میانه‌ی مظنه
