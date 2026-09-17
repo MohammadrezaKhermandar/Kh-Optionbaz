@@ -207,6 +207,30 @@ def default_settings() -> dict[str, Any]:
             "history_db_path": "var/recorder/market.db",
             "history_lookback_sessions": 20,
         },
+        # رتبه‌بندیِ «اولویت بررسی» روی گزینه‌هایی که از غربال گذشته‌اند.
+        #
+        # ⚠️ این وزن‌ها **فرضِ اولیه‌اند**، نه نتیجه‌ی پژوهش یا بهینه‌سازی.
+        # امتیازِ خروجی احتمال برد یا بازده مورد انتظار **نیست**؛ فقط
+        # می‌گوید با دادهٔ موجود کدام گزینه ارزشِ بررسیِ دقیق‌تر دارد.
+        # جزئیات در `market/opportunity_ranking.py`.
+        "ranking": {
+            "enabled": True,
+            # --- وزن مؤلفه‌ها (جمعشان لازم نیست ۱۰۰ باشد؛ نسبی‌اند) ---
+            "weight_price_cost": 30.0,
+            "weight_exit_capacity": 20.0,
+            "weight_time_to_expiry": 15.0,
+            "weight_required_move": 20.0,
+            "weight_cost_drag": 5.0,
+            "weight_strategy_evidence": 10.0,
+            # --- نقطه‌ی اشباع هر سنجه ---
+            "depth_comfort_multiple": 3.0,
+            "days_to_expiry_comfort": 30,
+            "max_required_move_pct": 25.0,
+            "max_cost_drag_pct": 5.0,
+            # کمتر از این تعداد سیگنالِ نتیجه‌دار، کارنامه‌ی استراتژی
+            # «نامعلوم» است — نه «بد».
+            "min_resolved_signals": 10,
+        },
         # ثبت تاریخچه‌ی خام بازار (`scripts/record_market.py`).
         #
         # این بخش فقط **پیش‌فرض مسیرها** را نگه می‌دارد؛ خودِ ابزار از CLI

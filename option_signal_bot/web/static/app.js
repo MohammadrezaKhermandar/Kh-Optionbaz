@@ -253,6 +253,7 @@ async function scan(quiet = false) {
       el("div", r.generated ? "ok-box" : "hint", message + (quiet ? `  (${when})` : ""))
     );
     renderScreening(r.screening);
+    renderRanking(r.ranking);
     await Promise.all([loadSignals(), loadStatus()]);
     return r.generated || 0;
   } catch (err) {
@@ -375,6 +376,181 @@ function renderScreening(screening) {
       `پایه‌ها: ${(g.legs || []).join("، ")}. یک پایه‌ی نقدشونده ضعف پایه‌ی دیگر را نمی‌پوشاند.`));
   });
 }
+
+// ------------------------------------------------- رتبه‌بندی اولویت بررسی
+/** یک مؤلفه‌ی امتیاز: چقدر گرفت، از چه وزنی، و چرا. */
+function componentLine(c) {
+  const line = el("div", "check-line");
+  const known = c.known;
+  const mark = known ? "•" : "؟";
+  line.append(el("span", "check-mark " + (known ? "" : "v-loss"), mark));
+  const score = known ? `${fmt(c.score, 0)} از ۱۰۰` : "نامعلوم";
+  line.append(el("span", "",
+    `${c.label} (وزن ${fmt(c.weight)}): ${score} — ${c.detail}`));
+  return line;
+}
+
+/** یک فرصت رتبه‌گرفته، با دلیل رتبه و مهم‌ترین ضعفش. */
+function rankedItem(item, position) {
+  const box = el("details", "screen-group rank-item");
+  // صدرِ فهرست باز است: «چرا این اول شد» باید بدون کلیک دیده شود.
+  if (position === 1) box.open = true;
+  const gap = item.score_best_case - item.score;
+  const summary = el("summary", "",
+    `${position}. ${item.symbol} — امتیاز ${fmt(item.score, 1)}` +
+    (gap > 0.05 ? ` (سقفِ ممکن ${fmt(item.score_best_case, 1)})` : "") +
+    ` · ${fmt(item.quantity)} قرارداد`);
+  box.append(summary);
+
+  const head = el("div", "screen-head");
+  head.append(el("span", "note", `${item.strategy} · ${item.side}`));
+  if (item.notional != null) {
+    head.append(el("span", "note", `سرمایه‌ی لازم: ${fmt(item.notional)} ریال`));
+  }
+  if (item.max_loss != null) {
+    head.append(el("span", "note", `بیشترین زیان: ${fmt(item.max_loss)} ریال`));
+  }
+  if (item.breakeven != null) {
+    head.append(el("span", "note", `سر‌به‌سر: ${fmt(item.breakeven)}`));
+  }
+  head.append(el("span", "note", `پوشش داده: ${fmt(item.coverage_pct, 0)}٪`));
+  box.append(head);
+
+  if (item.strengths && item.strengths.length) {
+    box.append(el("div", "note", "بیشترین سهم در رتبه: " + item.strengths.join("، ")));
+  }
+  if (item.weakness) {
+    box.append(el("div", "note v-loss",
+      `مهم‌ترین ضعف — ${item.weakness.label}: ${item.weakness.detail}`));
+  }
+  // نامعلوم‌ها ضعف نیستند؛ ندانستن‌اند و جدا نشان داده می‌شوند.
+  (item.unknown || []).forEach((u) => {
+    box.append(el("div", "note", `نامعلوم — ${u.label}: ${u.detail}`));
+  });
+
+  (item.components || []).forEach((c) => box.append(componentLine(c)));
+  box.append(el("div", "note", `ارزیابی روی دادهٔ ${item.observed_at.replace("T", " ")}`));
+  return box;
+}
+
+function renderRanking(ranking) {
+  const box = $("#ranking");
+  box.innerHTML = "";
+  if (!ranking) return;
+
+  if (ranking.enabled === false) {
+    box.append(el("div", "hint",
+      "رتبه‌بندی خاموش است: " + (ranking.reason || "در تنظیمات غیرفعال شده.")));
+    return;
+  }
+  if (ranking.error) {
+    box.append(el("div", "error", "رتبه‌بندی انجام نشد: " + ranking.error));
+    return;
+  }
+  if (ranking.demo) {
+    box.append(el("div", "warnbar",
+      "⚠️ دادهٔ آزمایشی — این ارزیابی روی دادهٔ کنترل‌شده‌ی نمونه است، نه بازار واقعی."));
+  }
+
+  const ranked = ranking.ranked || [];
+  const excluded = ranking.excluded || [];
+
+  const head = el("div", "card");
+  head.append(el("h3", "", `فرصت‌های رتبه‌گرفته — ${fmt(ranked.length)} مورد`));
+  if (ranking.note) head.append(el("p", "hint", ranking.note));
+  if (ranking.evaluated_at) {
+    head.append(el("div", "note",
+      "زمان ارزیابی: " + ranking.evaluated_at.replace("T", " ")));
+  }
+
+  if (!ranked.length) {
+    // صفحه با شل‌کردن محدودیت‌ها پر نمی‌شود: علت گفته می‌شود.
+    head.append(el("p", "empty",
+      ranking.reason ||
+      (excluded.length
+        ? "هیچ گزینه‌ای از غربال عبور نکرد، پس چیزی رتبه نگرفت. " +
+          "علتِ هر کدام پایین آمده — آستانه‌ها برای پرشدنِ فهرست شل نمی‌شوند."
+        : "گزینه‌ای برای رتبه‌بندی نبود.")));
+  }
+  box.append(head);
+
+  ranked.forEach((item, i) => box.append(rankedItem(item, i + 1)));
+
+  if (excluded.length) {
+    const group = el("details", "screen-group");
+    group.append(el("summary", "",
+      `کنارگذاشته‌ها — ${fmt(excluded.length)} مورد`));
+    excluded.forEach((e) => {
+      const item = el("div", "screen-item");
+      const h = el("div", "screen-head");
+      h.append(el("strong", "", e.symbol));
+      h.append(el("span", "note", e.strategy));
+      item.append(h);
+      item.append(el("div", "note v-loss", e.reason));
+      group.append(item);
+    });
+    box.append(group);
+  }
+}
+
+async function loadRanking() {
+  try {
+    const d = await api("/api/ranking");
+    const box = $("#ranking-fields");
+    box.innerHTML = "";
+    const s = d.settings || {};
+    $("#ranking-state").textContent = s.enabled === false ? "خاموش" : "روشن";
+    d.fields.forEach((f) => {
+      const field = el("div", "field");
+      field.append(el("label", "", f.label));
+      const input = el("input");
+      input.type = "number";
+      input.min = "0";
+      input.step = String(f.step);
+      input.id = "rnk-" + f.key;
+      input.value = s[f.key] ?? "";
+      field.append(input);
+      field.append(el("span", "note", f.unit));
+      box.append(field);
+    });
+  } catch (err) {
+    $("#ranking-note").className = "note bad";
+    $("#ranking-note").textContent = err.message;
+  }
+}
+
+$("#btn-save-ranking").addEventListener("click", async () => {
+  const note = $("#ranking-note");
+  note.className = "note";
+  note.textContent = "در حال ذخیره…";
+  try {
+    const d = await api("/api/ranking");
+    const body = {};
+    d.fields.forEach((f) => {
+      const raw = $("#rnk-" + f.key).value;
+      if (raw !== "") body[f.key] = Number(raw);
+    });
+    await api("/api/ranking", { method: "PUT", body: JSON.stringify(body) });
+    note.className = "note ok";
+    note.textContent = "ذخیره شد؛ در ارزیابیِ بعدی اعمال می‌شود.";
+    toast("تنظیمات رتبه‌بندی ذخیره شد.", "ok");
+  } catch (err) {
+    note.className = "note bad";
+    note.textContent = err.message;
+    toast(err.message, "bad");
+  }
+});
+
+$("#btn-ranking-demo").addEventListener("click", async () => {
+  // دادهٔ آزمایشی از مسیر جدا می‌آید و خودش برچسب‌دار است؛ هیچ‌وقت با
+  // نتیجه‌ی پاس رصد مخلوط نمی‌شود.
+  try {
+    renderRanking(await api("/api/ranking/demo"));
+    toast("نمونهٔ آزمایشی نمایش داده شد — دادهٔ بازار نیست.", "");
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+});
 
 async function loadTradability() {
   try {
@@ -1900,4 +2076,10 @@ async function loadPaperTab() {
 loadStatus();
 refreshPaperTradingFlag().then(loadSignals);
 loadTradability();
+loadRanking();
+// `?ranking=demo` همان دکمه‌ی «نمایش نمونه» را می‌زند — برای وقتی که
+// هنوز تاریخچه‌ای نیست و کاربر می‌خواهد شکلِ خروجی را ببیند.
+if (new URLSearchParams(location.search).get("ranking") === "demo") {
+  api("/api/ranking/demo").then(renderRanking).catch(() => {});
+}
 setInterval(loadStatus, 60000);

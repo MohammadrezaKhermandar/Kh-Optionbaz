@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import fields
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -311,6 +312,9 @@ async def run_scan() -> dict[str, Any]:
                 # «غربال خاموش بود» با «همه قبول شدند» یکی نیست.
                 screening["enabled"] = generator.tradability is not None
                 screening["history"] = _history_state(generator.tradability)
+                # رکوردهای خام فقط برای رتبه‌بندی لازم‌اند و به UI
+                # نمی‌روند؛ نسخه‌ی سریالایزشده‌شان از قبل در `records` هست.
+                screening["_records"] = generator.screening.records
                 return produced, screening
             finally:
                 context.close()
@@ -321,11 +325,146 @@ async def run_scan() -> dict[str, Any]:
             logger.exception("پاس رصد ناموفق بود.")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    try:
+        ranking = _build_ranking(settings, signals, screening)
+    except Exception as exc:  # رتبه‌بندی یک لایه‌ی نمایشی است، نه پیش‌نیاز
+        logger.exception("رتبه‌بندی فرصت‌ها شکست خورد؛ پاس رصد دست‌نخورده ماند.")
+        ranking = {"enabled": True, "error": str(exc)}
+    screening.pop("_records", None)
+
     return {
         "generated": len(signals),
         "signals": [_signal_dict(s) for s in signals],
         "screening": screening,
+        "ranking": ranking,
     }
+
+
+def _ranking_weights(settings: dict[str, Any]) -> Any:
+    """`RankingWeights` از تنظیمات؛ کلیدهای ناشناخته بی‌صدا نادیده می‌روند."""
+    from market.opportunity_ranking import RankingWeights
+
+    config = section(settings, "ranking")
+    known = {f.name for f in fields(RankingWeights)}
+    return RankingWeights(**{k: v for k, v in config.items() if k in known})
+
+
+def _strategy_evidence(settings: dict[str, Any]) -> dict[str, Any]:
+    """کارنامه‌ی محقق‌شده‌ی هر استراتژی، از تاریخچه‌ی خودِ پروژه.
+
+    ⚠️ فقط سیگنالِ **نتیجه‌دار** شمرده می‌شود. نبودِ پایگاه یا خالی بودنش
+    یعنی «نامعلوم»، پس دیکشنریِ خالی برمی‌گردد و مؤلفه‌ی شواهد نامعلوم
+    می‌ماند — نه صفر.
+    """
+    from market.opportunity_ranking import StrategyEvidence
+
+    storage = section(settings, "storage")
+    path = resolve_path(storage.get("sqlite_path", "var/signals.db"))
+    try:
+        from storage.reporting import SignalReporter
+
+        with SignalReporter(path) as reporter:
+            rows = reporter.by_strategy(None)
+    except Exception as exc:  # نبودِ کارنامه نباید پاس رصد را بخواباند
+        logger.warning("کارنامه‌ی استراتژی‌ها خوانده نشد: %s", exc)
+        return {}
+
+    evidence: dict[str, Any] = {}
+    for row in rows:
+        rate = row.win_rate
+        evidence[row.strategy] = StrategyEvidence(
+            strategy=row.strategy,
+            resolved=row.resolved,
+            wins=row.wins,
+            win_rate_pct=None if rate is None else rate * 100.0,
+            avg_pnl_pct=row.avg_pnl_pct,
+        )
+    return evidence
+
+
+def _build_ranking(
+    settings: dict[str, Any], signals: list[Signal], screening: dict[str, Any]
+) -> dict[str, Any]:
+    """رتبه‌بندیِ همین پاس، از رکوردهای غربال و خودِ سیگنال‌ها.
+
+    داده‌ی قرارداد (استرایک، پرمیوم، قیمت پایه) روی `Signal` است و
+    نتیجه‌ی غربال روی `ScreeningRecord`؛ با نماد به هم وصل می‌شوند.
+    """
+    config = section(settings, "ranking")
+    if not config.get("enabled", True):
+        return {"enabled": False, "reason": "رتبه‌بندی در تنظیمات خاموش است."}
+
+    from market.opportunity_ranking import rank_opportunities
+    from market.tradability import Thresholds
+
+    records = screening.get("_records") or []
+    if not records:
+        return {
+            "enabled": True,
+            "ranked": [],
+            "excluded": [],
+            "reason": (
+                "غربالی اجرا نشد یا هیچ گزینه‌ای ارزیابی نشد؛ چیزی برای "
+                "رتبه‌بندی نیست."
+            ),
+        }
+
+    by_symbol = {s.symbol: s for s in signals}
+    thresholds_config = section(settings, "tradability")
+    known_thresholds = {f.name for f in fields(Thresholds)}
+    thresholds = Thresholds(**{
+        k: v for k, v in thresholds_config.items() if k in known_thresholds
+    })
+
+    candidates: list[dict[str, Any]] = []
+    unpublished: list[dict[str, str]] = []
+    for record in records:
+        signal = by_symbol.get(record.symbol)
+        if signal is None:
+            # غربال شده ولی منتشر نشده — مثلاً تکراریِ پاسِ قبل. بدون
+            # خودِ سیگنال، استرایک و پرمیوم در دست نیست؛ رتبه‌دادن به آن
+            # یعنی امتیازی از دادهٔ ناقص که کاربر هم نمی‌تواند اجرایش کند.
+            unpublished.append({
+                "symbol": record.symbol,
+                "strategy": record.strategy,
+                "reason": (
+                    "از غربال گذشت ولی سیگنالش منتشر نشد (تکراری در بازه‌ی "
+                    "ضدتکرار، یا پایه‌ی ساختاری که کنار رفت)."
+                ),
+            })
+            continue
+        candidates.append({
+            "report": record.report,
+            "symbol": record.symbol,
+            "strategy": record.strategy,
+            "side": record.side,
+            "quantity": record.quantity,
+            "leg_group_id": record.leg_group_id,
+            "option_type": signal.option_type.value,
+            "strike": signal.strike,
+            "premium": signal.suggested_price,
+            "underlying_price": signal.underlying_price,
+            "notional": signal.notional,
+            "max_loss": signal.metadata.get("max_loss"),
+            # نبودِ این کلید یعنی نرخی تنظیم نشده → هزینه **نامعلوم**،
+            # نه صفر. همان قاعده‌ای که کلِ پروژه درباره‌ی کارمزد دارد.
+            "round_trip_fees": signal.metadata.get("round_trip_fees"),
+        })
+
+    result = rank_opportunities(
+        candidates=candidates,
+        thresholds=thresholds,
+        weights=_ranking_weights(settings),
+        evidence_by_strategy=_strategy_evidence(settings),
+        evaluated_at=datetime.now(),
+    )
+    payload = result.to_dict()
+    # کنارگذاشته‌های این لایه هم باید دیده شوند، نه اینکه بی‌صدا گم شوند.
+    payload["excluded"] = [
+        *payload["excluded"],
+        *({**row, "verdict": "tradable"} for row in unpublished),
+    ]
+    return {"enabled": True, **payload}
 
 
 def _history_state(screener: Any | None) -> dict[str, Any]:
@@ -404,6 +543,157 @@ def update_tradability(update: TradabilityUpdate) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="هیچ مقداری برای تغییر داده نشد.")
     _patch_settings({"tradability": patch})
     return {"ok": True, "applied": patch}
+
+
+# ----------------------------------------------------------------------
+# رتبه‌بندی اولویت بررسی
+# ----------------------------------------------------------------------
+#: واحد و توضیح هر تنظیم رتبه‌بندی — رابط از همین می‌خواند.
+RANKING_FIELDS: tuple[dict[str, Any], ...] = (
+    {"key": "weight_price_cost", "label": "وزن هزینه‌ی قیمتی",
+     "unit": "نصف اسپرد + لغزش خروج", "step": 5},
+    {"key": "weight_exit_capacity", "label": "وزن ظرفیت خروج",
+     "unit": "عمق نسبت به اندازه‌ی سفارش", "step": 5},
+    {"key": "weight_time_to_expiry", "label": "وزن فاصله تا سررسید",
+     "unit": "روز تا سررسید", "step": 5},
+    {"key": "weight_required_move", "label": "وزن حرکت لازم تا سر‌به‌سر",
+     "unit": "٪ حرکت پایه", "step": 5},
+    {"key": "weight_cost_drag", "label": "وزن سهم کارمزد",
+     "unit": "٪ از ارزش موقعیت", "step": 5},
+    {"key": "weight_strategy_evidence", "label": "وزن کارنامه‌ی استراتژی",
+     "unit": "نرخ برد محقق‌شده", "step": 5},
+    {"key": "depth_comfort_multiple", "label": "عمقِ «راحت»",
+     "unit": "برابرِ حداقلِ غربال", "step": 0.5},
+    {"key": "days_to_expiry_comfort", "label": "سررسیدِ «راحت»",
+     "unit": "روز", "step": 5},
+    {"key": "max_required_move_pct", "label": "سقف حرکت لازم",
+     "unit": "٪ حرکت پایه", "step": 5},
+    {"key": "max_cost_drag_pct", "label": "سقف سهم کارمزد",
+     "unit": "٪ از ارزش موقعیت", "step": 1},
+    {"key": "min_resolved_signals", "label": "حداقل نمونه برای کارنامه",
+     "unit": "سیگنال نتیجه‌دار (کمتر = نامعلوم)", "step": 1},
+)
+
+
+class RankingUpdate(BaseModel):
+    """ویرایش تنظیمات رتبه‌بندی. هر فیلد اختیاری است."""
+
+    enabled: bool | None = None
+    weight_price_cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_exit_capacity: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_time_to_expiry: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_required_move: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_cost_drag: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_strategy_evidence: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    depth_comfort_multiple: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    days_to_expiry_comfort: int | None = Field(default=None, ge=0)
+    max_required_move_pct: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    max_cost_drag_pct: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    min_resolved_signals: int | None = Field(default=None, ge=1)
+
+
+@app.get("/api/ranking")
+def get_ranking_settings() -> dict[str, Any]:
+    """تنظیمات رتبه‌بندی، همراه واحد و هشدارِ فرض‌بودنِ وزن‌ها."""
+    config = section(_settings(), "ranking")
+    return {
+        "settings": config,
+        "fields": list(RANKING_FIELDS),
+        "note": (
+            "خروجی «امتیاز اولویت بررسی» است — نه احتمال برد، نه بازده مورد "
+            "انتظار و نه توصیه‌ی خرید. وزن‌ها فرضِ اولیه‌اند و هیچ پژوهشی "
+            "پشتشان نیست. رتبه با امتیازِ محافظه‌کارانه چیده می‌شود: مؤلفه‌ی "
+            "نامعلوم صفر حساب می‌شود تا نبودِ داده کسی را بالا نبرد."
+        ),
+    }
+
+
+@app.put("/api/ranking")
+def update_ranking_settings(update: RankingUpdate) -> dict[str, Any]:
+    """ویرایش تنظیمات رتبه‌بندی؛ از ارزیابیِ بعدی اعمال می‌شود."""
+    patch = {k: v for k, v in update.model_dump().items() if v is not None}
+    if not patch:
+        raise HTTPException(status_code=400, detail="هیچ مقداری برای تغییر داده نشد.")
+    _patch_settings({"ranking": patch})
+    return {"ok": True, "applied": patch}
+
+
+@app.get("/api/ranking/demo")
+def get_ranking_demo() -> dict[str, Any]:
+    """نمونه‌ی **آزمایشی** با دادهٔ ساختگی، برای دیدنِ شکلِ خروجی.
+
+    ⚠️ این داده بازار نیست و هیچ‌وقت با دادهٔ واقعی مخلوط نمی‌شود:
+    مسیرش جداست، `demo` را `true` برمی‌گرداند و رابط بالای فهرست
+    برچسب می‌زند. لازم است چون تا وقتی تاریخچه‌ی recorder ساخته نشده،
+    خروجیِ واقعی به‌درستی خالی است و کاربر شکلِ توضیح‌ها را نمی‌بیند.
+    """
+    from datetime import timedelta
+
+    from market.opportunity_ranking import StrategyEvidence, rank_opportunities
+    from market.tradability import (
+        HistoryStats,
+        LiquidityObservation,
+        Thresholds,
+        evaluate,
+    )
+
+    now = datetime.now()
+    thresholds = Thresholds()
+    healthy = HistoryStats(
+        sessions=20, sessions_with_trades=18, sessions_with_both_quotes=20,
+        known=True, sessions_verified=True,
+    )
+
+    def observation(symbol: str, **kwargs: Any) -> LiquidityObservation:
+        base: dict[str, Any] = dict(
+            symbol=symbol, position_side="buy", quantity=10, observed_at=now,
+            bid=980.0, ask=1_020.0, exit_depth_contracts=100,
+            exit_fill_price=980.0, best_exit_price=980.0, open_interest=500,
+            trades_today=40, days_to_expiry=45, quote_age_seconds=5.0,
+        )
+        base.update(kwargs)
+        return LiquidityObservation(**base)
+
+    def candidate(obs: LiquidityObservation, **kwargs: Any) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "report": evaluate(obs, kwargs.pop("history", healthy), thresholds),
+            "symbol": obs.symbol, "strategy": "نمونه‌ی آزمایشی",
+            "side": obs.position_side, "quantity": obs.quantity,
+            "leg_group_id": None, "option_type": "call", "strike": 10_000.0,
+            "premium": 1_000.0, "underlying_price": 10_500.0,
+            "notional": 1_000.0 * obs.quantity * 1_000,
+            "max_loss": 1_000.0 * obs.quantity * 1_000,
+            "round_trip_fees": 50_000.0,
+        }
+        data.update(kwargs)
+        return data
+
+    result = rank_opportunities(
+        candidates=[
+            candidate(
+                observation("نمونه‌الف", bid=995.0, ask=1_005.0, exit_depth_contracts=200),
+                premium=200.0,
+            ),
+            candidate(observation("نمونه‌ب", bid=950.0, ask=1_050.0, exit_depth_contracts=15)),
+            # نامعلوم‌ها عمداً هست: نشان می‌دهد نبودِ داده چطور دیده می‌شود.
+            candidate(observation("نمونه‌پ"), round_trip_fees=None, underlying_price=None),
+            # ردشده‌ی غربال: اسپرد ۱۰۰٪
+            candidate(observation("نمونه‌ت", bid=500.0, ask=1_500.0)),
+            candidate(observation("نمونه‌ث"), leg_group_id="grp-نمونه"),
+        ],
+        thresholds=thresholds,
+        weights=_ranking_weights(_settings()),
+        evidence_by_strategy={
+            "نمونه‌ی آزمایشی": StrategyEvidence(
+                strategy="نمونه‌ی آزمایشی", resolved=24, wins=15, win_rate_pct=62.5,
+            )
+        },
+        evaluated_at=now - timedelta(seconds=1),
+        demo=True,
+    )
+    return {"enabled": True, **result.to_dict()}
 
 
 # ----------------------------------------------------------------------
