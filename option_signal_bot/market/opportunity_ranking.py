@@ -385,7 +385,9 @@ def _exit_capacity_component(
     """ظرفیتِ سمت خروج نسبت به **همین** اندازه‌ی سفارش."""
     ratio = report.observation.exit_depth_ratio
     floor = thresholds.min_exit_depth_ratio
-    comfort = floor * weights.depth_comfort_multiple
+    # اگر کاربر کفِ غربال را صفر بگذارد، ضرب‌کردن هم صفر می‌شود و این
+    # سنجه بی‌صدا بی‌اثر می‌ماند. آن‌وقت خودِ ضریب، مقیاسِ مطلق می‌شود.
+    comfort = max(floor * weights.depth_comfort_multiple, weights.depth_comfort_multiple)
     if ratio is None:
         return Component(
             key="exit_capacity",

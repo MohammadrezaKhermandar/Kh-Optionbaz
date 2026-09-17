@@ -308,6 +308,25 @@ def test_the_same_inputs_give_the_same_score_every_time():
     assert [c.score for c in first.components] == [c.score for c in second.components]
 
 
+def test_a_zero_depth_floor_does_not_silently_disable_the_capacity_measure():
+    """کفِ صفرِ غربال نباید سنجه‌ی ظرفیت را بی‌اثر کند.
+
+    اگر «راحت» از ضربِ کفِ صفر می‌آمد، صفر می‌شد و هر عمقی امتیاز کامل
+    می‌گرفت — یعنی دفترِ نازک و دفترِ عمیق فرقی نمی‌کردند.
+    """
+    thresholds = Thresholds(min_exit_depth_ratio=0.0)
+    thin = _candidate(_observation(symbol="ضنازک", exit_depth_contracts=10))
+    deep = _candidate(_observation(symbol="ضعمیق", exit_depth_contracts=300))
+
+    result = rank_opportunities(
+        candidates=[thin, deep], thresholds=thresholds, weights=WEIGHTS,
+        evidence_by_strategy={}, evaluated_at=NOW,
+    )
+
+    scores = {r.symbol: r.score for r in result.ranked}
+    assert scores["ضعمیق"] > scores["ضنازک"]
+
+
 def test_changing_a_weight_changes_the_score_in_the_stated_direction():
     """وزن‌ها واقعاً تنظیم‌پذیرند — نه عددی تزئینی."""
     candidate = _candidate(_observation(exit_depth_contracts=1_000))
