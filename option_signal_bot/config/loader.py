@@ -191,9 +191,6 @@ def default_settings() -> dict[str, Any]:
         # `docs/strategy-research.md`.
         "tradability": {
             "enabled": True,
-            # اندازه‌ی سفارشی که «امکان خروج» با آن سنجیده می‌شود، وقتی
-            # خودِ سیگنال تعدادی پیشنهاد نکرده باشد.
-            "default_order_size_contracts": 1,
             "min_open_interest_contracts": 50,
             "min_trades_today_count": 1,
             "max_relative_spread_pct": 25.0,
