@@ -59,6 +59,24 @@ VERDICT_LABELS: dict[Verdict, str] = {
 }
 
 
+class EntryStatus(str, Enum):
+    """اجراپذیریِ **سمتِ ورود** برای همین اندازه‌ی سفارش.
+
+    سه حالت، چون دو تای آخر یک چیز نیستند و درمانشان هم یکی نیست:
+
+    * `EXECUTABLE` — سفارش با عمقِ موجود **کامل** پر می‌شود؛ قیمتِ
+      اجراییِ ورود در دست است و همه‌ی عددهای ریالی مبنا دارند.
+    * `SHORT_OF_DEPTH` — دفتر را دیده‌ایم و **قطعاً** کم است: کاربر
+      می‌تواند سفارش را کوچک‌تر کند.
+    * `UNKNOWN` — اصلاً دفتری نداریم؛ **ندانستن** است، نه کمبود. اینجا
+      کوچک‌کردنِ سفارش هم چیزی را حل نمی‌کند، باید داده آورد.
+    """
+
+    EXECUTABLE = "executable"
+    SHORT_OF_DEPTH = "short_of_depth"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class Check:
     """یک سنجه‌ی منفرد، با عددِ اندازه‌گیری‌شده و آستانه‌اش.
@@ -156,6 +174,10 @@ class LiquidityObservation:
     #: تعداد قرارداد. بدون این، هزینه‌ی رفت‌وبرگشت قابل محاسبه نیست و
     #: نصفِ اسپرد جایش گذاشته می‌شد که هزینه‌ی رفت‌وبرگشت **نیست**.
     entry_fill_price: float | None = None
+    #: عمقِ **کلِ** سمت ورود، به تعداد قرارداد. بودنِ این عدد در کنارِ
+    #: نبودنِ `entry_fill_price` یعنی دفتر را دیده‌ایم و عمقش کم بوده —
+    #: که با «دفتر را ندیده‌ایم» یکی نیست و نباید یک‌جور خوانده شود.
+    entry_depth_contracts: int | None = None
     #: عمقِ سمت خروج که در محدوده‌ی قیمتیِ قابل قبول است. حجمی که فقط
     #: در قیمت‌های دور هست حاشیه‌ی امنِ خروج نیست، پس اینجا شمرده
     #: نمی‌شود. (دروازه‌ی غربال همچنان با عمقِ کل کار می‌کند.)
@@ -243,6 +265,28 @@ class LiquidityObservation:
             * 100.0,
             0.0,
         )
+
+    @property
+    def entry_depth_ratio(self) -> float | None:
+        """عمقِ کلِ سمت ورود تقسیم بر اندازه‌ی سفارش."""
+        if self.entry_depth_contracts is None or self.quantity <= 0:
+            return None
+        return self.entry_depth_contracts / self.quantity
+
+    @property
+    def entry_status(self) -> EntryStatus:
+        """آیا **ورود** برای همین تعداد قرارداد اجراپذیر است؟
+
+        `entry_fill_price` فقط وقتی مقدار می‌گیرد که سفارش **کامل** پر
+        شود؛ پس بودنش یعنی اجراپذیر. اگر نیست، عمقِ دیده‌شده تعیین
+        می‌کند که «کم است» بگوییم یا «نمی‌دانیم» — و این دو با هم فرق
+        دارند، چون یکی با کوچک‌کردنِ سفارش حل می‌شود و دیگری نه.
+        """
+        if self.entry_fill_price:
+            return EntryStatus.EXECUTABLE
+        if self.entry_depth_contracts is None:
+            return EntryStatus.UNKNOWN
+        return EntryStatus.SHORT_OF_DEPTH
 
     @property
     def usable_exit_depth_ratio(self) -> float | None:

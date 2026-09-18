@@ -126,6 +126,7 @@ class TradabilityScreener:
             exit_fill_price=book_data["fill_price"],
             best_exit_price=book_data["best_exit"],
             entry_fill_price=book_data["entry_fill_price"],
+            entry_depth_contracts=book_data["entry_depth"],
             exit_depth_within_band_contracts=book_data["depth_in_band"],
             open_interest=getattr(contract, "open_interest", None),
             trades_today=self._trades_today(contract),
@@ -145,6 +146,9 @@ class TradabilityScreener:
 
         * `depth` — عمقِ **کل** سمت خروج. عمداً به اندازه‌ی سفارش بریده
           نمی‌شود (اشکالِ نسخه‌ی قبل، که نسبت را هرگز بالای ۱ نمی‌برد).
+        * `entry_depth` — عمقِ **کل** سمت ورود. وقتی ورود پر نمی‌شود،
+          همین عدد است که «عمق کم بود» را از «دفتری ندیدیم» جدا
+          می‌کند؛ بدون آن هر دو یک‌جور `None` می‌شدند.
         * `depth_in_band` — همان عمق، ولی فقط سطوحی که تا آستانه‌ی لغزش
           از بهترین مظنه فاصله دارند. حجمِ قیمت‌های دور حاشیه‌ی امن
           نیست.
@@ -169,6 +173,9 @@ class TradabilityScreener:
                 best_exit = book.best_bid if exit_side == "sell" else book.best_ask
                 return {
                     "depth": int(book.real_depth(exit_side)),
+                    # عمقِ سمت ورود: تنها چیزی که «کم است» را از
+                    # «نمی‌دانیم» جدا می‌کند وقتی سفارش پر نمی‌شود.
+                    "entry_depth": int(book.real_depth(entry_side)),
                     # قیمتِ پرشدن فقط وقتی معنا دارد که سفارش **کامل** پر
                     # شود؛ میانگینِ یک پرشدنِ ناقص، لغزشِ واقعی را
                     # کم‌برآورد می‌کند. همین قاعده برای سمت ورود هم هست.
@@ -199,6 +206,7 @@ class TradabilityScreener:
         entry_fits = entry_level_one is not None and entry_level_one >= needed
         return {
             "depth": None if level_one is None else int(level_one),
+            "entry_depth": None if entry_level_one is None else int(entry_level_one),
             "fill_price": best_exit if fits else None,
             "entry_fill_price": best_entry if entry_fits else None,
             # تک‌سطحی است: همان سطح، اگر اصلاً سطحی باشد. فاصله‌اش از

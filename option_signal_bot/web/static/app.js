@@ -404,27 +404,46 @@ function rankedItem(item, position) {
 
   const head = el("div", "screen-head");
   head.append(el("span", "note", `${item.strategy} · خرید`));
-  if (item.capital_required != null) {
+  // همه‌ی عددهای ریالی از قیمتِ اجراییِ ورود و خروجِ همین تعداد می‌آیند.
+  head.append(el("span", "note",
+    `پرمیومِ پرداختی: ${fmt(item.premium_cost)} ریال ` +
+    `(ورودِ اجرایی ${fmt(item.entry_price)})`));
+  // وجهِ ورود و هزینه‌ی فرضیِ رفت‌وبرگشت دو چیزند: دومی برای ورود لازم نیست.
+  head.append(el("span", "note",
+    item.capital_required != null
+      ? `وجه لازم برای ورود: ${fmt(item.capital_required)} ریال ` +
+        `(+ کارمزد ورود ${fmt(item.entry_fee)})`
+      : "وجه لازم برای ورود: نامعلوم — نرخ کارمزد اعلام نشده و صفر فرض نمی‌شود"));
+  if (item.round_trip_fees_estimate != null) {
     head.append(el("span", "note",
-      `سرمایه‌ی لازم: ${fmt(item.capital_required)} ریال`));
+      `کارمزد رفت‌وبرگشتِ فرضی: ${fmt(item.round_trip_fees_estimate)} ریال ` +
+      `(خروجِ فرضی ${fmt(item.exit_fee_estimate)})`));
   }
   // این دو عدد عمداً جدا نشان داده می‌شوند: قاطی‌کردنشان ریسک را
-  // کم‌تر از واقع نشان می‌دهد.
-  if (item.max_theoretical_loss != null) {
-    head.append(el("span", "note v-loss",
-      `حداکثر زیان نظری: ${fmt(item.max_theoretical_loss)} ریال (کل پرمیوم)`));
-  }
-  if (item.stop_loss_loss != null) {
-    head.append(el("span", "note",
-      `زیان تا حد ضرر: ${fmt(item.stop_loss_loss)} ریال`));
-  }
+  // کم‌تر از واقع نشان می‌دهد، و هر کدام فرضِ خودش را دارد.
+  head.append(el("span", "note v-loss",
+    item.max_theoretical_loss != null
+      ? `حداکثر زیان نظری: ${fmt(item.max_theoretical_loss)} ریال`
+      : "حداکثر زیان نظری: نامعلوم"));
+  head.append(el("span", "note",
+    item.stop_loss_loss != null
+      ? `زیان تا حد ضرر: ${fmt(item.stop_loss_loss)} ریال`
+      : "زیان تا حد ضرر: نامعلوم"));
   if (item.breakeven != null) {
     head.append(el("span", "note",
-      `سر‌به‌سر: ${fmt(item.breakeven)}` +
-      (item.breakeven_includes_fees ? " (با کارمزد)" : " — بدون کارمزد، خالص نیست")));
+      `سر‌به‌سر در سررسید: ${fmt(item.breakeven)}` +
+      (item.breakeven_includes_entry_fees
+        ? " (با کارمزد ورود، بدون هزینه‌ی اعمال — خالص نیست)"
+        : " — بدون کارمزد، خالص نیست")));
   }
   head.append(el("span", "note", `پوشش داده: ${fmt(item.coverage_pct, 0)}٪`));
   box.append(head);
+
+  // تعریف و فرضِ هر عدد، همان‌جا که خودِ عدد دیده می‌شود.
+  [item.max_theoretical_loss_basis, item.stop_loss_loss_basis,
+   item.breakeven_basis].forEach((basis) => {
+    if (basis) box.append(el("div", "note", basis));
+  });
 
   if (item.strengths && item.strengths.length) {
     box.append(el("div", "note", "بیشترین سهم در رتبه: " + item.strengths.join("، ")));
@@ -471,6 +490,8 @@ function renderRanking(ranking) {
   if (ranking.scope) head.append(el("p", "hint", ranking.scope));
   // اینکه چرا مؤلفه‌ی عملکرد اصلاً نیست، باید صریح گفته شود.
   if (ranking.evidence_note) head.append(el("p", "hint", ranking.evidence_note));
+  // تعریفِ عددهای ریالی یک‌جا، بالای فهرست.
+  if (ranking.money_note) head.append(el("p", "hint", ranking.money_note));
   if (ranking.evaluated_at) {
     head.append(el("div", "note",
       "زمان ارزیابی: " + ranking.evaluated_at.replace("T", " ")));

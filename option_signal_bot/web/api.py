@@ -350,7 +350,7 @@ def _ranking_weights(settings: dict[str, Any]) -> Any:
 
 
 def _ranking_candidate(
-    record: Any, signal: Signal | None, fees_known: bool
+    record: Any, signal: Signal | None, fees: Any
 ) -> dict[str, Any]:
     """ورودیِ رتبه‌بندی برای یک رکوردِ غربال.
 
@@ -369,26 +369,28 @@ def _ranking_candidate(
         "strike": signal.strike if signal else 0.0,
         "contract_size": signal.units_per_contract if signal else 1,
         "underlying_price": signal.underlying_price if signal else None,
-        # ⚠️ این «زیان تا حد ضرر» است، نه حداکثر زیانِ نظری: ماژول ریسک
-        # آن را از درصدِ حد ضرر می‌سازد. حداکثر زیانِ نظریِ خریدِ اختیار
-        # کلِ پرمیوم است و خودِ رتبه‌بندی حسابش می‌کند.
-        "stop_loss_loss": signal.metadata.get("max_loss") if signal else None,
-        "round_trip_fees": signal.metadata.get("round_trip_fees") if signal else None,
-        "fees_known": fees_known,
+        # ⚠️ **قیمتِ** حد ضرر می‌رود، نه مبلغِ زیانِ ماژول ریسک: آن مبلغ
+        # از پرمیومِ *پیشنهادی* ساخته شده و با سرمایه و سر‌به‌سرِ
+        # رتبه‌بندی — که از قیمتِ اجرایی می‌آیند — هم‌مبنا نیست.
+        "stop_loss_price": signal.stop_loss if signal else None,
+        # نرخ، نه مبلغ: کارمزدِ ورود از قیمتِ اجراییِ ورود و کارمزدِ
+        # خروجِ فرضی از قیمتِ اجراییِ خروجِ همان تعداد حساب می‌شود.
+        "fees": fees,
     }
 
 
-def _fees_known(settings: dict[str, Any]) -> bool:
-    """آیا نرخ کارمزدِ ماژول ریسک **اعلام‌شده** است؟
+def _fee_schedule(settings: dict[str, Any]) -> Any:
+    """نرخ کارمزدِ ماژول ریسک، همان‌طور که تنظیم شده.
 
     صفرِ اعلام‌شده هزینه‌ی دانسته است؛ صفرِ پیش‌فرضِ پروژه یعنی
-    «نمی‌دانیم». بدون این تفکیک، هر دو یک‌جور خوانده می‌شدند.
+    «نمی‌دانیم» (`FeeSchedule.rates_known`). بدون این تفکیک، هر دو
+    یک‌جور خوانده می‌شدند.
     """
     from risk.fees import FeeSchedule
 
     config = section(settings, "risk").get("fees") or {}
     known = {f.name for f in fields(FeeSchedule)}
-    return FeeSchedule(**{k: v for k, v in config.items() if k in known}).rates_known
+    return FeeSchedule(**{k: v for k, v in config.items() if k in known})
 
 
 def _build_ranking(
@@ -428,7 +430,7 @@ def _build_ranking(
         k: v for k, v in thresholds_config.items() if k in known_thresholds
     })
 
-    fees_known = _fees_known(settings)
+    fees = _fee_schedule(settings)
     candidates: list[dict[str, Any]] = []
     unpublished: list[dict[str, str]] = []
     for record in records:
@@ -439,7 +441,7 @@ def _build_ranking(
                 # علتشان باید در کنارگذاشته‌ها بماند. بدون سیگنال هم
                 # همه‌ی چیزی که برای گفتنِ «چرا» لازم است روی خودِ رکورد
                 # هست، پس با گزارش کامل به رتبه‌بندی می‌روند.
-                candidates.append(_ranking_candidate(record, None, fees_known))
+                candidates.append(_ranking_candidate(record, None, fees))
                 continue
             # از غربال گذشت ولی منتشر نشد — مثلاً تکراریِ بازه‌ی ضدتکرار.
             # بدون خودِ سیگنال، استرایک و قیمت در دست نیست و رتبه‌دادن
@@ -453,7 +455,7 @@ def _build_ranking(
                 ),
             })
             continue
-        candidates.append(_ranking_candidate(record, signal, fees_known))
+        candidates.append(_ranking_candidate(record, signal, fees))
 
     result = rank_opportunities(
         candidates=candidates,
@@ -639,6 +641,7 @@ def get_ranking_demo() -> dict[str, Any]:
         Thresholds,
         evaluate,
     )
+    from risk.fees import FeeSchedule
 
     now = datetime.now()
     thresholds = Thresholds()
@@ -650,8 +653,9 @@ def get_ranking_demo() -> dict[str, Any]:
     contract_size = 1_000
     strike = 10_000.0
     spot = 10_500.0
-    #: کارمزدِ **اعلام‌شده**ی نمونه: ۰٫۵٪ رفت‌وبرگشت روی پرمیوم.
-    demo_fee_rate = 0.005
+    #: نرخِ **اعلام‌شده**ی نمونه: ۰٫۲۵٪ هر سمت. مبلغش را خودِ رتبه‌بندی
+    #: از قیمتِ اجراییِ همان سمت حساب می‌کند، نه از پرمیومِ پیشنهادی.
+    demo_fees = FeeSchedule(buy_rate=0.0025, sell_rate=0.0025, declared=True)
 
     def observation(symbol: str, bids: list[tuple[float, int]],
                     asks: list[tuple[float, int]]) -> LiquidityObservation:
@@ -677,6 +681,9 @@ def get_ranking_demo() -> dict[str, Any]:
             ),
             exit_fill_price=exit_price if exit_filled >= quantity else None,
             entry_fill_price=entry_price if entry_filled >= quantity else None,
+            # عمقِ سمت ورود از همان دفتر: «کم بود» را از «ندیدیم» جدا
+            # می‌کند وقتی ورود پر نمی‌شود.
+            entry_depth_contracts=book.real_depth("buy"),
             best_exit_price=book.best_bid,
             open_interest=500, trades_today=40, days_to_expiry=45,
             quote_age_seconds=5.0,
@@ -684,19 +691,16 @@ def get_ranking_demo() -> dict[str, Any]:
 
     def candidate(obs: LiquidityObservation, **kwargs: Any) -> dict[str, Any]:
         entry = obs.entry_fill_price or 0.0
-        premium_cost = entry * quantity * contract_size
-        fees = round(premium_cost * demo_fee_rate, 0)
         data: dict[str, Any] = {
             "report": evaluate(obs, healthy, thresholds),
             "symbol": obs.symbol, "strategy": "نمونه‌ی آزمایشی",
             "side": "buy", "quantity": quantity, "leg_group_id": None,
             "option_type": "call", "strike": strike, "contract_size": contract_size,
             "underlying_price": spot,
-            # زیان تا حد ضررِ ۳۵٪ روی پرمیوم، به‌علاوه‌ی کارمزدی که در هر
-            # حالت پرداخت می‌شود — همان تعریفی که ماژول ریسک دارد.
-            "stop_loss_loss": round(premium_cost * 0.35 + fees, 0),
-            "round_trip_fees": fees,
-            "fees_known": True,
+            # حد ضررِ ۳۵٪ روی **قیمتِ اجراییِ ورودِ همین دفتر**؛ مبلغ زیانش
+            # را رتبه‌بندی از همان مبنا می‌سازد، پس عددها با هم می‌خوانند.
+            "stop_loss_price": round(entry * 0.65, 1) or None,
+            "fees": demo_fees,
         }
         data.update(kwargs)
         return data
@@ -716,8 +720,13 @@ def get_ranking_demo() -> dict[str, Any]:
             # نرخ کارمزد اعلام نشده → مؤلفه‌اش نامعلوم، نه صفر.
             candidate(
                 observation("نمونه‌پ", bids=[(980.0, 100)], asks=[(1_020.0, 100)]),
-                fees_known=False, round_trip_fees=None,
+                fees=None,
             ),
+            # ورودِ اجراناپذیر: عمقِ خرید ۱ قرارداد برای سفارشِ ۱۰ تایی.
+            # از غربال می‌گذرد (عمقِ خروج دارد) ولی رتبه نمی‌گیرد.
+            candidate(observation(
+                "نمونه‌چ", bids=[(980.0, 100)], asks=[(1_020.0, 1)],
+            )),
             # ردشده‌ی غربال: اسپرد ۱۰۰٪
             candidate(observation(
                 "نمونه‌ت", bids=[(500.0, 100)], asks=[(1_500.0, 100)],
