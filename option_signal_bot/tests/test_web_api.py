@@ -382,7 +382,7 @@ def test_ranking_weight_change_round_trips_and_rejects_nonsense(client):
     # خالی و منفی هر دو باید رد شوند، نه اینکه بی‌صدا در yaml بنشینند.
     assert client.put("/api/ranking", json={}).status_code == 400
     assert client.put("/api/ranking", json={"weight_exit_capacity": -1}).status_code == 422
-    assert client.put("/api/ranking", json={"min_resolved_signals": 0}).status_code == 422
+    assert client.put("/api/ranking", json={"max_fee_cost_pct": 0}).status_code == 422
 
 
 def test_scan_returns_ranking_without_leaking_internal_records(client):
@@ -408,6 +408,50 @@ def test_nothing_passing_the_gate_is_reported_with_a_reason_not_an_empty_list(cl
     assert ranking["excluded"], "علت کنارگذاشتن باید گزارش شود"
     for item in ranking["excluded"]:
         assert item["reason"].strip()
+
+
+def test_screening_records_carry_the_signal_id_they_belong_to(client):
+    """نتیجه‌ی غربال باید به **همان سیگنال** وصل شود، نه فقط همان نماد.
+
+    روی یک نماد می‌تواند چند سیگنال از چند استراتژی با سمت و تعدادِ
+    متفاوت در یک پاس باشد؛ وصل‌کردن با نماد یعنی عددهای بی‌ربط قاطی
+    شوند و «چرا این رتبه» دروغ از آب دربیاید.
+    """
+    records = client.post("/api/scan").json()["screening"]["records"]
+    assert records, "این فیکسچر باید چند گزینه ارزیابی کند"
+
+    for record in records:
+        assert record["signal_id"], f"{record['symbol']} شناسه‌ی سیگنال ندارد"
+
+    # و همان نماد با استراتژی‌های مختلف، شناسه‌های جدا می‌گیرد.
+    by_symbol: dict[str, set[str]] = {}
+    for record in records:
+        by_symbol.setdefault(record["symbol"], set()).add(record["signal_id"])
+    repeated = {s: ids for s, ids in by_symbol.items() if len(ids) > 1}
+    if repeated:
+        for symbol, ids in repeated.items():
+            assert len(ids) == len(
+                [r for r in records if r["symbol"] == symbol]
+            ), f"شناسه‌های {symbol} یکتا نیستند"
+
+
+def test_rejected_records_keep_their_verdict_and_reason_in_the_exclusions(client):
+    """ردشده و نیازمند بررسی نباید از فهرست کنارگذاشته‌ها گم شوند.
+
+    آن‌ها سیگنالِ منتشرشده ندارند، پس اگر اتصال با سیگنال باعث حذفشان
+    شود، کاربر دیگر نمی‌بیند چه چیزی رد شد و چرا.
+    """
+    body = client.post("/api/scan").json()
+    screened = body["screening"]["records"]
+    excluded = body["ranking"]["excluded"]
+
+    assert screened, "این فیکسچر باید چند گزینه ارزیابی کند"
+    assert len(excluded) >= len(screened), "هر رکوردِ غربال باید جایی دیده شود"
+    for item in excluded:
+        assert item["reason"].strip()
+    assert {i["verdict"] for i in excluded} <= {
+        "tradable", "needs_review", "rejected",
+    }
 
 
 def test_demo_ranking_is_labelled_and_served_from_a_separate_path(client):

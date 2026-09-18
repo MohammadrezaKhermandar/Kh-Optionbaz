@@ -374,6 +374,9 @@ class SignalGenerator:
             quantity=signal.suggested_qty,
             report=report,
             leg_group_id=str(group_id) if group_id else None,
+            # نماد برای وصل‌کردن کافی نیست: چند سیگنال روی یک نماد
+            # ممکن است در یک پاس صادر شود.
+            signal_id=signal.signal_id,
         ))
         if report.verdict is Verdict.TRADABLE:
             return True

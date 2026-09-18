@@ -216,20 +216,17 @@ def default_settings() -> dict[str, Any]:
         "ranking": {
             "enabled": True,
             # --- وزن مؤلفه‌ها (جمعشان لازم نیست ۱۰۰ باشد؛ نسبی‌اند) ---
-            "weight_price_cost": 30.0,
+            "weight_round_trip_cost": 30.0,
             "weight_exit_capacity": 20.0,
             "weight_time_to_expiry": 15.0,
-            "weight_required_move": 20.0,
-            "weight_cost_drag": 5.0,
-            "weight_strategy_evidence": 10.0,
+            "weight_required_move": 25.0,
+            "weight_fee_cost": 10.0,
             # --- نقطه‌ی اشباع هر سنجه ---
             "depth_comfort_multiple": 3.0,
             "days_to_expiry_comfort": 30,
             "max_required_move_pct": 25.0,
-            "max_cost_drag_pct": 5.0,
-            # کمتر از این تعداد سیگنالِ نتیجه‌دار، کارنامه‌ی استراتژی
-            # «نامعلوم» است — نه «بد».
-            "min_resolved_signals": 10,
+            "max_round_trip_cost_pct": 30.0,
+            "max_fee_cost_pct": 5.0,
         },
         # ثبت تاریخچه‌ی خام بازار (`scripts/record_market.py`).
         #

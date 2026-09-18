@@ -4,9 +4,12 @@
 خراب شوند، امتیاز بی‌صدا گمراه‌کننده می‌شود:
 
 * گزینه‌ی ردشده‌ی غربال، هر چقدر هم جذاب، نباید رتبه بگیرد؛
+* هزینه‌ی رفت‌وبرگشت باید از قیمتِ **اجراپذیر** بیاید، نه نصفِ اسپرد؛
 * اجرای بدتر نباید امتیاز بهتر بگیرد؛
 * اندازه‌ی سفارش باید واقعاً بر رتبه اثر بگذارد؛
+* عمقِ قیمت‌های دور نباید حاشیه‌ی امنِ خروج حساب شود؛
 * داده‌ی ناقص نباید برتریِ مصنوعی بسازد؛
+* «زیان تا حد ضرر» با «حداکثر زیان نظری» قاطی نشود؛
 * امتیاز باید از همان ورودی‌ها قابلِ بازتولید و توضیح باشد.
 """
 
@@ -16,9 +19,9 @@ from datetime import datetime
 
 import pytest
 
+from data.order_book import BookLevel, OrderBook
 from market.opportunity_ranking import (
     RankingWeights,
-    StrategyEvidence,
     breakeven_price,
     rank_opportunities,
 )
@@ -32,6 +35,7 @@ from market.tradability import (
 NOW = datetime(2026, 5, 20, 10, 30)
 THRESHOLDS = Thresholds()
 WEIGHTS = RankingWeights()
+CONTRACT_SIZE = 1_000
 
 #: تاریخچه‌ای که همه‌ی سنجه‌هایش دانسته و سالم است، تا حکمِ غربال به
 #: خودِ مظنه و عمق بستگی داشته باشد نه به نبودِ تاریخچه.
@@ -44,32 +48,52 @@ HEALTHY = HistoryStats(
 )
 
 
-def _observation(**kwargs) -> LiquidityObservation:
-    """یک قرارداد سالم و نقدشونده؛ هر تست فقط چیزی را که می‌سنجد عوض می‌کند."""
+def _book(bids, asks, symbol="ضخود۱۰۰۱") -> OrderBook:
+    return OrderBook(
+        symbol,
+        bids=tuple(BookLevel(p, q) for p, q in bids),
+        asks=tuple(BookLevel(p, q) for p, q in asks),
+    )
+
+
+def _observation(
+    symbol: str = "ضخود۱۰۰۱",
+    quantity: int = 10,
+    bids=((980.0, 100),),
+    asks=((1_020.0, 100),),
+    **overrides,
+) -> LiquidityObservation:
+    """مشاهده را از یک دفترِ واقعی می‌سازد تا عددها با هم بخوانند."""
+    book = _book(bids, asks, symbol)
+    exit_price, exit_filled = book.fill_price("sell", quantity)
+    entry_price, entry_filled = book.fill_price("buy", quantity)
     defaults = dict(
-        symbol="ضخود۱۰۰۱",
+        symbol=symbol,
         position_side="buy",
-        quantity=10,
+        quantity=quantity,
         observed_at=NOW,
-        bid=980.0,
-        ask=1_020.0,
-        exit_depth_contracts=100,
-        exit_fill_price=980.0,
-        best_exit_price=980.0,
+        bid=book.best_bid,
+        ask=book.best_ask,
+        exit_depth_contracts=book.real_depth("sell"),
+        exit_depth_within_band_contracts=book.depth_within(
+            "sell", THRESHOLDS.max_exit_slippage_pct
+        ),
+        exit_fill_price=exit_price if exit_filled >= quantity else None,
+        entry_fill_price=entry_price if entry_filled >= quantity else None,
+        best_exit_price=book.best_bid,
         open_interest=500,
         trades_today=40,
         days_to_expiry=45,
         quote_age_seconds=5.0,
     )
-    defaults.update(kwargs)
+    defaults.update(overrides)
     return LiquidityObservation(**defaults)
 
 
 def _candidate(observation=None, history=HEALTHY, **overrides) -> dict:
     observation = observation or _observation()
-    report = evaluate(observation, history, THRESHOLDS)
     candidate = {
-        "report": report,
+        "report": evaluate(observation, history, THRESHOLDS),
         "symbol": observation.symbol,
         "strategy": "directional_ma_cross",
         "side": observation.position_side,
@@ -77,123 +101,187 @@ def _candidate(observation=None, history=HEALTHY, **overrides) -> dict:
         "leg_group_id": None,
         "option_type": "call",
         "strike": 10_000.0,
-        "premium": 1_000.0,
+        "contract_size": CONTRACT_SIZE,
         "underlying_price": 10_500.0,
-        "notional": 1_000.0 * observation.quantity * 1_000,
-        "max_loss": 1_000.0 * observation.quantity * 1_000,
+        "stop_loss_loss": 3_500_000.0,
         "round_trip_fees": 50_000.0,
+        "fees_known": True,
     }
     candidate.update(overrides)
     return candidate
 
 
-def _rank(candidates, weights=WEIGHTS, evidence=None):
+def _rank(candidates, weights=WEIGHTS, thresholds=THRESHOLDS):
     return rank_opportunities(
         candidates=candidates,
-        thresholds=THRESHOLDS,
+        thresholds=thresholds,
         weights=weights,
-        evidence_by_strategy=evidence or {},
         evaluated_at=NOW,
     )
+
+
+def _component(ranked, key):
+    return next(c for c in ranked.components if c.key == key)
 
 
 # ----------------------------------------------------------------------
 # ۱. غربال دروازه است، امتیاز جایش را نمی‌گیرد
 # ----------------------------------------------------------------------
 def test_a_rejected_option_never_enters_the_ranking_however_attractive():
-    """گزینه‌ی ردشده حتی با بهترین عددهای دیگر هم رتبه نمی‌گیرد.
-
-    این همان چیزی است که کل معماری بر آن بنا شده: نقدشوندگی جبران‌شدنی
-    نیست. اگر امتیاز بتواند ردشده را بالا بیاورد، غربال بی‌معنا می‌شود.
-    """
-    # اسپرد ۶۰٪ — خیلی بالاتر از سقفِ ۲۵٪ غربال؛ بقیه‌ی سنجه‌ها عالی‌اند.
-    dead = _candidate(_observation(symbol="ضمرده", bid=500.0, ask=1_500.0))
+    """گزینه‌ی ردشده حتی با بهترین عددهای دیگر هم رتبه نمی‌گیرد."""
+    dead = _candidate(_observation(
+        symbol="ضمرده", bids=((500.0, 100),), asks=((1_500.0, 100),)
+    ))
     assert dead["report"].verdict.value == "rejected"
 
     result = _rank([dead])
 
     assert result.ranked == ()
     assert [e.symbol for e in result.excluded] == ["ضمرده"]
+    assert result.excluded[0].verdict == "rejected"
     assert "رد شده" in result.excluded[0].reason
 
 
-def test_a_needs_review_option_is_excluded_too_with_its_own_reason():
-    """نبودِ داده «قبول» ترجمه نمی‌شود — ولی علتش با «رد شده» فرق دارد."""
+def test_a_needs_review_option_keeps_its_own_status_and_reason():
+    """نبودِ داده «قبول» ترجمه نمی‌شود — و علتش با «رد شده» فرق دارد."""
     unknown_history = _candidate(history=HistoryStats(known=False))
     assert unknown_history["report"].verdict.value == "needs_review"
 
     result = _rank([unknown_history])
 
     assert result.ranked == ()
+    assert result.excluded[0].verdict == "needs_review"
     assert "نیازمند بررسی" in result.excluded[0].reason
 
 
+# ----------------------------------------------------------------------
+# ۲. دامنه‌ی نسخه‌ی اول: فقط خریدِ تک‌پایه
+# ----------------------------------------------------------------------
 def test_a_multi_leg_leg_is_excluded_with_a_stated_scope_reason():
-    """دامنه‌ی نسخه‌ی اول صریح اعلام می‌شود، بی‌صدا حذف نمی‌شود."""
-    leg = _candidate(leg_group_id="grp-1")
-
-    result = _rank([leg])
+    result = _rank([_candidate(leg_group_id="grp-1")])
 
     assert result.ranked == ()
     assert "چندپایه" in result.excluded[0].reason
 
 
+def test_a_sell_position_is_not_scored_with_the_buy_formula():
+    """فروش نباید با فرمولِ خرید امتیاز بگیرد.
+
+    سرمایه‌ی درگیر، سر‌به‌سر و حداکثر زیانِ این نسخه همه از منطقِ خرید
+    می‌آیند؛ اعمالشان روی فروش یعنی ریسک را غلط نشان بدهیم.
+    """
+    result = _rank([_candidate(side="sell")])
+
+    assert result.ranked == ()
+    assert result.excluded[0].verdict == "tradable", "غربال را پاس کرده بود"
+    assert "فروش" in result.excluded[0].reason
+
+
+def test_the_payload_states_the_scope_and_the_disabled_evidence():
+    payload = _rank([_candidate()]).to_dict()
+
+    assert "تک‌پایه" in payload["scope"]
+    assert "نرخ برد" in payload["evidence_note"]
+    assert not any(
+        c["key"] == "strategy_evidence" for c in payload["ranked"][0]["components"]
+    ), "مؤلفه‌ی عملکرد نباید اصلاً ساخته شود"
+
+
 # ----------------------------------------------------------------------
-# ۲. اجرای بدتر، امتیاز بهتر نمی‌گیرد
+# ۳. هزینه‌ی رفت‌وبرگشت از قیمتِ اجراپذیر
 # ----------------------------------------------------------------------
+def test_round_trip_cost_uses_both_executable_sides_not_half_the_spread():
+    """هزینه باید کلِ اسپرد را ببیند، نه نصفش.
+
+    دفتر: خرید روی ۱۰۲۰، فروش روی ۹۸۰. رفت‌وبرگشت یعنی ۴۰ ریال از
+    ۱۰۲۰ = ۳٫۹۲٪. نسخه‌ی قبلی «نصف اسپرد» می‌گرفت که تقریباً نصفِ این
+    عدد بود و هزینه را کم‌تر از واقع نشان می‌داد.
+    """
+    ranked = _rank([_candidate()]).ranked[0]
+
+    cost = _component(ranked, "round_trip_cost")
+    assert cost.measured == pytest.approx((1_020.0 - 980.0) / 1_020.0 * 100, abs=0.01)
+    assert "پرمیومِ پرداختی" in cost.unit
+    # و نصفِ اسپرد (۲٪) عددِ دیگری است؛ نباید با آن اشتباه شود.
+    assert cost.measured > 3.0
+
+
+def test_round_trip_cost_is_unknown_when_a_side_cannot_be_executed():
+    """اگر یک سمت برای این حجم پر نشود، عددی ساخته نمی‌شود."""
+    thin_entry = _candidate(_observation(
+        quantity=50, bids=((980.0, 100),), asks=((1_020.0, 5),)
+    ))
+
+    result = _rank([thin_entry])
+    # عمقِ خروج کافی است پس غربال ردش نمی‌کند؛ ولی ورود اجراپذیر نیست.
+    ranked = result.ranked[0]
+    cost = _component(ranked, "round_trip_cost")
+    assert cost.score is None
+    assert "اجراپذیر نیست" in cost.detail
+
+
 def test_worse_execution_never_scores_better_in_otherwise_equal_conditions():
-    """در شرایط برابر، اسپردِ بدتر باید امتیازِ کمتر بدهد، نه بیشتر."""
-    tight = _candidate(_observation(symbol="ضتنگ", bid=995.0, ask=1_005.0))
-    wide = _candidate(_observation(symbol="ضپهن", bid=950.0, ask=1_050.0))
+    tight = _candidate(_observation(
+        symbol="ضتنگ", bids=((995.0, 100),), asks=((1_005.0, 100),)
+    ))
+    wide = _candidate(_observation(
+        symbol="ضپهن", bids=((950.0, 100),), asks=((1_050.0, 100),)
+    ))
 
     result = _rank([tight, wide])
 
-    ordered = [r.symbol for r in result.ranked]
-    assert ordered == ["ضتنگ", "ضپهن"], "اسپرد بازتر نباید بالاتر بنشیند"
+    assert [r.symbol for r in result.ranked] == ["ضتنگ", "ضپهن"]
     assert result.ranked[0].score > result.ranked[1].score
 
 
-def test_slippage_lowers_the_score_even_when_the_spread_is_identical():
-    """لغزش سنجه‌ی جدایی است: عمق دور از مظنه، ظرفیت نیست.
+# ----------------------------------------------------------------------
+# ۴. ظرفیت خروج: فقط عمقِ درونِ محدوده‌ی قیمتی
+# ----------------------------------------------------------------------
+def test_far_away_volume_is_not_counted_as_exit_head_room():
+    """حجمی که در قیمت‌های دور نشسته، حاشیه‌ی امنِ خروج نیست.
 
-    این دو قرارداد اسپرد یکسان دارند؛ تنها فرقشان این است که سفارش در
-    یکی روی بهترین مظنه پر می‌شود و در دیگری با ۵٪ بدتر.
+    هر دو دفتر ۱۰ قرارداد روی بهترین مظنه دارند؛ دومی هزار قرارداد
+    دیگر هم دارد ولی ۳۰٪ پایین‌تر. اگر آن حجم شمرده شود، این گزینه
+    بی‌دلیل «پرظرفیت» به نظر می‌رسد.
     """
-    clean = _candidate(_observation(symbol="ضصاف", exit_fill_price=980.0))
-    slipping = _candidate(_observation(symbol="ضلغزان", exit_fill_price=931.0))
+    near = _candidate(_observation(
+        symbol="ضنزدیک", bids=((1_000.0, 10), (960.0, 20)), asks=((1_010.0, 100),)
+    ))
+    far = _candidate(_observation(
+        symbol="ضدور", bids=((1_000.0, 10), (700.0, 1_000)), asks=((1_010.0, 100),)
+    ))
 
-    result = _rank([clean, slipping])
+    result = _rank([near, far])
 
-    assert [r.symbol for r in result.ranked] == ["ضصاف", "ضلغزان"]
-    assert result.ranked[0].score > result.ranked[1].score
-
-
-def test_deeper_book_scores_at_least_as_high_as_a_thin_one():
-    thin = _candidate(_observation(symbol="ضکم‌عمق", exit_depth_contracts=10))
-    deep = _candidate(_observation(symbol="ضپرعمق", exit_depth_contracts=100))
-
-    result = _rank([thin, deep])
-
-    assert [r.symbol for r in result.ranked] == ["ضپرعمق", "ضکم‌عمق"]
+    by_symbol = {r.symbol: r for r in result.ranked}
+    near_cap = _component(by_symbol["ضنزدیک"], "exit_capacity")
+    far_cap = _component(by_symbol["ضدور"], "exit_capacity")
+    assert near_cap.measured > far_cap.measured
+    # عمقِ کل برای «ضدور» خیلی بیشتر است، ولی امتیاز ظرفیتش نباید بالاتر برود.
+    assert far_cap.score <= near_cap.score
+    assert "دورتر" in far_cap.detail
 
 
-# ----------------------------------------------------------------------
-# ۳. اندازه‌ی سفارش واقعاً اثر می‌گذارد
-# ----------------------------------------------------------------------
+def test_a_zero_depth_floor_does_not_silently_disable_the_capacity_measure():
+    """کفِ صفرِ غربال نباید سنجه‌ی ظرفیت را بی‌اثر کند."""
+    thresholds = Thresholds(min_exit_depth_ratio=0.0)
+    thin = _candidate(_observation(symbol="ضنازک", bids=((980.0, 10),)))
+    deep = _candidate(_observation(symbol="ضعمیق", bids=((980.0, 300),)))
+
+    result = _rank([thin, deep], thresholds=thresholds)
+
+    scores = {r.symbol: r.score for r in result.ranked}
+    assert scores["ضعمیق"] > scores["ضنازک"]
+
+
 def test_a_bigger_order_can_lose_its_place_to_depth_and_slippage():
-    """همان قرارداد، با سفارشِ بزرگ‌تر: عمقِ نسبی کم و لغزش زیاد می‌شود.
-
-    دفتر: ۱۰ قرارداد روی ۱۰۰۰ و ۹۰ قرارداد روی ۹۰۰. سفارشِ ۱۰تایی روی
-    بهترین مظنه پر می‌شود؛ سفارشِ ۱۰۰تایی میانگینِ بدتری می‌گیرد و
-    نسبتِ عمقش هم از ۱۰ برابر به ۱ برابر می‌افتد.
-    """
+    """همان دفتر، سفارشِ بزرگ‌تر: ظرفیتِ نسبی کم و هزینه زیاد می‌شود."""
+    book = (((1_000.0, 10), (900.0, 200)), ((1_010.0, 500),))
     small = _candidate(_observation(
-        symbol="ضکوچک", quantity=10,
-        exit_depth_contracts=100, exit_fill_price=1_000.0, best_exit_price=1_000.0,
+        symbol="ضکوچک", quantity=10, bids=book[0], asks=book[1]
     ))
     big = _candidate(_observation(
-        symbol="ضبزرگ", quantity=100,
-        exit_depth_contracts=100, exit_fill_price=910.0, best_exit_price=1_000.0,
+        symbol="ضبزرگ", quantity=100, bids=book[0], asks=book[1]
     ))
 
     result = _rank([small, big])
@@ -202,33 +290,61 @@ def test_a_bigger_order_can_lose_its_place_to_depth_and_slippage():
     assert result.ranked[0].score > result.ranked[1].score
 
 
-def test_an_order_too_big_for_the_book_is_rejected_by_the_gate_not_ranked_low():
-    """سفارشی که عمق کفافش را نمی‌دهد اصلاً رتبه نمی‌گیرد — رتبه‌ی پایین نه.
+# ----------------------------------------------------------------------
+# ۵. پول: سرمایه، زیان و سر‌به‌سر با تعریفِ سازگار
+# ----------------------------------------------------------------------
+def test_stop_loss_loss_is_not_presented_as_the_theoretical_maximum():
+    """این دو عدد یکی نیستند و قاطی‌کردنشان ریسک را کم نشان می‌دهد.
 
-    این تفاوت مهم است: «بد» با «غیرقابل اجرا» یکی نیست.
+    خریدِ اختیار می‌تواند **کلِ** پرمیوم را از دست بدهد؛ «زیان تا حد
+    ضرر» فقط تا همان درصدِ تنظیم‌شده است — و آن هم مشروط به اینکه
+    بشود در آن قیمت خارج شد.
     """
-    oversized = _candidate(_observation(
-        symbol="ضعظیم", quantity=500, exit_depth_contracts=100, exit_fill_price=None,
-    ))
+    ranked = _rank([_candidate(stop_loss_loss=3_500_000.0)]).ranked[0]
 
-    result = _rank([oversized])
+    # ورودِ اجراپذیر ۱۰۲۰ × ۱۰ قرارداد × ۱۰۰۰ واحد + ۵۰٬۰۰۰ کارمزد
+    assert ranked.capital_required == pytest.approx(1_020 * 10 * 1_000 + 50_000)
+    assert ranked.max_theoretical_loss == pytest.approx(ranked.capital_required)
+    assert ranked.stop_loss_loss == 3_500_000.0
+    assert ranked.max_theoretical_loss > ranked.stop_loss_loss
 
-    assert result.ranked == ()
-    assert result.excluded[0].verdict == "rejected"
+
+def test_capital_and_breakeven_come_from_the_executable_entry_price():
+    """سرمایه و سر‌به‌سر باید با پولی که واقعاً پرداخت می‌شود بخوانند."""
+    ranked = _rank([_candidate()]).ranked[0]
+
+    fee_per_unit = 50_000 / (10 * 1_000)
+    assert ranked.breakeven == pytest.approx(10_000 + 1_020 + fee_per_unit)
+    assert ranked.breakeven_includes_fees is True
+
+
+def test_a_breakeven_without_fees_is_not_presented_as_net():
+    """وقتی نرخ کارمزد نامعلوم است، سر‌به‌سر «خالص» نیست."""
+    ranked = _rank([_candidate(fees_known=False, round_trip_fees=None)]).ranked[0]
+
+    assert ranked.breakeven == pytest.approx(10_000 + 1_020), "بدون کارمزد"
+    assert ranked.breakeven_includes_fees is False
+    assert ranked.capital_required == pytest.approx(1_020 * 10 * 1_000)
+
+
+def test_declared_zero_fees_differ_from_an_unknown_rate():
+    """صفرِ اعلام‌شده هزینه‌ی دانسته است؛ نرخِ تنظیم‌نشده نامعلوم."""
+    declared_zero = _rank([_candidate(round_trip_fees=0.0, fees_known=True)]).ranked[0]
+    unknown = _rank([_candidate(round_trip_fees=None, fees_known=False)]).ranked[0]
+
+    assert _component(declared_zero, "fee_cost").score == pytest.approx(100.0)
+    assert _component(unknown, "fee_cost").score is None
+    assert declared_zero.coverage_pct > unknown.coverage_pct
 
 
 # ----------------------------------------------------------------------
-# ۴. داده‌ی ناقص برتریِ مصنوعی نمی‌سازد
+# ۶. داده‌ی ناقص برتریِ مصنوعی نمی‌سازد
 # ----------------------------------------------------------------------
 def test_missing_data_never_outranks_a_fully_known_option():
-    """مؤلفه‌ی نامعلوم از مخرج حذف نمی‌شود؛ صفر حساب می‌شود.
-
-    اگر حذف می‌شد، گزینه‌ای که کارمزدش را نمی‌دانیم خودبه‌خود از گزینه‌ی
-    یکسانی که هزینه‌اش را می‌دانیم بالاتر می‌نشست — یعنی ندانستن پاداش
-    می‌گرفت.
-    """
-    known = _candidate(_observation(symbol="ضدانسته"), round_trip_fees=50_000.0)
-    unknown = _candidate(_observation(symbol="ضنامعلوم"), round_trip_fees=None)
+    known = _candidate(_observation(symbol="ضدانسته"))
+    unknown = _candidate(
+        _observation(symbol="ضنامعلوم"), round_trip_fees=None, fees_known=False
+    )
 
     result = _rank([known, unknown])
 
@@ -238,61 +354,33 @@ def test_missing_data_never_outranks_a_fully_known_option():
 
 
 def test_an_unknown_component_is_reported_not_hidden():
-    """نامعلوم باید دیده شود: هم در پوشش داده، هم در فهرست خودش."""
-    candidate = _candidate(round_trip_fees=None)
-
-    ranked = _rank([candidate]).ranked[0]
+    ranked = _rank([_candidate(round_trip_fees=None, fees_known=False)]).ranked[0]
 
     assert ranked.coverage_pct < 100.0
-    labels = [c.label for c in ranked.unknown_components]
-    assert "سهم کارمزد از موقعیت" in labels
-    # و در «ضعف» شمرده نمی‌شود؛ ندانستن ضعف نیست.
+    assert "سهم کارمزد از سرمایه" in [c.label for c in ranked.unknown_components]
     assert ranked.weakness is None or ranked.weakness.is_known
 
 
 def test_the_conservative_score_never_exceeds_the_best_case():
-    partial = _rank([_candidate(round_trip_fees=None)]).ranked[0]
+    partial = _rank([_candidate(round_trip_fees=None, fees_known=False)]).ranked[0]
 
     assert partial.score < partial.score_best_case
-    # فاصله دقیقاً به اندازه‌ی وزنِ نامعلوم است — نواری که می‌گوید چقدر نمی‌دانیم.
     assert partial.score_best_case - partial.score == pytest.approx(
-        WEIGHTS.weight_cost_drag + WEIGHTS.weight_strategy_evidence
+        WEIGHTS.weight_fee_cost
     )
 
 
-def test_evidence_stays_unknown_until_the_sample_is_big_enough():
-    """نرخ بردِ سه سیگنال عدد است، ولی شاهد نیست."""
-    thin = StrategyEvidence(
-        strategy="directional_ma_cross", resolved=3, wins=3, win_rate_pct=100.0
-    )
+def test_required_move_is_unknown_without_an_underlying_price():
+    ranked = _rank([_candidate(underlying_price=None)]).ranked[0]
 
-    ranked = _rank([_candidate()], evidence={"directional_ma_cross": thin}).ranked[0]
-
-    evidence = next(c for c in ranked.components if c.key == "strategy_evidence")
-    assert evidence.score is None
-    assert "نامعلوم است، نه بد" in evidence.detail
-
-
-def test_a_real_track_record_counts_once_the_sample_is_big_enough():
-    solid = StrategyEvidence(
-        strategy="directional_ma_cross", resolved=20, wins=14, win_rate_pct=70.0
-    )
-
-    ranked = _rank([_candidate()], evidence={"directional_ma_cross": solid}).ranked[0]
-
-    evidence = next(c for c in ranked.components if c.key == "strategy_evidence")
-    assert evidence.score == pytest.approx(70.0)
-    assert "پیش‌بینی" in evidence.detail, "باید صریح بگوید گذشته است، نه پیش‌بینی"
+    assert _component(ranked, "required_move").score is None
+    assert ranked.coverage_pct < 100.0
 
 
 # ----------------------------------------------------------------------
-# ۵. امتیاز قابل بازتولید و توضیح است
+# ۷. امتیاز قابل بازتولید و توضیح است
 # ----------------------------------------------------------------------
 def test_the_score_is_the_weighted_sum_of_its_own_components():
-    """امتیاز باید دقیقاً از همان سهم‌هایی بیاید که نمایش داده می‌شود.
-
-    اگر عدد و توضیح از دو جا بیایند، «چرا این رتبه» بی‌معنا می‌شود.
-    """
     ranked = _rank([_candidate()]).ranked[0]
 
     rebuilt = sum(c.contribution for c in ranked.components) / ranked.total_weight * 100
@@ -308,37 +396,15 @@ def test_the_same_inputs_give_the_same_score_every_time():
     assert [c.score for c in first.components] == [c.score for c in second.components]
 
 
-def test_a_zero_depth_floor_does_not_silently_disable_the_capacity_measure():
-    """کفِ صفرِ غربال نباید سنجه‌ی ظرفیت را بی‌اثر کند.
-
-    اگر «راحت» از ضربِ کفِ صفر می‌آمد، صفر می‌شد و هر عمقی امتیاز کامل
-    می‌گرفت — یعنی دفترِ نازک و دفترِ عمیق فرقی نمی‌کردند.
-    """
-    thresholds = Thresholds(min_exit_depth_ratio=0.0)
-    thin = _candidate(_observation(symbol="ضنازک", exit_depth_contracts=10))
-    deep = _candidate(_observation(symbol="ضعمیق", exit_depth_contracts=300))
-
-    result = rank_opportunities(
-        candidates=[thin, deep], thresholds=thresholds, weights=WEIGHTS,
-        evidence_by_strategy={}, evaluated_at=NOW,
-    )
-
-    scores = {r.symbol: r.score for r in result.ranked}
-    assert scores["ضعمیق"] > scores["ضنازک"]
-
-
 def test_changing_a_weight_changes_the_score_in_the_stated_direction():
-    """وزن‌ها واقعاً تنظیم‌پذیرند — نه عددی تزئینی."""
-    candidate = _candidate(_observation(exit_depth_contracts=1_000))
+    candidate = _candidate(_observation(bids=((980.0, 1_000),)))
     light = _rank([candidate], weights=RankingWeights(weight_exit_capacity=5.0))
     heavy = _rank([candidate], weights=RankingWeights(weight_exit_capacity=60.0))
 
-    # ظرفیتِ خروج اینجا امتیاز کاملی دارد، پس وزنِ بیشتر یعنی امتیاز بالاتر.
     assert heavy.ranked[0].score > light.ranked[0].score
 
 
 def test_every_component_explains_itself_with_a_number():
-    """توضیح بدون عدد، توضیح نیست — همان قاعده‌ای که غربال هم دارد."""
     ranked = _rank([_candidate()]).ranked[0]
 
     for component in ranked.components:
@@ -348,7 +414,6 @@ def test_every_component_explains_itself_with_a_number():
 
 
 def test_the_output_says_what_the_score_is_not():
-    """این عدد نباید با احتمال برد یا بازده مورد انتظار اشتباه شود."""
     payload = _rank([_candidate()]).to_dict()
 
     assert "احتمال برد" in payload["note"]
@@ -356,36 +421,20 @@ def test_the_output_says_what_the_score_is_not():
 
 
 # ----------------------------------------------------------------------
-# سر‌به‌سر و حرکت لازم
+# سر‌به‌سر
 # ----------------------------------------------------------------------
 def test_breakeven_moves_the_right_way_for_calls_and_puts():
     assert breakeven_price(10_000, 500, "call") == 10_500
     assert breakeven_price(10_000, 500, "put") == 9_500
+    # کارمزد سر‌به‌سر را دورتر می‌برد، در هر دو جهت.
+    assert breakeven_price(10_000, 500, "call", fee_per_unit=10) == 10_510
+    assert breakeven_price(10_000, 500, "put", fee_per_unit=10) == 9_490
 
 
 def test_an_option_needing_a_huge_move_ranks_below_one_that_is_already_there():
-    """هرچه حرکتِ لازم بزرگ‌تر، ادعای استراتژی بزرگ‌تر — نه احتمالش کمتر.
-
-    اینجا هیچ احتمالی ادعا نمی‌شود؛ فقط «چقدر باید اتفاق بیفتد» سنجیده
-    می‌شود.
-    """
-    near = _candidate(
-        _observation(symbol="ضنزدیک"), strike=10_000.0, premium=100.0,
-        underlying_price=10_500.0,
-    )
-    far = _candidate(
-        _observation(symbol="ضدور"), strike=14_000.0, premium=100.0,
-        underlying_price=10_500.0,
-    )
+    near = _candidate(_observation(symbol="ضنزدیک"), strike=9_000.0)
+    far = _candidate(_observation(symbol="ضدور"), strike=14_000.0)
 
     result = _rank([near, far])
 
     assert [r.symbol for r in result.ranked] == ["ضنزدیک", "ضدور"]
-
-
-def test_required_move_is_unknown_without_an_underlying_price():
-    ranked = _rank([_candidate(underlying_price=None)]).ranked[0]
-
-    move = next(c for c in ranked.components if c.key == "required_move")
-    assert move.score is None
-    assert ranked.coverage_pct < 100.0

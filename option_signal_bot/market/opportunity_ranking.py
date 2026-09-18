@@ -15,13 +15,18 @@
 یا داده‌ی لازم را نمی‌گیرد: گزینه‌ی ردشده هر چقدر هم سودِ ظاهری داشته
 باشد، اینجا رتبه نمی‌گیرد — در فهرست «کنارگذاشته‌ها» با علتش می‌آید.
 
-**سنجه‌های هم‌بسته یک بار شمرده می‌شوند**
+**هزینه از قیمتِ اجراپذیر می‌آید، نه از نصفِ اسپرد**
 
-اسپرد و لغزش هر دو «هزینه‌ی قیمتیِ ورود و خروج» را می‌سنجند؛ جدا
-وزن‌دادن به هر دو یعنی یک شاهد را دو بار پاداش دادن. پس در یک عدد
-جمع می‌شوند: `نصفِ اسپرد + لغزش` — یعنی هزینه‌ی عبور از مظنه به‌علاوه‌ی
-بدترشدنِ قیمت برای **همین اندازه‌ی سفارش**. عمق جداست چون چیز دیگری
-می‌گوید: ظرفیت، نه قیمت.
+هزینه‌ی رفت‌وبرگشت یعنی روی `ask` بخری و روی `bid` بفروشی — کلِ اسپرد،
+به‌علاوه‌ی لغزشِ هر دو سمت برای **همین تعداد قرارداد**. پس از میانگینِ
+وزنیِ پرشدنِ واقعیِ هر دو سمت حساب می‌شود و مخرجش قیمتِ ورود است:
+«چند درصد از پرمیومِ پرداختی». اگر یکی از دو سمت برای این حجم اجراپذیر
+نباشد، عددی **ساخته نمی‌شود**.
+
+اسپرد و لغزش جدا وزن نمی‌گیرند: هر دو در همین یک عدد هستند، وگرنه یک
+شاهد دو بار پاداش می‌گرفت. عمق جداست چون چیز دیگری می‌گوید — ظرفیت،
+نه قیمت — و فقط عمقِ **درون محدوده‌ی قیمتی** شمرده می‌شود: حجمی که در
+قیمت‌های دور نشسته حاشیه‌ی امنِ خروج نیست.
 
 **نامعلوم پنهان نمی‌شود و به نفع گزینه تمام نمی‌شود**
 
@@ -34,12 +39,21 @@
 فاصله‌ی این دو، «نواری» است که می‌گوید چقدر نمی‌دانیم. `coverage_pct`
 همان را به درصدِ وزنِ دانسته بیان می‌کند.
 
-**دامنه‌ی نسخه‌ی اول — صریح**
+**دامنه‌ی نسخه‌ی اول — صریح: فقط خریدِ اختیارِ تک‌پایه**
 
-فقط موقعیتِ **تک‌پایه** رتبه می‌گیرد. ساختار چندپایه (استردل، کالر، …)
-کنار گذاشته می‌شود چون مقایسه‌ی سود/بازدهِ ساختارها با مخرج‌های متفاوت
-عددِ گمراه‌کننده می‌سازد و وجه تضمینِ پایه‌ی فروش هم در این پروژه مدل
-نشده است. این حذف **اعلام** می‌شود، بی‌صدا نیست.
+همه‌ی فرمول‌های اینجا از منطقِ **خرید** می‌آیند: سرمایه‌ی درگیر یعنی
+پرمیومِ پرداختی، حداکثر زیانِ نظری یعنی از دست دادنِ همان پرمیوم، و
+سر‌به‌سر یعنی استرایک به‌علاوه‌ی هزینه‌ی ورود. هیچ‌کدامِ این‌ها برای
+**فروش** یا ساختارهای پوششی معتبر نیست: آن‌ها وجه تضمین می‌خواهند و
+پروفایل زیانشان فرق دارد. پس فروش و ساختار چندپایه رتبه نمی‌گیرند و
+با علتِ صریح کنار گذاشته می‌شوند — مدل‌سازیِ درستشان کارِ این نسخه
+نیست، و امتیازدادن به آن‌ها با فرمولِ خرید یعنی ریسکشان را غلط نشان
+بدهیم.
+
+**عملکردِ استراتژی در این نسخه امتیاز نمی‌دهد**
+
+تنها دادهٔ در دسترس نرخ برد است، و نرخ برد به‌تنهایی شاهدِ عملکرد
+نیست. `EVIDENCE_DISABLED_NOTE` را ببینید.
 """
 
 from __future__ import annotations
@@ -52,7 +66,6 @@ from market.tradability import Thresholds, TradabilityReport, Verdict
 #: گروه‌های نمایشی مؤلفه‌ها. فقط برای دسته‌بندی در رابط‌اند؛ محاسبه مسطح است.
 GROUP_EXECUTION = "اجرا و نقدشوندگی"
 GROUP_RISK = "ریسک و سرمایه"
-GROUP_EVIDENCE = "شواهد استراتژی"
 
 
 @dataclass(frozen=True)
@@ -65,18 +78,16 @@ class RankingWeights:
     همه از داشبورد قابل تغییرند و اثرشان در ارزیابیِ بعدی دیده می‌شود.
     """
 
-    #: هزینه‌ی قیمتیِ رفت‌وبرگشت (اسپرد + لغزش) برای همین اندازه‌ی سفارش
-    weight_price_cost: float = 30.0
-    #: ظرفیتِ سمت خروج نسبت به اندازه‌ی سفارش
+    #: هزینه‌ی قیمتیِ رفت‌وبرگشت، از قیمتِ **اجراپذیرِ** ورود و خروج
+    weight_round_trip_cost: float = 30.0
+    #: ظرفیتِ سمت خروج، فقط عمقِ درونِ محدوده‌ی قیمتی
     weight_exit_capacity: float = 20.0
     #: فاصله تا سررسید
     weight_time_to_expiry: float = 15.0
     #: حرکتی که پایه باید بکند تا این موقعیت به سر‌به‌سر برسد
-    weight_required_move: float = 20.0
-    #: کارمزدِ رفت‌وبرگشت نسبت به ارزش موقعیت
-    weight_cost_drag: float = 5.0
-    #: کارنامه‌ی **محقق‌شده‌ی** همین استراتژی در تاریخچه‌ی خودِ پروژه
-    weight_strategy_evidence: float = 10.0
+    weight_required_move: float = 25.0
+    #: کارمزدِ رفت‌وبرگشت نسبت به سرمایه‌ی درگیر
+    weight_fee_cost: float = 10.0
 
     #: عمقی که «راحت» حساب می‌شود: این ضریبِ حداقلِ غربال. عمقِ بالاتر
     #: از این، امتیاز بیشتری نمی‌گیرد — حاشیه‌ی اطمینان اشباع می‌شود.
@@ -85,41 +96,40 @@ class RankingWeights:
     days_to_expiry_comfort: int = 30
     #: حرکتِ لازم تا سر‌به‌سر از این بیشتر باشد، امتیازِ این مؤلفه صفر است.
     max_required_move_pct: float = 25.0
+    #: هزینه‌ی رفت‌وبرگشتِ قیمتی از این بیشتر باشد، امتیازش صفر است
+    #: (درصد از پرمیومِ پرداختی).
+    max_round_trip_cost_pct: float = 30.0
     #: کارمزدِ رفت‌وبرگشت از این بیشتر باشد، امتیازِ این مؤلفه صفر است.
-    max_cost_drag_pct: float = 5.0
-    #: کمتر از این تعداد سیگنالِ **نتیجه‌دار**، کارنامه «نامعلوم» است —
-    #: نه «بد». نرخ بردِ ۲ سیگنال، شاهد نیست.
-    min_resolved_signals: int = 10
+    max_fee_cost_pct: float = 5.0
 
     def as_dict(self) -> dict[str, float]:
         return {
-            "weight_price_cost": self.weight_price_cost,
+            "weight_round_trip_cost": self.weight_round_trip_cost,
             "weight_exit_capacity": self.weight_exit_capacity,
             "weight_time_to_expiry": self.weight_time_to_expiry,
             "weight_required_move": self.weight_required_move,
-            "weight_cost_drag": self.weight_cost_drag,
-            "weight_strategy_evidence": self.weight_strategy_evidence,
+            "weight_fee_cost": self.weight_fee_cost,
             "depth_comfort_multiple": self.depth_comfort_multiple,
             "days_to_expiry_comfort": self.days_to_expiry_comfort,
             "max_required_move_pct": self.max_required_move_pct,
-            "max_cost_drag_pct": self.max_cost_drag_pct,
-            "min_resolved_signals": self.min_resolved_signals,
+            "max_round_trip_cost_pct": self.max_round_trip_cost_pct,
+            "max_fee_cost_pct": self.max_fee_cost_pct,
         }
 
 
-@dataclass(frozen=True)
-class StrategyEvidence:
-    """کارنامه‌ی محقق‌شده‌ی یک استراتژی، از تاریخچه‌ی خودِ پروژه.
-
-    ⚠️ گذشته است، نه پیش‌بینی. و تا وقتی نمونه کم است، **نامعلوم** می‌ماند:
-    نرخ بردِ سه سیگنال، عدد است ولی شاهد نیست.
-    """
-
-    strategy: str
-    resolved: int = 0
-    wins: int = 0
-    win_rate_pct: float | None = None
-    avg_pnl_pct: float | None = None
+#: چرا مؤلفه‌ی «عملکرد استراتژی» در این نسخه **اصلاً ساخته نمی‌شود**.
+#:
+#: تنها چیزی که در دست داریم نرخ برد است، و نرخ برد به‌تنهایی شاهدِ
+#: عملکرد نیست: ۹ برد کوچک و ۱ باخت بزرگ نرخ بردِ ۹۰٪ می‌دهد و پول از
+#: دست می‌دهد. برای امتیازدادن به عملکرد، سود و زیانِ **پس از هزینه**
+#: با مبنای قابل مقایسه لازم است که این پروژه هنوز ثبت نمی‌کند. تا آن
+#: موقع، نداشتنِ مؤلفه صادقانه‌تر از داشتنِ مؤلفه‌ی گمراه‌کننده است.
+EVIDENCE_DISABLED_NOTE = (
+    "مؤلفه‌ی عملکرد استراتژی در این نسخه غیرفعال است: تنها دادهٔ موجود "
+    "نرخ برد است و نرخ برد به‌تنهایی شاهدِ عملکرد نیست (چند برد کوچک و "
+    "یک باخت بزرگ هم نرخ بردِ بالا می‌سازد). تا وقتی سود و زیانِ پس از "
+    "هزینه با مبنای قابل مقایسه ثبت نشود، این مؤلفه امتیاز نمی‌دهد."
+)
 
 
 @dataclass(frozen=True)
@@ -171,11 +181,20 @@ class RankedOpportunity:
     side: str
     quantity: int
     components: tuple[Component, ...]
-    #: ارزشِ کلِ موقعیت به ریال — **گزارش می‌شود، امتیاز نمی‌گیرد**.
-    #: ارزان بودن به‌خودی‌خود مزیت نیست.
-    notional: float | None
-    max_loss: float | None
+    #: سرمایه‌ی درگیر به ریال: قیمتِ **اجراپذیرِ** ورود × تعداد ×
+    #: اندازه‌ی قرارداد، به‌علاوه‌ی کارمزدِ **اعلام‌شده** اگر باشد.
+    #: **گزارش می‌شود، امتیاز نمی‌گیرد** — ارزان بودن مزیت نیست.
+    capital_required: float | None
+    #: زیانِ نظری در بدترین حالت: خریدِ اختیار می‌تواند **کلِ** پرمیوم
+    #: را از دست بدهد (به‌علاوه‌ی کارمزد). این با «زیان تا حد ضرر» یکی
+    #: نیست و قاطی‌کردنشان ریسک را کم‌تر از واقع نشان می‌دهد.
+    max_theoretical_loss: float | None
+    #: زیان اگر حد ضررِ پیشنهادیِ ماژول ریسک بخورد — مشروط به اینکه
+    #: واقعاً بشود در آن قیمت خارج شد.
+    stop_loss_loss: float | None
     breakeven: float | None
+    #: آیا سر‌به‌سر کارمزد را هم در بر دارد؟ اگر نه، «خالص» نیست.
+    breakeven_includes_fees: bool
     observed_at: str
     verdict: str
 
@@ -244,9 +263,11 @@ class RankedOpportunity:
             "score": round(self.score, 1),
             "score_best_case": round(self.score_best_case, 1),
             "coverage_pct": round(self.coverage_pct, 1),
-            "notional": self.notional,
-            "max_loss": self.max_loss,
+            "capital_required": self.capital_required,
+            "max_theoretical_loss": self.max_theoretical_loss,
+            "stop_loss_loss": self.stop_loss_loss,
             "breakeven": self.breakeven,
+            "breakeven_includes_fees": self.breakeven_includes_fees,
             "observed_at": self.observed_at,
             "verdict": self.verdict,
             "components": [c.to_dict() for c in self.components],
@@ -303,6 +324,11 @@ class RankingResult:
                 else None
             ),
             "demo": self.demo,
+            "scope": (
+                "نسخه‌ی اول فقط **خریدِ اختیارِ تک‌پایه** را رتبه می‌دهد. "
+                "فروش و ساختارهای چندپایه با فرمولِ خرید امتیاز نمی‌گیرند."
+            ),
+            "evidence_note": EVIDENCE_DISABLED_NOTE,
             "note": (
                 "«امتیاز اولویت بررسی» است، نه احتمال برد و نه بازده مورد "
                 "انتظار. وزن‌ها فرضِ اولیه‌اند و اثباتی پشتشان نیست. رتبه با "
@@ -336,45 +362,54 @@ def _higher_is_better(
     return _clamp01((value - floor) / span) * 100.0
 
 
-def _price_cost_component(
-    report: TradabilityReport, thresholds: Thresholds, weights: RankingWeights
+def _round_trip_cost_component(
+    report: TradabilityReport, weights: RankingWeights
 ) -> Component:
-    """هزینه‌ی قیمتیِ رفت‌وبرگشت: نصفِ اسپرد + لغزشِ خروج.
+    """هزینه‌ی قیمتیِ رفت‌وبرگشت، از قیمتِ **اجراپذیرِ** هر دو سمت.
 
-    چرا با هم: هر دو یک چیز را می‌سنجند — پولی که صرفِ **قیمت** می‌شود،
-    نه ظرفیت. جدا وزن‌دادنشان یعنی یک شاهد دو بار پاداش بگیرد.
-    نصفِ اسپرد چون عبور از وسطِ مظنه تا یک سمت، نیمِ اسپرد هزینه دارد.
+    نصفِ اسپرد هزینه‌ی رفت‌وبرگشت **نیست**: رفت‌وبرگشت یعنی روی
+    `ask` بخری و روی `bid` بفروشی، یعنی کلِ اسپرد — به‌علاوه‌ی لغزشِ
+    هر دو سمت برای همین تعداد قرارداد.
+
+    مخرج قیمتِ ورود است، پس عدد یعنی «چند درصد از پرمیومِ پرداختی».
+    اگر یکی از دو سمت برای این حجم اجراپذیر نباشد، عددی ساخته نمی‌شود.
     """
     observation = report.observation
-    spread = observation.relative_spread_pct
-    slippage = observation.exit_slippage_pct
-    limit = thresholds.max_relative_spread_pct / 2.0 + thresholds.max_exit_slippage_pct
+    cost = observation.round_trip_cost_pct
+    label = "هزینه‌ی قیمتی رفت‌وبرگشت"
+    unit = "٪ از پرمیومِ پرداختی"
 
-    if spread is None or slippage is None:
-        missing = "اسپرد" if spread is None else "لغزش خروج"
+    if cost is None:
+        missing = (
+            "سمتِ ورود" if not observation.entry_fill_price else "سمتِ خروج"
+        )
         return Component(
-            key="price_cost",
-            label="هزینه‌ی قیمتی رفت‌وبرگشت",
+            key="round_trip_cost",
+            label=label,
             group=GROUP_EXECUTION,
-            weight=weights.weight_price_cost,
+            weight=weights.weight_round_trip_cost,
             score=None,
             measured=None,
-            unit="٪",
-            detail=f"{missing} دانسته نیست؛ هزینه‌ی قیمتی محاسبه نشد.",
+            unit=unit,
+            detail=(
+                f"{missing} برای {observation.quantity} قرارداد اجراپذیر نیست؛ "
+                "هزینه‌ی رفت‌وبرگشت محاسبه نشد و عددی جایش ساخته نمی‌شود."
+            ),
         )
 
-    cost = spread / 2.0 + slippage
     return Component(
-        key="price_cost",
-        label="هزینه‌ی قیمتی رفت‌وبرگشت",
+        key="round_trip_cost",
+        label=label,
         group=GROUP_EXECUTION,
-        weight=weights.weight_price_cost,
-        score=_lower_is_better(cost, limit),
+        weight=weights.weight_round_trip_cost,
+        score=_lower_is_better(cost, weights.max_round_trip_cost_pct),
         measured=round(cost, 2),
-        unit="٪ (نصف اسپرد + لغزش خروج)",
+        unit=unit,
         detail=(
-            f"نصفِ اسپرد {spread / 2:,.2f}٪ + لغزشِ خروجِ {observation.quantity} "
-            f"قرارداد {slippage:,.2f}٪ = {cost:,.2f}٪ از سقفِ {limit:,.2f}٪"
+            f"ورود {observation.entry_fill_price:,.0f} ← خروج "
+            f"{observation.exit_fill_price:,.0f} برای {observation.quantity} "
+            f"قرارداد = {cost:,.2f}٪ از پرمیومِ پرداختی "
+            f"(سقفِ تنظیم‌شده {weights.max_round_trip_cost_pct:,.1f}٪)"
         ),
     )
 
@@ -382,35 +417,50 @@ def _price_cost_component(
 def _exit_capacity_component(
     report: TradabilityReport, thresholds: Thresholds, weights: RankingWeights
 ) -> Component:
-    """ظرفیتِ سمت خروج نسبت به **همین** اندازه‌ی سفارش."""
-    ratio = report.observation.exit_depth_ratio
+    """ظرفیتِ خروج — فقط عمقی که **در محدوده‌ی قیمتی** است.
+
+    حجمی که در قیمت‌های دور نشسته سفارش را پر می‌کند ولی حاشیه‌ی امنِ
+    خروج نیست؛ امتیاز دادن به آن یعنی وانمود کنیم راهِ خروجی هست که
+    عملاً با زیانِ معنادار همراه است.
+    """
+    observation = report.observation
+    ratio = observation.usable_exit_depth_ratio
     floor = thresholds.min_exit_depth_ratio
     # اگر کاربر کفِ غربال را صفر بگذارد، ضرب‌کردن هم صفر می‌شود و این
     # سنجه بی‌صدا بی‌اثر می‌ماند. آن‌وقت خودِ ضریب، مقیاسِ مطلق می‌شود.
     comfort = max(floor * weights.depth_comfort_multiple, weights.depth_comfort_multiple)
+    label = "ظرفیت خروج در محدوده‌ی قیمتی"
+    unit = "برابرِ سفارش"
     if ratio is None:
         return Component(
             key="exit_capacity",
-            label="ظرفیت خروج",
+            label=label,
             group=GROUP_EXECUTION,
             weight=weights.weight_exit_capacity,
             score=None,
             measured=None,
-            unit="برابرِ سفارش",
+            unit=unit,
             detail="عمقِ سمت خروج در دسترس نیست.",
         )
+    total = observation.exit_depth_ratio
+    extra = (
+        ""
+        if total is None or total <= ratio + 1e-9
+        else f"؛ عمقِ کل {total:,.2f} برابر است ولی مازادش در قیمت‌های دورتر از "
+             f"{thresholds.max_exit_slippage_pct:,.1f}٪ نشسته و شمرده نشد"
+    )
     return Component(
         key="exit_capacity",
-        label="ظرفیت خروج",
+        label=label,
         group=GROUP_EXECUTION,
         weight=weights.weight_exit_capacity,
         score=_higher_is_better(ratio, floor, comfort),
         measured=round(ratio, 2),
-        unit="برابرِ سفارش",
+        unit=unit,
         detail=(
-            f"عمقِ سمتِ خروج {ratio:,.2f} برابرِ سفارشِ "
-            f"{report.observation.quantity} قراردادی است "
-            f"(کفِ غربال {floor:,.2f}، «راحت» {comfort:,.2f})"
+            f"عمقِ درونِ {thresholds.max_exit_slippage_pct:,.1f}٪ از بهترین مظنه، "
+            f"{ratio:,.2f} برابرِ سفارشِ {observation.quantity} قراردادی است "
+            f"(کفِ غربال {floor:,.2f}، «راحت» {comfort:,.2f}){extra}"
         ),
     )
 
@@ -499,92 +549,73 @@ def _required_move_component(
     )
 
 
-def _cost_drag_component(
-    round_trip_fees: float | None, notional: float | None, weights: RankingWeights
+def _fee_cost_component(
+    round_trip_fees: float | None,
+    fees_known: bool,
+    capital: float | None,
+    weights: RankingWeights,
 ) -> Component:
-    """کارمزدِ رفت‌وبرگشت نسبت به ارزش موقعیت.
+    """کارمزدِ رفت‌وبرگشت نسبت به سرمایه‌ی درگیر.
 
-    ⚠️ نبودِ نرخ یعنی **نامعلوم**، نه رایگان. همان قاعده‌ای که کلِ پروژه
-    درباره‌ی کارمزد دارد: صفرِ پیش‌فرض ادعای بی‌هزینه بودن نیست.
+    ⚠️ سه حالتِ متفاوت، که قاطی‌کردنشان گمراه‌کننده است:
+
+    * نرخ **اعلام‌شده‌ی** ناصفر → هزینه‌ی دانسته؛
+    * نرخ **اعلام‌شده‌ی** صفر → هزینه‌ی دانسته و برابر صفر (امتیاز کامل)؛
+    * نرخی تنظیم **نشده** → **نامعلوم**، نه رایگان.
     """
-    label = "سهم کارمزد از موقعیت"
-    if round_trip_fees is None or not notional or notional <= 0:
+    label = "سهم کارمزد از سرمایه"
+    unit = "٪ از سرمایه‌ی درگیر"
+    if not fees_known or not capital or capital <= 0:
         return Component(
-            key="cost_drag",
+            key="fee_cost",
             label=label,
             group=GROUP_RISK,
-            weight=weights.weight_cost_drag,
+            weight=weights.weight_fee_cost,
             score=None,
             measured=None,
-            unit="٪",
+            unit=unit,
             detail=(
-                "نرخ کارمزد تنظیم نشده است؛ هزینه‌ی واقعی نامعلوم است "
-                "(صفر فرض نمی‌شود)."
+                "نرخ کارمزد تنظیم/اعلام نشده است؛ هزینه‌ی واقعی نامعلوم است "
+                "و صفر فرض نمی‌شود."
             ),
         )
-    drag = round_trip_fees / notional * 100.0
+    fees = round_trip_fees or 0.0
+    drag = fees / capital * 100.0
     return Component(
-        key="cost_drag",
+        key="fee_cost",
         label=label,
         group=GROUP_RISK,
-        weight=weights.weight_cost_drag,
-        score=_lower_is_better(drag, weights.max_cost_drag_pct),
+        weight=weights.weight_fee_cost,
+        score=_lower_is_better(drag, weights.max_fee_cost_pct),
         measured=round(drag, 3),
-        unit="٪ از ارزش موقعیت",
+        unit=unit,
         detail=(
-            f"کارمزد رفت‌وبرگشت {round_trip_fees:,.0f} ریال = {drag:,.3f}٪ "
-            f"از {notional:,.0f} ریال"
-        ),
-    )
-
-
-def _evidence_component(
-    evidence: StrategyEvidence | None, strategy: str, weights: RankingWeights
-) -> Component:
-    """کارنامه‌ی **محقق‌شده‌ی** همین استراتژی در تاریخچه‌ی خودِ پروژه.
-
-    ⚠️ گذشته است، نه پیش‌بینی. و زیر حداقلِ نمونه، نامعلوم می‌ماند —
-    نه صفر و نه ۵۰٪. «شاهدی نداریم» با «شاهدِ بد داریم» یکی نیست.
-    """
-    label = "کارنامه‌ی محقق‌شده‌ی استراتژی"
-    minimum = weights.min_resolved_signals
-    if evidence is None or evidence.resolved < minimum or evidence.win_rate_pct is None:
-        seen = 0 if evidence is None else evidence.resolved
-        return Component(
-            key="strategy_evidence",
-            label=label,
-            group=GROUP_EVIDENCE,
-            weight=weights.weight_strategy_evidence,
-            score=None,
-            measured=None,
-            unit="٪ نرخ برد",
-            detail=(
-                f"فقط {seen} سیگنالِ نتیجه‌دار از «{strategy}» ثبت شده "
-                f"(حداقل {minimum} لازم است)؛ کارنامه نامعلوم است، نه بد."
-            ),
-        )
-    return Component(
-        key="strategy_evidence",
-        label=label,
-        group=GROUP_EVIDENCE,
-        weight=weights.weight_strategy_evidence,
-        score=_clamp01(evidence.win_rate_pct / 100.0) * 100.0,
-        measured=round(evidence.win_rate_pct, 1),
-        unit="٪ نرخ برد",
-        detail=(
-            f"{evidence.wins} برد از {evidence.resolved} سیگنالِ نتیجه‌دار "
-            f"({evidence.win_rate_pct:,.1f}٪). این گذشته است، نه پیش‌بینی."
+            f"کارمزد رفت‌وبرگشتِ اعلام‌شده {fees:,.0f} ریال = {drag:,.3f}٪ "
+            f"از سرمایه‌ی {capital:,.0f} ریالی"
         ),
     )
 
 
 def breakeven_price(
-    strike: float, premium: float, option_type: str
+    strike: float,
+    entry_price: float,
+    option_type: str,
+    fee_per_unit: float = 0.0,
 ) -> float | None:
-    """سر‌به‌سرِ یک موقعیتِ **خریدِ** تک‌پایه، به ازای هر واحدِ پایه."""
-    if strike <= 0 or premium < 0:
+    """سر‌به‌سرِ یک موقعیتِ **خریدِ** تک‌پایه، به ازای هر واحدِ پایه.
+
+    `entry_price` باید قیمتِ **اجراپذیرِ** ورود باشد، نه پرمیومِ
+    پیشنهادیِ استراتژی: سر‌به‌سر روی پولی حساب می‌شود که واقعاً پرداخت
+    می‌شود.
+
+    `fee_per_unit` وقتی صفر است که یا نرخ صفرِ اعلام‌شده باشد یا اصلاً
+    کارمزدی در کار نباشد؛ اگر نرخ **نامعلوم** است، فراخواننده باید
+    صفر بدهد و نتیجه را «بدون کارمزد» معرفی کند — نه «خالص».
+    """
+    if strike <= 0 or entry_price < 0:
         return None
-    return strike + premium if option_type == "call" else strike - premium
+    total = entry_price + max(fee_per_unit, 0.0)
+    return strike + total if option_type == "call" else strike - total
 
 
 def rank_opportunity(
@@ -598,22 +629,43 @@ def rank_opportunity(
     weights: RankingWeights,
     option_type: str,
     strike: float,
-    premium: float,
+    contract_size: int,
     underlying_price: float | None,
-    notional: float | None,
-    max_loss: float | None,
+    stop_loss_loss: float | None,
     round_trip_fees: float | None,
-    evidence: StrategyEvidence | None,
+    fees_known: bool,
 ) -> RankedOpportunity:
-    """امتیازِ یک فرصت، با همه‌ی مؤلفه‌ها و دلایلشان."""
-    breakeven = breakeven_price(strike, premium, option_type)
+    """امتیازِ یک **خریدِ اختیارِ تک‌پایه**، با همه‌ی مؤلفه‌ها و دلایلشان.
+
+    همه‌ی عددهای ریالی از قیمتِ **اجراپذیرِ ورود** می‌آیند، نه از پرمیومِ
+    پیشنهادیِ استراتژی — تا سرمایه، سر‌به‌سر و زیان با یک تعریف حساب
+    شوند و با هم بخوانند.
+    """
+    entry = report.observation.entry_fill_price
+    units = quantity * max(contract_size, 1)
+
+    # کارمزد فقط وقتی وارد عددها می‌شود که **اعلام‌شده** باشد. نرخِ
+    # نامعلوم صفر فرض نمی‌شود؛ به‌جایش سر‌به‌سر «بدون کارمزد» می‌ماند.
+    fees = (round_trip_fees or 0.0) if fees_known else 0.0
+    fee_per_unit = (fees / units) if (fees_known and units) else 0.0
+
+    premium_cost = entry * units if entry else None
+    capital_required = None if premium_cost is None else premium_cost + fees
+    # خریدِ اختیار: بدترین حالت یعنی بی‌ارزش منقضی شدن — کلِ پرمیوم
+    # به‌علاوه‌ی کارمزد. این «حداکثر زیان نظری» است.
+    max_theoretical_loss = capital_required
+
+    breakeven = (
+        None if entry is None
+        else breakeven_price(strike, entry, option_type, fee_per_unit)
+    )
+
     components = (
-        _price_cost_component(report, thresholds, weights),
+        _round_trip_cost_component(report, weights),
         _exit_capacity_component(report, thresholds, weights),
         _time_component(report, thresholds, weights),
         _required_move_component(breakeven, underlying_price, option_type, weights),
-        _cost_drag_component(round_trip_fees, notional, weights),
-        _evidence_component(evidence, strategy, weights),
+        _fee_cost_component(round_trip_fees, fees_known, capital_required, weights),
     )
     return RankedOpportunity(
         symbol=symbol,
@@ -621,9 +673,11 @@ def rank_opportunity(
         side=side,
         quantity=quantity,
         components=components,
-        notional=notional,
-        max_loss=max_loss,
+        capital_required=capital_required,
+        max_theoretical_loss=max_theoretical_loss,
+        stop_loss_loss=stop_loss_loss,
         breakeven=breakeven,
+        breakeven_includes_fees=fees_known,
         observed_at=report.observation.observed_at.isoformat(timespec="seconds"),
         verdict=report.verdict.value,
     )
@@ -633,18 +687,15 @@ def rank_opportunities(
     candidates: list[dict[str, object]],
     thresholds: Thresholds,
     weights: RankingWeights,
-    evidence_by_strategy: dict[str, StrategyEvidence] | None = None,
     evaluated_at: datetime | None = None,
     demo: bool = False,
 ) -> RankingResult:
     """رتبه‌بندیِ یک پاس.
 
     هر عضو `candidates` یک دیکشنری با کلیدهای لازمِ `rank_opportunity`
-    به‌علاوه‌ی `report` است. گزینه‌ای که حکمش `tradable` نیست یا پایه‌ی
-    یک ساختار چندپایه است، وارد رتبه‌بندی **نمی‌شود** و در `excluded`
-    با علت می‌آید.
+    به‌علاوه‌ی `report` است. سه دروازه پیش از رتبه‌گرفتن هست و ردشدن از
+    هر کدام در `excluded` **با علت** می‌آید، نه بی‌صدا.
     """
-    evidence_by_strategy = evidence_by_strategy or {}
     ranked: list[RankedOpportunity] = []
     excluded: list[ExcludedOpportunity] = []
 
@@ -652,6 +703,7 @@ def rank_opportunities(
         report: TradabilityReport = candidate["report"]  # type: ignore[assignment]
         symbol = str(candidate["symbol"])
         strategy = str(candidate["strategy"])
+        side = str(candidate["side"]).lower()
 
         # دروازه‌ی اول: غربال. امتیاز جای نقدشوندگی را نمی‌گیرد.
         if report.verdict is not Verdict.TRADABLE:
@@ -663,7 +715,7 @@ def rank_opportunities(
             ))
             continue
 
-        # دروازه‌ی دوم: دامنه‌ی نسخه‌ی اول.
+        # دروازه‌ی دوم: دامنه‌ی نسخه‌ی اول — ساختار چندپایه.
         if candidate.get("leg_group_id"):
             excluded.append(ExcludedOpportunity(
                 symbol=symbol,
@@ -671,8 +723,25 @@ def rank_opportunities(
                 verdict=report.verdict.value,
                 reason=(
                     "پایه‌ی یک ساختار چندپایه است؛ نسخه‌ی اولِ رتبه‌بندی فقط "
-                    "موقعیتِ تک‌پایه را می‌سنجد (مقایسه‌ی ساختارها مخرجِ "
+                    "خریدِ اختیارِ تک‌پایه را می‌سنجد (مقایسه‌ی ساختارها مخرجِ "
                     "یکسان ندارد و وجه تضمین مدل نشده است)."
+                ),
+            ))
+            continue
+
+        # دروازه‌ی سوم: فقط **خرید**. فرمولِ این نسخه — سرمایه‌ی درگیر،
+        # سر‌به‌سر، حداکثر زیانِ نظری — همه از منطقِ خریدِ اختیار می‌آیند.
+        # فروش ریسک و وجه تضمینِ کاملاً متفاوتی دارد؛ امتیاز دادن به آن
+        # با همین فرمول یعنی ریسکش را غلط نشان بدهیم.
+        if side != "buy":
+            excluded.append(ExcludedOpportunity(
+                symbol=symbol,
+                strategy=strategy,
+                verdict=report.verdict.value,
+                reason=(
+                    "موقعیتِ فروش است؛ نسخه‌ی اولِ رتبه‌بندی فقط خریدِ اختیار "
+                    "را می‌سنجد. فرمولِ سرمایه و زیانِ خرید برای فروش معتبر "
+                    "نیست و وجه تضمینش در این پروژه مدل نشده است."
                 ),
             ))
             continue
@@ -680,19 +749,18 @@ def rank_opportunities(
         ranked.append(rank_opportunity(
             symbol=symbol,
             strategy=strategy,
-            side=str(candidate["side"]),
+            side=side,
             quantity=int(candidate["quantity"]),  # type: ignore[arg-type]
             report=report,
             thresholds=thresholds,
             weights=weights,
             option_type=str(candidate["option_type"]),
             strike=float(candidate["strike"]),  # type: ignore[arg-type]
-            premium=float(candidate["premium"]),  # type: ignore[arg-type]
+            contract_size=int(candidate.get("contract_size") or 1),  # type: ignore[arg-type]
             underlying_price=candidate.get("underlying_price"),  # type: ignore[arg-type]
-            notional=candidate.get("notional"),  # type: ignore[arg-type]
-            max_loss=candidate.get("max_loss"),  # type: ignore[arg-type]
+            stop_loss_loss=candidate.get("stop_loss_loss"),  # type: ignore[arg-type]
             round_trip_fees=candidate.get("round_trip_fees"),  # type: ignore[arg-type]
-            evidence=evidence_by_strategy.get(strategy),
+            fees_known=bool(candidate.get("fees_known")),
         ))
 
     # چیدنِ رتبه با امتیازِ **محافظه‌کارانه**: نامعلوم هیچ‌وقت بالا نمی‌برد.

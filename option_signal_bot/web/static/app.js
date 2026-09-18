@@ -403,15 +403,25 @@ function rankedItem(item, position) {
   box.append(summary);
 
   const head = el("div", "screen-head");
-  head.append(el("span", "note", `${item.strategy} · ${item.side}`));
-  if (item.notional != null) {
-    head.append(el("span", "note", `سرمایه‌ی لازم: ${fmt(item.notional)} ریال`));
+  head.append(el("span", "note", `${item.strategy} · خرید`));
+  if (item.capital_required != null) {
+    head.append(el("span", "note",
+      `سرمایه‌ی لازم: ${fmt(item.capital_required)} ریال`));
   }
-  if (item.max_loss != null) {
-    head.append(el("span", "note", `بیشترین زیان: ${fmt(item.max_loss)} ریال`));
+  // این دو عدد عمداً جدا نشان داده می‌شوند: قاطی‌کردنشان ریسک را
+  // کم‌تر از واقع نشان می‌دهد.
+  if (item.max_theoretical_loss != null) {
+    head.append(el("span", "note v-loss",
+      `حداکثر زیان نظری: ${fmt(item.max_theoretical_loss)} ریال (کل پرمیوم)`));
+  }
+  if (item.stop_loss_loss != null) {
+    head.append(el("span", "note",
+      `زیان تا حد ضرر: ${fmt(item.stop_loss_loss)} ریال`));
   }
   if (item.breakeven != null) {
-    head.append(el("span", "note", `سر‌به‌سر: ${fmt(item.breakeven)}`));
+    head.append(el("span", "note",
+      `سر‌به‌سر: ${fmt(item.breakeven)}` +
+      (item.breakeven_includes_fees ? " (با کارمزد)" : " — بدون کارمزد، خالص نیست")));
   }
   head.append(el("span", "note", `پوشش داده: ${fmt(item.coverage_pct, 0)}٪`));
   box.append(head);
@@ -458,6 +468,9 @@ function renderRanking(ranking) {
   const head = el("div", "card");
   head.append(el("h3", "", `فرصت‌های رتبه‌گرفته — ${fmt(ranked.length)} مورد`));
   if (ranking.note) head.append(el("p", "hint", ranking.note));
+  if (ranking.scope) head.append(el("p", "hint", ranking.scope));
+  // اینکه چرا مؤلفه‌ی عملکرد اصلاً نیست، باید صریح گفته شود.
+  if (ranking.evidence_note) head.append(el("p", "hint", ranking.evidence_note));
   if (ranking.evaluated_at) {
     head.append(el("div", "note",
       "زمان ارزیابی: " + ranking.evaluated_at.replace("T", " ")));

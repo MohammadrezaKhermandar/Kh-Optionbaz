@@ -152,6 +152,14 @@ class LiquidityObservation:
     exit_fill_price: float | None = None
     #: بهترین قیمتِ سمت خروج (سطح اول)
     best_exit_price: float | None = None
+    #: میانگین وزنیِ قیمتی که سفارشِ **ورود** با آن پر می‌شود — همان
+    #: تعداد قرارداد. بدون این، هزینه‌ی رفت‌وبرگشت قابل محاسبه نیست و
+    #: نصفِ اسپرد جایش گذاشته می‌شد که هزینه‌ی رفت‌وبرگشت **نیست**.
+    entry_fill_price: float | None = None
+    #: عمقِ سمت خروج که در محدوده‌ی قیمتیِ قابل قبول است. حجمی که فقط
+    #: در قیمت‌های دور هست حاشیه‌ی امنِ خروج نیست، پس اینجا شمرده
+    #: نمی‌شود. (دروازه‌ی غربال همچنان با عمقِ کل کار می‌کند.)
+    exit_depth_within_band_contracts: int | None = None
     open_interest: int | None = None
     trades_today: int | None = None
     days_to_expiry: int | None = None
@@ -210,6 +218,38 @@ class LiquidityObservation:
         else:
             drop = self.exit_fill_price - self.best_exit_price
         return max(drop / self.best_exit_price * 100.0, 0.0)
+
+    @property
+    def round_trip_cost_pct(self) -> float | None:
+        """هزینه‌ی قیمتیِ ورود و خروجِ **همین تعداد قرارداد**، درصد.
+
+        مخرج: قیمتِ اجراپذیرِ **ورود** (پرمیومی که واقعاً پرداخت
+        می‌شود). یعنی «اگر همین حالا وارد و بلافاصله خارج شوی، چند درصد
+        از پرمیومِ پرداختی از دست می‌رود».
+
+        این عدد **کلِ** اسپرد را در بر می‌گیرد به‌علاوه‌ی لغزشِ هر دو
+        سمت برای این حجم — نه نصفِ اسپرد، که هزینه‌ی رفت‌وبرگشت نیست.
+
+        `None` وقتی یکی از دو سمت برای این حجم اجراپذیر نیست؛ آن‌وقت
+        عددی ساخته نمی‌شود.
+        """
+        if not self.entry_fill_price or not self.exit_fill_price:
+            return None
+        if self.entry_fill_price <= 0:
+            return None
+        return max(
+            (self.entry_fill_price - self.exit_fill_price)
+            / self.entry_fill_price
+            * 100.0,
+            0.0,
+        )
+
+    @property
+    def usable_exit_depth_ratio(self) -> float | None:
+        """عمقِ **درون محدوده‌ی قیمتی** تقسیم بر اندازه‌ی سفارش."""
+        if self.exit_depth_within_band_contracts is None or self.quantity <= 0:
+            return None
+        return self.exit_depth_within_band_contracts / self.quantity
 
     @property
     def source_time_known(self) -> bool:
@@ -445,6 +485,13 @@ class ScreeningRecord:
     report: TradabilityReport
     #: شناسه‌ی ساختار چندپایه، اگر پایه‌ی یک ساختار باشد
     leg_group_id: str | None = None
+    #: شناسه‌ی **همان** سیگنالی که غربال شد.
+    #:
+    #: نماد برای وصل‌کردنِ نتیجه به سیگنال کافی نیست: روی یک نماد
+    #: می‌تواند چند سیگنال از چند استراتژی، با سمت و تعدادِ متفاوت،
+    #: در یک پاس صادر شود. وصل‌کردن با نماد یعنی نتیجه‌ی غربالِ یکی به
+    #: دیگری بچسبد و عددهای بی‌ربط قاطی شوند.
+    signal_id: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -453,6 +500,7 @@ class ScreeningRecord:
             "side": self.side,
             "quantity": self.quantity,
             "leg_group_id": self.leg_group_id,
+            "signal_id": self.signal_id,
             "verdict": self.report.verdict.value,
             "verdict_label": self.report.verdict_label,
             "reason": self.report.reason,
