@@ -467,7 +467,12 @@ def _build_ranking(
     # کنارگذاشته‌های این لایه هم باید دیده شوند، نه اینکه بی‌صدا گم شوند.
     payload["excluded"] = [
         *payload["excluded"],
-        *({**row, "verdict": "tradable"} for row in unpublished),
+        # همان شکلِ ردیف‌های رتبه‌بندی، تا مصرف‌کننده‌ی پاسخ کلیدِ
+        # جاافتاده نبیند.
+        *(
+            {**row, "verdict": "tradable", "code": "not_published"}
+            for row in unpublished
+        ),
     ]
     return {"enabled": True, **payload}
 
