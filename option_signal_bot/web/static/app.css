@@ -427,3 +427,30 @@ tbody tr.selected:hover { background: color-mix(in srgb, var(--garnet) 24%, tran
   margin-bottom: 8px;
   line-height: 1.7;
 }
+
+/* ------------------------- غربال قابلیت معامله ------------------------- */
+/* هر سنجه با علامت و عددش می‌آید: پیامِ بدون عدد توضیح نیست. */
+.screen-group { margin-top: 12px; }
+.screen-group > summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+.screen-item {
+  border: 1px solid var(--border);
+  border-top: none;
+  padding: 10px 12px;
+  font-size: 12.5px;
+}
+.screen-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.check-line { display: flex; gap: 8px; line-height: 1.9; }
+.check-mark { width: 14px; text-align: center; font-weight: 700; }

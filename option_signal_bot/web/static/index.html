@@ -60,6 +60,29 @@
       <button class="btn btn-ghost" id="btn-refresh">بازخوانی</button>
     </div>
     <div id="scan-result"></div>
+
+    <div class="card" id="tradability-card">
+      <h3>
+        غربال قابلیت معامله
+        <span class="count" id="tradability-state"></span>
+      </h3>
+      <p class="hint">
+        دروازه‌ی ورود به پیشنهادها، نه یک امتیاز: قراردادی که نشود از آن
+        <strong>خارج</strong> شد پیشنهاد نمی‌شود — هر چقدر هم سیگنالش قوی باشد.
+        عمق همیشه نسبت به <strong>اندازه‌ی همین سفارش</strong> سنجیده می‌شود؛
+        آنچه برای ۱ قرارداد نقدشونده است، برای ۵۰ تا لزوماً نیست.
+        <br>
+        ⚠️ این آستانه‌ها <strong>اثبات‌شده نیستند</strong> — نقطه‌ی شروعی
+        محافظه‌کارانه‌اند تا قراردادِ آشکارا مرده کنار برود.
+      </p>
+      <div class="params" id="tradability-fields"></div>
+      <div class="card-actions">
+        <button class="btn btn-primary" id="btn-save-tradability">ذخیره آستانه‌ها</button>
+        <span class="note" id="tradability-note"></span>
+      </div>
+    </div>
+
+    <div id="screening"></div>
     <div id="signals"><p class="empty">در حال بارگذاری…</p></div>
   </section>
 

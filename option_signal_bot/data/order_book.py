@@ -106,6 +106,15 @@ class OrderBook:
         """مجموع حجم قابل معامله در یک سمت (`buy` یا `sell`)."""
         return sum(level.quantity for level in self._levels(side))
 
+    def real_depth(self, side: str) -> int:
+        """همان `depth`، ولی فقط روی سطوح **واقعی**.
+
+        سطحی که قیمت یا حجمش صفر است جای خالی است و `fill_price` هم
+        نادیده‌اش می‌گیرد. اگر ظرفیت خروج را با `depth` بسنجیم و
+        پرشدن را با `fill_price`، دو عدد ناسازگار می‌گیریم.
+        """
+        return sum(level.quantity for level in self._levels(side) if level.is_real)
+
     def _levels(self, side: str) -> tuple[BookLevel, ...]:
         """سطوحی که باید بخوریم تا سفارشِ `side` پر شود.
 
@@ -265,6 +274,19 @@ class OrderBookClient(RealtimeQuoteSource):
         self.retries = retries
         self.user_agent = user_agent
         self._cache: dict[str, tuple[float, OrderBook]] = {}
+
+    def cache_age_seconds(self, ins_code: str) -> float | None:
+        """عمرِ نسخه‌ی کش‌شده‌ی این دفتر، بر حسب ثانیه.
+
+        `None` یعنی چیزی در کش نیست. ⚠️ این عمرِ **دریافتِ ما**ست، نه
+        زمانِ بازار: منبع برای دفتر سفارش مهر زمانی نمی‌دهد، پس
+        نمی‌شود گفت داده در بازار چقدر کهنه است. جای هم گذاشتنشان یعنی
+        ادعای چیزی که نمی‌دانیم.
+        """
+        cached = self._cache.get(ins_code)
+        if cached is None:
+            return None
+        return max(time.monotonic() - cached[0], 0.0)
 
     def get_order_book(self, ins_code: str, symbol: str = "") -> OrderBook:
         """دفتر سفارش یک نماد. خطای شبکه را **بالا می‌برد**."""
