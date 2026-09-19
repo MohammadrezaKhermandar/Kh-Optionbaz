@@ -191,6 +191,16 @@ class PaperBroker(OrderExecutorInterface):
             reason = "عمق کافی در دفتر سفارش نیست"
             return self._rejected(order_id, symbol, side, quantity, now, reason)
 
+        # ⚠️ ورودی که کاربر **تأیید کرده** باید با همین پرشدن سنجیده
+        # شود، نه با مظنه‌ای که چند ثانیه قبل در لایه‌ی دیگری خوانده
+        # شده. اینجا تنها جایی است که هم قیمتِ واقعیِ پرشدن معلوم است و
+        # هم هنوز هیچ‌چیزِ حساب عوض نشده.
+        guard = kwargs.get("entry_guard")
+        if guard:
+            reason = self._guard_violation(guard, avg_price, filled_qty, quantity)
+            if reason is not None:
+                return self._rejected(order_id, symbol, side, quantity, now, reason)
+
         notional = avg_price * filled_qty * contract.contract_size
         is_buy = side_normalized == "buy"
         fee = (
@@ -225,7 +235,9 @@ class PaperBroker(OrderExecutorInterface):
             filled_quantity=filled_qty,
             created_at=datetime.fromisoformat(now),
             updated_at=datetime.fromisoformat(now),
-            metadata=self._order_metadata(contract, fee, kwargs.get("decision")),
+            metadata=self._order_metadata(
+                contract, fee, kwargs.get("decision"), kwargs.get("entry_guard")
+            ),
         )
 
         signal_id = kwargs.get("signal_id")
@@ -239,18 +251,65 @@ class PaperBroker(OrderExecutorInterface):
         return order
 
     @staticmethod
+    def _guard_violation(
+        guard: dict, fill_price: float, filled_quantity: int, requested: int
+    ) -> str | None:
+        """آیا پرشدنِ واقعی با چیزی که کاربر تأیید کرده می‌خواند؟
+
+        دو چیز بررسی می‌شود و هر دو **پیش از** تغییر حساب:
+
+        * **مقدار** — عمق می‌تواند بین بررسی و تأیید کم شده باشد. پرکردنِ
+          نصفِ سفارش یعنی موقعیتی باز شود که کاربر تأییدش نکرده، پس
+          به‌جای پرشدنِ جزئی، رد می‌شود.
+        * **قیمت** — انحراف از قیمتی که کاربر دید، نسبت به همان قیمت.
+
+        `None` یعنی مشکلی نیست.
+        """
+        confirmed_quantity = int(guard.get("confirmed_quantity") or requested)
+        if filled_quantity < confirmed_quantity:
+            return (
+                f"عمق از زمان تأیید کم شده است: فقط {filled_quantity} از "
+                f"{confirmed_quantity} قرارداد پر می‌شود. سفارش رد شد و حساب "
+                "دست‌نخورده ماند؛ با تعدادِ کمتر دوباره بررسی کنید."
+            )
+
+        confirmed_price = guard.get("confirmed_price")
+        tolerance = guard.get("tolerance_pct")
+        if not confirmed_price or tolerance is None:
+            return None
+        moved = abs(fill_price - float(confirmed_price)) / float(confirmed_price) * 100.0
+        if moved > float(tolerance):
+            return (
+                f"قیمتِ پرشدن {fill_price:,.0f} است در برابر {float(confirmed_price):,.0f} "
+                f"که تأیید شد — {moved:,.2f}٪ جابه‌جایی، بیشتر از آستانه‌ی "
+                f"{float(tolerance):,.2f}٪. سفارش رد شد و حساب دست‌نخورده ماند."
+            )
+        return None
+
+    @staticmethod
     def _order_metadata(
-        contract: OptionContract, fee: float, decision: object | None
+        contract: OptionContract,
+        fee: float,
+        decision: object | None,
+        entry_guard: object | None = None,
     ) -> dict[str, object]:
         """چیزی که باید **همراهِ خودِ سفارش** بماند.
 
-        `decision` عکسِ ارزیابیِ لحظه‌ی تصمیم است (اگر فراخواننده داده
-        باشد). بدون آن، بعداً هیچ راهی نیست بفهمیم معامله با چه
-        اطلاعاتی باز شد — و ارزیابیِ بعدی روی حدس بنا می‌شود.
+        سه چیزِ **جدا** که قاطی‌کردنشان ردپا را از بین می‌برد:
+
+        * `decision` — عکسِ ارزیابی در لحظه‌ای که کاربر تصمیم گرفت؛
+        * `entry_guard` — چه چیزی تأیید شد (قیمت، تعداد، بلیت) و
+          بررسیِ نهایی چه دید؛
+        * خودِ ردیفِ سفارش — قیمت و تعدادی که **واقعاً** پر شد.
+
+        بدون این سه، بعداً نمی‌شود فهمید تفاوتِ عددها از تصمیمِ کاربر
+        آمده، از تغییرِ بازار، یا از خطای ما.
         """
         metadata: dict[str, object] = {"ins_code": contract.ins_code, "fee_paid": fee}
         if decision:
             metadata["decision"] = decision
+        if entry_guard:
+            metadata["entry_guard"] = entry_guard
         return metadata
 
     def cancel_order(self, order_id: str) -> bool:

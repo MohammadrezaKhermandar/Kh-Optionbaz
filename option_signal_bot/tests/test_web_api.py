@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 from datetime import date, timedelta
 from pathlib import Path
@@ -1183,3 +1184,51 @@ def test_a_scan_carries_the_regime_without_letting_it_into_the_score(client):
     for row in ranking.get("ranked", []):
         keys = {c["key"] for c in row["components"]}
         assert "regime" not in keys and "fit" not in keys
+def test_a_book_that_moved_between_check_and_order_does_not_change_the_account(
+    client, monkeypatch
+):
+    """دفتر بین «بررسی» و «تأیید» عوض می‌شود — حساب نباید تکان بخورد.
+
+    این همان حالتی است که بلیت برایش هست: تأییدِ کاربر روی قیمتی بود
+    که دیگر وجود ندارد.
+    """
+    from market import sandbox as sb
+
+    check = _check(client)
+    before = client.get("/api/paper-trading/account?sandbox=true").json()["cash"]
+
+    moved = sb.BY_SYMBOL[PRACTICE_SYMBOL]
+    monkeypatch.setitem(
+        sb.BY_SYMBOL,
+        PRACTICE_SYMBOL,
+        dataclasses.replace(moved, asks=((1_200.0, 200),)),
+    )
+    response = _order(client, check["ticket"]["id"])
+
+    assert response.status_code == 409
+    after = client.get("/api/paper-trading/account?sandbox=true").json()["cash"]
+    assert after == before, "هیچ پولی نباید جابه‌جا شده باشد"
+    positions = client.get("/api/paper-trading/positions?sandbox=true").json()
+    assert positions["positions"] == []
+
+
+def test_depth_that_vanished_between_check_and_order_is_refused(client, monkeypatch):
+    """عمق بین بررسی و ثبت آب می‌رود: به‌جای نصفه‌پرکردن، رد."""
+    from market import sandbox as sb
+
+    check = _check(client)
+    before = client.get("/api/paper-trading/account?sandbox=true").json()["cash"]
+
+    thin = sb.BY_SYMBOL[PRACTICE_SYMBOL]
+    monkeypatch.setitem(
+        sb.BY_SYMBOL,
+        PRACTICE_SYMBOL,
+        dataclasses.replace(thin, asks=((1_005.0, 2),)),
+    )
+    response = _order(client, check["ticket"]["id"])
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "عمق" in detail or "اجراپذیر" in detail
+    after = client.get("/api/paper-trading/account?sandbox=true").json()["cash"]
+    assert after == before

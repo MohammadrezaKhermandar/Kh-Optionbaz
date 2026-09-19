@@ -2196,6 +2196,7 @@ async def place_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
         )
 
     decision: dict[str, Any] | None = None
+    entry_guard: dict[str, Any] | None = None
     if request.ticket:
         claimed = _claim_ticket(request.ticket, symbol, side, quantity, request.sandbox)
         _ttl, tolerance = _ticket_settings(settings)
@@ -2226,16 +2227,38 @@ async def place_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
                     + "؛ ".join(b.message for b in fresh.blockers)
                 ),
             )
+        # این بررسیِ اول **زودهنگام** است و فقط برای پیامِ روشن: گاردِ
+        # اصلی داخلِ کارگزار و روی همان مظنه‌ای است که حساب را عوض
+        # می‌کند. اینجا رد کردن یعنی کاربر زودتر بفهمد، نه اینکه
+        # کنترلِ دوم لازم نباشد.
         _reject_if_price_moved(claimed["entry_price"], fresh.entry_price, tolerance)
         from market.entry_check import decision_snapshot
 
         decision = decision_snapshot(fresh, request.ticket)
+        entry_guard = {
+            "ticket_id": request.ticket,
+            # آنچه کاربر دید و تأیید کرد
+            "confirmed_at": claimed["issued_at"].isoformat(timespec="seconds"),
+            "confirmed_price": claimed["entry_price"],
+            "confirmed_quantity": claimed["quantity"],
+            # آنچه بررسیِ نهایی، لحظه‌ی ثبت، دید
+            "final_check_at": fresh.checked_at.isoformat(timespec="seconds"),
+            "final_check_price": fresh.entry_price,
+            # قیدی که کارگزار روی پرشدنِ واقعی اعمال می‌کند
+            "tolerance_pct": tolerance,
+            "require_full_fill": True,
+        }
 
     def _work() -> dict[str, Any]:
         broker, context = _paper_broker(settings, sandbox=request.sandbox)
         try:
             order = broker.place_order(
-                symbol, side, quantity, signal_id=signal_id, decision=decision
+                symbol,
+                side,
+                quantity,
+                signal_id=signal_id,
+                decision=decision,
+                entry_guard=entry_guard,
             )
             return _serialize_order(order)
         finally:
