@@ -119,6 +119,18 @@ let allSignals = [];
 //: کش سطح صفحه؛ دکمه‌ی «اجرا با یک کلیک» فقط وقتی معاملات کاغذی روشن است دیده می‌شود
 let paperTradingEnabled = false;
 
+/** مسیر آزمایشی (تمرین): حساب، پایگاه و مظنه‌های جدا از دادهٔ واقعی.
+ *
+ * تا وقتی تاریخچه‌ی recorder ساخته نشده، مسیر واقعی **درست** ولی خالی
+ * است؛ این حالت اجازه می‌دهد کلِ جریان همین حالا تمرین شود، بدون اینکه
+ * چیزی از آن به حساب واقعی برسد. */
+let sandboxMode = false;
+
+/** همان مسیر، با پرچمِ حالت. هر فراخوانیِ معاملات کاغذی از این رد می‌شود
+ * تا هیچ‌وقت نصفِ جریان در یک حساب و نصفِ دیگرش در حسابِ دیگر ننشیند. */
+const withMode = (path) =>
+  path + (path.includes("?") ? "&" : "?") + "sandbox=" + (sandboxMode ? "true" : "false");
+
 async function refreshPaperTradingFlag() {
   try {
     const d = await api("/api/paper-trading/settings");
@@ -166,11 +178,14 @@ function signalCard(s) {
   if (src) card.append(el("div", "sig-src", "منبع داده: " + src));
 
   if (paperTradingEnabled) {
-    const actions = el("div", "card-actions");
-    const btn = el("button", "btn btn-ghost", "اجرای این سیگنال (کاغذی)");
-    btn.addEventListener("click", () => executeSignalAsPaperOrder(s, btn));
-    actions.append(btn);
-    card.append(actions);
+    // ثبتِ مستقیم برداشته شد: سیگنالِ ساعتِ پیش تضمینِ اجرای حالا نیست،
+    // پس همان جریانِ «بررسی با دادهٔ تازه ← تأیید» اینجا هم می‌آید.
+    card.append(entryFlow({
+      symbol: s.symbol,
+      signalId: s.signal_id,
+      quantity: s.suggested_qty || 1,
+      label: "ثبت کاغذی این سیگنال",
+    }));
   }
 
   return card;
@@ -459,6 +474,182 @@ function rankedItem(item, position) {
 
   (item.components || []).forEach((c) => box.append(componentLine(c)));
   box.append(el("div", "note", `ارزیابی روی دادهٔ ${item.observed_at.replace("T", " ")}`));
+  if (item.sample_note) box.append(el("div", "hint", item.sample_note));
+  if (paperTradingEnabled || sandboxMode) {
+    box.append(entryFlow({
+      symbol: item.symbol,
+      quantity: item.quantity,
+      previousScore: item.score,
+      label: "ثبت کاغذی این فرصت",
+    }));
+  }
+  return box;
+}
+
+/** جریانِ ورود: تعداد → بررسی با دادهٔ تازه → تأیید.
+ *
+ * چرا دو مرحله: رتبه‌ای که روی کارت می‌بینید عکسِ یک لحظه است. تا وقتی
+ * با دادهٔ تازه و برای **همین تعداد** دوباره بررسی نشده، تأییدی در کار
+ * نیست. تغییر تعداد هم بررسیِ قبلی را باطل می‌کند — دقیقاً چون جوابِ
+ * سؤالِ دیگری بود.
+ */
+function entryFlow({ symbol, signalId, quantity, previousScore, label }) {
+  const box = el("div", "card entry-flow");
+  box.append(el("h3", "", label || "ثبت کاغذی"));
+  const row = el("div", "params");
+  const field = el("div", "field");
+  field.append(el("label", "", "تعداد قرارداد"));
+  const qty = el("input");
+  qty.type = "number";
+  qty.min = "1";
+  qty.step = "1";
+  qty.value = String(quantity || 1);
+  field.append(qty);
+  row.append(field);
+  box.append(row);
+
+  const actions = el("div", "card-actions");
+  const checkBtn = el("button", "btn btn-ghost", "بررسی با دادهٔ تازه");
+  const confirmBtn = el("button", "btn btn-primary", "تأیید و ثبت کاغذی");
+  confirmBtn.disabled = true;
+  confirmBtn.hidden = true;
+  const note = el("span", "note");
+  actions.append(checkBtn, confirmBtn, note);
+  box.append(actions);
+
+  const result = el("div", "entry-result");
+  box.append(result);
+
+  let ticket = null;
+
+  const invalidate = (why) => {
+    ticket = null;
+    confirmBtn.disabled = true;
+    confirmBtn.hidden = true;
+    if (why) {
+      note.className = "note";
+      note.textContent = why;
+    }
+  };
+
+  qty.addEventListener("input", () =>
+    invalidate("تعداد عوض شد؛ باید دوباره با دادهٔ تازه بررسی شود."));
+
+  checkBtn.addEventListener("click", async () => {
+    const quantityValue = Number(qty.value);
+    if (!quantityValue || quantityValue < 1) {
+      note.className = "note bad";
+      note.textContent = "تعداد باید یک عدد مثبت باشد.";
+      return;
+    }
+    checkBtn.disabled = true;
+    note.className = "note";
+    note.textContent = "در حال بررسی با دادهٔ تازه…";
+    result.innerHTML = "";
+    try {
+      const check = await api("/api/trade-check", {
+        method: "POST",
+        body: JSON.stringify({
+          symbol: signalId ? null : symbol,
+          signal_id: signalId || null,
+          quantity: quantityValue,
+          sandbox: sandboxMode,
+          previous_score: previousScore === undefined ? null : previousScore,
+        }),
+      });
+      result.append(entryCheckView(check));
+      if (check.ok && check.ticket) {
+        ticket = check.ticket.id;
+        confirmBtn.hidden = false;
+        confirmBtn.disabled = false;
+        note.className = "note ok";
+        note.textContent =
+          `بررسی سالم بود؛ تأیید تا ${check.ticket.expires_at.replace("T", " ")} معتبر است.`;
+      } else {
+        invalidate("با این تعداد و این داده، ورود ممکن نیست.");
+        note.className = "note bad";
+      }
+    } catch (err) {
+      invalidate();
+      note.className = "note bad";
+      note.textContent = err.message;
+    } finally {
+      checkBtn.disabled = false;
+    }
+  });
+
+  confirmBtn.addEventListener("click", async () => {
+    if (!ticket) return;
+    confirmBtn.disabled = true;
+    note.className = "note";
+    note.textContent = "در حال ثبت…";
+    try {
+      const order = await api("/api/paper-trading/orders", {
+        method: "POST",
+        body: JSON.stringify({
+          symbol: signalId ? null : symbol,
+          signal_id: signalId || null,
+          side: "buy",
+          quantity: Number(qty.value),
+          ticket,
+          sandbox: sandboxMode,
+        }),
+      });
+      if (order.status === "rejected") {
+        note.className = "note bad";
+        note.textContent = "رد شد: " + (order.metadata && order.metadata.reason);
+      } else {
+        note.className = "note ok";
+        note.textContent =
+          `ثبت شد @ ${fmt(order.price)} — در تب «معاملات کاغذی» دیده می‌شود.`;
+        toast("معامله‌ی کاغذی ثبت شد.", "ok");
+      }
+    } catch (err) {
+      // بلیتِ مصرف‌شده/منقضی یعنی باید دوباره بررسی شود، نه اینکه دوباره
+      // همان تأیید زده شود.
+      note.className = "note bad";
+      note.textContent = err.message;
+    } finally {
+      invalidate();
+    }
+  });
+
+  return box;
+}
+
+/** نتیجه‌ی بررسی: اول مانع‌ها، بعد عددها، بعد هشدارها. */
+function entryCheckView(check) {
+  const box = el("div", "");
+  if (check.sandbox) {
+    box.append(el("div", "warnbar", check.sandbox_label || "دادهٔ آزمایشی."));
+  }
+  (check.blockers || []).forEach((b) =>
+    box.append(el("div", "error", "مانع — " + b.message)));
+
+  const o = check.opportunity;
+  if (o) {
+    const head = el("div", "screen-head");
+    head.append(el("span", "note", `قیمتِ اجراییِ ورود: ${fmt(check.entry_price)}`));
+    head.append(el("span", "note",
+      o.capital_required != null
+        ? `وجه لازم: ${fmt(o.capital_required)} ریال`
+        : "وجه لازم: نامعلوم (نرخ کارمزد اعلام نشده)"));
+    head.append(el("span", "note v-loss",
+      o.max_theoretical_loss != null
+        ? `حداکثر زیان نظری: ${fmt(o.max_theoretical_loss)}`
+        : "حداکثر زیان نظری: نامعلوم"));
+    head.append(el("span", "note",
+      o.breakeven != null ? `سر‌به‌سر: ${fmt(o.breakeven)}` : "سر‌به‌سر: نامعلوم"));
+    head.append(el("span", "note", `امتیاز تازه: ${fmt(o.score, 1)}`));
+    if (check.available_cash != null) {
+      head.append(el("span", "note", `نقدِ حساب: ${fmt(check.available_cash)}`));
+    }
+    box.append(head);
+    box.append(el("div", "note", o.breakeven_basis || ""));
+  }
+
+  (check.warnings || []).forEach((w) => box.append(el("div", "note v-loss", "⚠️ " + w)));
+  box.append(el("div", "hint", check.note || ""));
   return box;
 }
 
@@ -575,16 +766,32 @@ $("#btn-save-ranking").addEventListener("click", async () => {
   }
 });
 
-$("#btn-ranking-demo").addEventListener("click", async () => {
-  // دادهٔ آزمایشی از مسیر جدا می‌آید و خودش برچسب‌دار است؛ هیچ‌وقت با
-  // نتیجه‌ی پاس رصد مخلوط نمی‌شود.
+$("#btn-ranking-demo").addEventListener("click", () => setSandboxMode(!sandboxMode));
+
+/** روشن/خاموش کردنِ مسیر تمرین — یک‌جا، تا نصفِ جریان در حالت دیگر نماند. */
+async function setSandboxMode(on) {
+  sandboxMode = !!on;
+  $("#sandbox-state").textContent = sandboxMode ? "روشن" : "خاموش";
+  $("#btn-ranking-demo").textContent = sandboxMode
+    ? "خروج از حالت تمرین"
+    : "حالت تمرین (دادهٔ آزمایشی)";
   try {
-    renderRanking(await api("/api/ranking/demo"));
-    toast("نمونهٔ آزمایشی نمایش داده شد — دادهٔ بازار نیست.", "");
+    if (sandboxMode) {
+      // فرصت‌های تمرین از همان دیتاستی می‌آیند که بررسی و ثبتِ آزمایشی
+      // هم از آن می‌خوانند؛ پس قیمتِ کارت و قیمتِ پرشدن یکی است.
+      renderRanking(await api("/api/ranking/demo"));
+      toast("حالت تمرین روشن شد — دادهٔ آزمایشی، حساب جدا.", "");
+    } else {
+      $("#ranking").innerHTML = "";
+      $("#ranking").append(el("p", "hint",
+        "حالت تمرین خاموش شد. برای دیدن فرصت‌های واقعی، «اجرای پاس رصد بازار» را بزنید."));
+      toast("حالت تمرین خاموش شد.", "");
+    }
+    await loadPaperTab();
   } catch (err) {
     toast(err.message, "bad");
   }
-});
+}
 
 async function loadTradability() {
   try {
@@ -1621,10 +1828,11 @@ $("#btn-save-paper-settings").addEventListener("click", async () => {
 });
 
 $("#btn-paper-reset").addEventListener("click", async () => {
-  if (!confirm("حساب کاغذی کاملاً ریست شود؟ همه‌ی پوزیشن‌ها و تاریخچه پاک می‌شود.")) return;
+  const which = sandboxMode ? "حساب **تمرینی**" : "حساب کاغذیِ واقعی";
+  if (!confirm(`${which} کاملاً ریست شود؟ همه‌ی پوزیشن‌ها و تاریخچه‌اش پاک می‌شود.`)) return;
   try {
-    await api("/api/paper-trading/reset", { method: "POST" });
-    toast("حساب کاغذی ریست شد.", "ok");
+    await api(withMode("/api/paper-trading/reset"), { method: "POST" });
+    toast(sandboxMode ? "حساب تمرینی ریست شد." : "حساب کاغذی ریست شد.", "ok");
     await loadPaperTab();
   } catch (err) {
     toast("ریست ناموفق بود: " + err.message, "bad");
@@ -1772,7 +1980,7 @@ async function loadPaperAccount() {
   const box = $("#paper-account");
   box.innerHTML = '<p class="empty">در حال بارگذاری…</p>';
   try {
-    const a = await api("/api/paper-trading/account");
+    const a = await api(withMode("/api/paper-trading/account"));
     box.innerHTML = "";
     box.append(paperStatRow(a));
   } catch (err) {
@@ -1785,7 +1993,7 @@ async function loadPaperPositions() {
   const box = $("#paper-positions");
   box.innerHTML = '<p class="empty">در حال بارگذاری…</p>';
   try {
-    const d = await api("/api/paper-trading/positions");
+    const d = await api(withMode("/api/paper-trading/positions"));
     box.innerHTML = "";
     if (!d.positions.length) {
       box.append(el("p", "empty", "پوزیشن باز کاغذی ندارید."));
@@ -1837,6 +2045,10 @@ async function loadPaperPositions() {
       }
     });
     box.append(table);
+    // عکسِ تصمیمِ لحظه‌ی ورود، همان‌جا که موقعیت دیده می‌شود.
+    d.positions.forEach((p) => {
+      if (p.entry_decision) box.append(entryDecisionView(p));
+    });
     if (d.expired_unsettled.length) {
       box.append(el(
         "div", "warnbar",
@@ -1849,6 +2061,47 @@ async function loadPaperPositions() {
     box.innerHTML = "";
     box.append(el("div", "error", "خطا: " + err.message));
   }
+}
+
+/** «آن موقع چه می‌دانستم؟» — عکسِ ارزیابیِ لحظه‌ی ورود.
+ *
+ * بدون این، ارزیابیِ بعدیِ معامله روی حدس بنا می‌شود: نمی‌شود فهمید
+ * کدام عدد از اول بد بود و کدام بعداً بد شد.
+ */
+function entryDecisionView(position) {
+  const d = position.entry_decision || {};
+  const box = el("details", "screen-group");
+  box.append(el("summary", "", `تصمیمِ ورودِ ${position.symbol} — چرا و با چه اطلاعاتی`));
+  const head = el("div", "screen-head");
+  head.append(el("span", "note", `زمان بررسی: ${(d.checked_at || "—").replace("T", " ")}`));
+  head.append(el("span", "note", `تعداد: ${fmt(d.quantity)}`));
+  head.append(el("span", "note", `قیمتِ اجراییِ ورود: ${fmt(d.entry_price_at_decision)}`));
+  if (d.score != null) head.append(el("span", "note", `امتیاز: ${fmt(d.score, 1)}`));
+  if (d.coverage_pct != null) {
+    head.append(el("span", "note", `پوشش داده: ${fmt(d.coverage_pct, 0)}٪`));
+  }
+  head.append(el("span", "note",
+    d.capital_required != null
+      ? `وجه ورود: ${fmt(d.capital_required)}`
+      : "وجه ورود: نامعلوم"));
+  head.append(el("span", "note v-loss",
+    d.max_theoretical_loss != null
+      ? `حداکثر زیان نظری: ${fmt(d.max_theoretical_loss)}`
+      : "حداکثر زیان نظری: نامعلوم"));
+  box.append(head);
+  if (d.strengths && d.strengths.length) {
+    box.append(el("div", "note", "بیشترین سهم در رتبه: " + d.strengths.join("، ")));
+  }
+  if (d.weakness) box.append(el("div", "note v-loss", "مهم‌ترین ضعف: " + d.weakness));
+  if (d.unknown && d.unknown.length) {
+    box.append(el("div", "note", "نامعلوم‌ها: " + d.unknown.join("، ")));
+  }
+  (d.warnings || []).forEach((w) => box.append(el("div", "note v-loss", "⚠️ " + w)));
+  if (d.screening_reason) {
+    box.append(el("div", "note", "غربال: " + d.screening_reason));
+  }
+  if (d.fee_basis) box.append(el("div", "note", d.fee_basis));
+  return box;
 }
 
 async function settlePaperPosition(position, btn) {
@@ -1884,7 +2137,11 @@ async function settlePaperPosition(position, btn) {
   try {
     await api("/api/paper-trading/settle", {
       method: "POST",
-      body: JSON.stringify({ symbol: position.symbol, settlement_price: price }),
+      body: JSON.stringify({
+        symbol: position.symbol,
+        settlement_price: price,
+        sandbox: sandboxMode,
+      }),
     });
     toast(`${position.symbol} تسویه شد.`, "ok");
     await loadPaperTab();
@@ -1903,6 +2160,8 @@ async function closePaperPosition(position, btn) {
         symbol: position.symbol,
         side: "sell",
         quantity: position.quantity,
+        // بستنِ موقعیت خروج است، نه ورود: بلیتِ بررسیِ ورود نمی‌خواهد.
+        sandbox: sandboxMode,
       }),
     });
     toast(`پوزیشن ${position.symbol} بسته شد.`, "ok");
@@ -1917,7 +2176,7 @@ async function loadPaperOrders() {
   const box = $("#paper-orders");
   box.innerHTML = '<p class="empty">در حال بارگذاری…</p>';
   try {
-    const d = await api("/api/paper-trading/orders");
+    const d = await api(withMode("/api/paper-trading/orders"));
     box.innerHTML = "";
     if (!d.orders.length) {
       box.append(el("p", "empty", "هنوز سفارش کاغذی ثبت نشده."));
@@ -2060,7 +2319,7 @@ $("#btn-paper-order").addEventListener("click", async () => {
   try {
     const order = await api("/api/paper-trading/orders", {
       method: "POST",
-      body: JSON.stringify({ symbol, side, quantity }),
+      body: JSON.stringify({ symbol, side, quantity, sandbox: sandboxMode }),
     });
     note.className = order.status === "rejected" ? "note bad" : "note ok";
     note.textContent = order.status === "rejected"
@@ -2073,37 +2332,41 @@ $("#btn-paper-order").addEventListener("click", async () => {
   }
 });
 
-async function executeSignalAsPaperOrder(signal, btn) {
-  btn.disabled = true;
-  const label = btn.textContent;
-  btn.textContent = "در حال ثبت…";
-  try {
-    const order = await api("/api/paper-trading/orders", {
-      method: "POST",
-      body: JSON.stringify({ signal_id: signal.signal_id, quantity: signal.suggested_qty }),
-    });
-    if (order.status === "rejected") {
-      toast("رد شد: " + (order.metadata && order.metadata.reason), "bad");
-    } else {
-      toast(`سیگنال با یک کلیک اجرا شد @ ${fmt(order.price)}`, "ok");
-    }
-  } catch (err) {
-    toast("اجرای سیگنال ناموفق بود: " + err.message, "bad");
-  } finally {
-    btn.disabled = false;
-    btn.textContent = label;
-  }
-}
-
 async function loadPaperTab() {
+  applyPaperMode();
   // موازی و مستقل: خطای یک بخش (مثلاً تنظیمات) نباید بقیه پنل را خالی نگه دارد
   await Promise.all([
     loadPaperSettings(),
     loadPaperAccount(),
     loadPaperPositions(),
     loadPaperOrders(),
-    loadPaperChainUnderlyings(),
+    sandboxMode ? Promise.resolve() : loadPaperChainUnderlyings(),
   ]);
+}
+
+/** در حالت تمرین، این تب باید بگوید کدام حساب را نشان می‌دهد.
+ *
+ * دو چیز هم آنجا معنا ندارند و خاموش می‌شوند: تنظیماتِ حسابِ واقعی
+ * (موجودی و نرخ کارمزدِ تمرین ثابت‌اند) و فرمِ سفارشِ دستی روی زنجیره‌ی
+ * واقعی (نمادهایش در دیتاستِ تمرین وجود ندارند). نشان‌دادنِ کنترلی که
+ * کار نمی‌کند، بدتر از نبودنش است.
+ */
+function applyPaperMode() {
+  const banner = $("#paper-mode-banner");
+  banner.innerHTML = "";
+  const setup = $("#paper-setup");
+  const manual = $("#paper-manual-order");
+  if (sandboxMode) {
+    banner.append(el("div", "warnbar",
+      "⚠️ حالت تمرین روشن است: این حساب، پایگاه و مظنه‌ها آزمایشی‌اند و " +
+      "کاملاً از حساب کاغذیِ واقعی جدا هستند. ورود از روی فرصت‌های تمرین " +
+      "در تب «سیگنال‌ها» انجام می‌شود."));
+    setup.hidden = true;
+    manual.hidden = true;
+  } else {
+    setup.hidden = false;
+    manual.hidden = false;
+  }
 }
 
 // ------------------------------------------------------------------ boot
@@ -2111,9 +2374,9 @@ loadStatus();
 refreshPaperTradingFlag().then(loadSignals);
 loadTradability();
 loadRanking();
-// `?ranking=demo` همان دکمه‌ی «نمایش نمونه» را می‌زند — برای وقتی که
-// هنوز تاریخچه‌ای نیست و کاربر می‌خواهد شکلِ خروجی را ببیند.
+// `?ranking=demo` مستقیم وارد حالت تمرین می‌شود — برای وقتی که هنوز
+// تاریخچه‌ای نیست و کاربر می‌خواهد کلِ جریان را یک بار ببیند.
 if (new URLSearchParams(location.search).get("ranking") === "demo") {
-  api("/api/ranking/demo").then(renderRanking).catch(() => {});
+  setSandboxMode(true).catch(() => {});
 }
 setInterval(loadStatus, 60000);

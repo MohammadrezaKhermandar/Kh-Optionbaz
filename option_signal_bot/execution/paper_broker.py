@@ -225,7 +225,7 @@ class PaperBroker(OrderExecutorInterface):
             filled_quantity=filled_qty,
             created_at=datetime.fromisoformat(now),
             updated_at=datetime.fromisoformat(now),
-            metadata={"ins_code": contract.ins_code, "fee_paid": fee},
+            metadata=self._order_metadata(contract, fee, kwargs.get("decision")),
         )
 
         signal_id = kwargs.get("signal_id")
@@ -237,6 +237,21 @@ class PaperBroker(OrderExecutorInterface):
                 self._apply_sell(symbol, filled_qty, avg_price, fee, now, contract, signal_id)
             self._save_order(order, fee, signal_id)
         return order
+
+    @staticmethod
+    def _order_metadata(
+        contract: OptionContract, fee: float, decision: object | None
+    ) -> dict[str, object]:
+        """چیزی که باید **همراهِ خودِ سفارش** بماند.
+
+        `decision` عکسِ ارزیابیِ لحظه‌ی تصمیم است (اگر فراخواننده داده
+        باشد). بدون آن، بعداً هیچ راهی نیست بفهمیم معامله با چه
+        اطلاعاتی باز شد — و ارزیابیِ بعدی روی حدس بنا می‌شود.
+        """
+        metadata: dict[str, object] = {"ins_code": contract.ins_code, "fee_paid": fee}
+        if decision:
+            metadata["decision"] = decision
+        return metadata
 
     def cancel_order(self, order_id: str) -> bool:
         """هر سفارش کاغذی همان لحظه‌ی ثبت، پر یا رد می‌شود؛ چیزی برای لغو نمی‌ماند."""
