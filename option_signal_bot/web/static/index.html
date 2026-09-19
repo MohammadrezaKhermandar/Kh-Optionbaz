@@ -102,7 +102,8 @@
       <div class="params" id="ranking-fields"></div>
       <div class="card-actions">
         <button class="btn btn-primary" id="btn-save-ranking">ذخیره تنظیمات</button>
-        <button class="btn btn-ghost" id="btn-ranking-demo">نمایش نمونه (دادهٔ آزمایشی)</button>
+        <button class="btn btn-ghost" id="btn-ranking-demo">حالت تمرین (دادهٔ آزمایشی)</button>
+      <span class="count" id="sandbox-state">خاموش</span>
         <span class="note" id="ranking-note"></span>
       </div>
     </div>
@@ -309,9 +310,10 @@
       </div>
     </div>
 
+    <div id="paper-mode-banner"></div>
     <div id="paper-account"><p class="empty">در حال بارگذاری…</p></div>
 
-    <div class="card">
+    <div class="card" id="paper-manual-order">
       <h3>ثبت سفارش دستی</h3>
       <p class="hint">
         اول نماد پایه، سررسید و نوع قرارداد را فیلتر کنید، بعد از جدول یک قرارداد را انتخاب کنید.

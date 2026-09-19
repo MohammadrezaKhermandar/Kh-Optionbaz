@@ -168,6 +168,9 @@ def default_settings() -> dict[str, Any]:
             # ریال. معادل ۵۰۰ میلیون تومان.
             "initial_balance": 5_000_000_000.0,
             "sqlite_path": "var/paper_trading.db",
+            # حسابِ **آزمایشی** پایگاهِ خودش را دارد تا تمرین هیچ‌وقت با
+            # حسابِ واقعیِ کاغذی قاطی نشود. ریست و گزارشش هم جداست.
+            "sandbox_sqlite_path": "var/paper_trading_sandbox.db",
             "fees": {
                 "buy_rate": 0.0,
                 "sell_rate": 0.0,
@@ -182,6 +185,13 @@ def default_settings() -> dict[str, Any]:
             },
             # مثل مقدار پیش‌فرض خودِ OrderBookClient
             "order_book_ttl_seconds": 10.0,
+            # عمرِ بلیتِ «بررسی پیش از ورود» (ثانیه). کوتاه است چون کارش
+            # همین است: تأییدی که با دادهٔ کهنه انجام شود، تأییدِ چیزِ
+            # دیگری است.
+            "ticket_ttl_seconds": 90.0,
+            # قیمتِ اجراییِ ورود تا این درصد بتواند بین بررسی و تأیید
+            # تکان بخورد. بیشتر از این ⇒ بررسی دوباره.
+            "ticket_price_tolerance_pct": 0.5,
         },
         # غربالِ قابلیت معامله — دروازه‌ی ورود به پیشنهادها.
         #
