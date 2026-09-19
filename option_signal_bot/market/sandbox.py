@@ -343,7 +343,7 @@ def regime_block(
         subject_kind="market",
         as_of=moment,
         thresholds=thresholds,
-        adjustment=Adjustment.NOT_NEEDED,
+        adjustment=Adjustment.NOT_APPLICABLE,
     )
     underlying = assess_regime(
         price_points(_sample_series(9_000.0, 0.0035, 0.012), moment),
@@ -351,8 +351,9 @@ def regime_block(
         subject_kind="underlying",
         as_of=moment,
         thresholds=thresholds,
-        # دادهٔ نمونه رویداد شرکتی ندارد؛ چیزی برای تعدیل نیست.
-        adjustment=Adjustment.NOT_NEEDED,
+        # سریِ نمونه اصلاً رویداد شرکتی ندارد؛ ساخته‌شدنش با فرمولِ
+        # نوشته‌شده است و مبنای قیمتش عوض نمی‌شود.
+        adjustment=Adjustment.NO_CAPITAL_EVENTS,
     )
     return {
         "enabled": True,
