@@ -816,7 +816,7 @@ def _market_regime(settings: dict[str, Any], as_of: date) -> Any | None:
         subject_kind="market",
         as_of=as_of,
         thresholds=_regime_thresholds(settings),
-        adjustment=Adjustment.NOT_NEEDED,
+        adjustment=Adjustment.NOT_APPLICABLE,
     )
 
 
@@ -851,7 +851,9 @@ def _underlying_regime(
                 candles = log.adjust_history(candles)
                 adjustment = Adjustment.APPLIED
             else:
-                adjustment = Adjustment.NOT_NEEDED
+                # پرسیدیم و چیزی نبود. این با «نپرسیدیم» یکی نیست، و با
+                # «سری کاملاً هم‌مبنا است» هم یکی نیست (سود نقدی).
+                adjustment = Adjustment.NO_CAPITAL_EVENTS
         except Exception as exc:
             # نشد بپرسیم ⇒ «نامعلوم»، نه «رویدادی نبود».
             logger.warning("رویدادهای شرکتی %s در دسترس نبود: %s", symbol, exc)

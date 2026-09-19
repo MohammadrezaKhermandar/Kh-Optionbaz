@@ -61,7 +61,9 @@ def _regime(points, **kwargs):
         subject_kind="underlying",
         as_of=TODAY,
         thresholds=THRESHOLDS,
-        adjustment=Adjustment.NOT_NEEDED,
+        # پیش‌فرضِ این فایل: «پرسیدیم و رویدادی نبود». حالتِ «نپرسیدیم»
+        # قیدِ جداگانه‌ای دارد که خودش تست دارد.
+        adjustment=Adjustment.NO_CAPITAL_EVENTS,
     )
     defaults.update(kwargs)
     return assess_regime(points, **defaults)
@@ -151,27 +153,67 @@ def test_a_move_smaller_than_the_usual_noise_is_not_called_a_trend():
 # ----------------------------------------------------------------------
 # ۳. تعدیلِ قیمت
 # ----------------------------------------------------------------------
-def test_an_unadjusted_capital_increase_fakes_a_crash():
-    """قیمتِ تعدیل‌نشده یک ریزشِ ساختگی می‌سازد؛ تعدیل‌شده نمی‌سازد.
+def _capital_increase_series() -> tuple[list, date]:
+    """رشدِ آرام، ولی از روزِ افزایش سرمایه قیمت **نصف** می‌شود.
 
-    همان خطایی که `market/corporate_actions.py` برای بک‌تست حل کرده
-    بود، اینجا هم می‌توانست وضعیت را وارونه نشان بدهد.
+    همان افتِ مصنوعیِ ناشی از تغییرِ مبنای قیمت: هیچ ریزشی در بازار
+    نیفتاده، فقط تعداد سهم دو برابر شده.
     """
     split_day = TODAY - timedelta(days=20)
     raw: list[Candle] = []
     for i in range(60):
         day = TODAY - timedelta(days=60 - i)
-        # رشدِ آرام، ولی از روزِ افزایش سرمایه قیمت **نصف** می‌شود
         price = 1_000.0 * (1.005**i)
         if day >= split_day:
             price /= 2
         raw.append(Candle(date=day, open=price, high=price, low=price,
                           close=price, volume=0.0))
+    return raw, split_day
 
-    unadjusted = _regime(
+
+def test_an_unknown_adjustment_never_produces_a_directional_verdict():
+    """افتِ مصنوعیِ مبنای قیمت نباید «نزولی» خوانده شود.
+
+    این خطرناک‌ترین حالت است: سری **دقیقاً** همان شکلی را دارد که
+    ماژول دنبالش می‌گردد — تغییرِ بزرگ با کاراییِ بالا. اگر وضعیتِ
+    تعدیل نامعلوم باشد، حکم باید «نامشخص» بماند و علتش دیده شود.
+    """
+    raw, _split_day = _capital_increase_series()
+
+    report = _regime(
         [PricePoint(c.date, c.close) for c in raw], adjustment=Adjustment.UNKNOWN
     )
 
+    assert report.state is RegimeState.UNKNOWN
+    assert "تعدیل" in (report.unknown_reason or "")
+    assert "افزایش سرمایه" in (report.unknown_reason or "")
+    # سنجه‌ها می‌مانند تا کاربر خودش ببیند چه اتفاقی افتاده.
+    change = next(m for m in report.measures if m.key == "change")
+    assert change.value < -40
+
+
+def test_an_unknown_adjustment_never_produces_a_positive_fit():
+    """و تناسبِ مثبت هم از آن در نمی‌آید."""
+    raw, _ = _capital_increase_series()
+    unknown_state = _regime(
+        [PricePoint(c.date, c.close) for c in raw], adjustment=Adjustment.UNKNOWN
+    )
+
+    fit = assess_fit(
+        option_type="put",
+        side="buy",
+        underlying=unknown_state,
+        market=_report(RegimeState.DOWN, subject="شاخص", kind="market"),
+        days_to_expiry=45,
+    )
+
+    assert fit.state is FitState.UNKNOWN
+    assert any("نامشخص" in r for r in fit.reasons)
+
+
+def test_adjusting_the_same_series_recovers_the_real_direction():
+    """با تعدیلِ افزایش سرمایه، همان سری «صعودی» خوانده می‌شود."""
+    raw, split_day = _capital_increase_series()
     log = CorporateActionLog([
         CorporateAction(
             underlying="نمونه",
@@ -180,15 +222,27 @@ def test_an_unadjusted_capital_increase_fakes_a_crash():
             ratio=0.5,
         )
     ])
-    fixed = log.adjust_history(raw)
+
     adjusted = _regime(
-        [PricePoint(c.date, c.close) for c in fixed], adjustment=Adjustment.APPLIED
+        [PricePoint(c.date, c.close) for c in log.adjust_history(raw)],
+        adjustment=Adjustment.APPLIED,
     )
 
-    assert unadjusted.state is RegimeState.DOWN, "ریزشِ ساختگی"
-    assert adjusted.state is RegimeState.UP, "واقعیت: رشدِ آرام"
-    # و وقتی نمی‌دانیم تعدیل شده یا نه، همین را می‌گوییم.
-    assert any("تعدیل" in r for r in unadjusted.reasons)
+    assert adjusted.state is RegimeState.UP
+    assert any("افزایش سرمایه" in r for r in adjusted.reasons)
+
+
+def test_the_dividend_gap_is_admitted_in_every_state():
+    """«تعدیل شد» یعنی افزایش سرمایه اعمال شد، نه اینکه سری بی‌عیب است.
+
+    سود نقدی منبعِ عمومیِ قابل اتکا ندارد و تعدیل نمی‌شود؛ اگر این را
+    نگوییم، کاربر «تعدیل‌شده» را «کاملاً هم‌مبنا» می‌فهمد.
+    """
+    from market.regime import ADJUSTMENT_LABELS
+
+    for state in (Adjustment.APPLIED, Adjustment.NO_CAPITAL_EVENTS):
+        assert "سود نقدی" in ADJUSTMENT_LABELS[state]
+    assert "شاخص" in ADJUSTMENT_LABELS[Adjustment.NOT_APPLICABLE]
 
 
 # ----------------------------------------------------------------------
@@ -210,13 +264,13 @@ def test_the_recorded_index_gets_a_verdict_with_reasons_and_no_network():
         subject="شاخص کل بورس تهران",
         subject_kind="market",
         as_of=last_day + timedelta(days=1),
-        adjustment=Adjustment.NOT_NEEDED,
+        adjustment=Adjustment.NOT_APPLICABLE,
     )
 
     assert len(rows) > 100, "نمونه باید تاریخچه‌ی معناداری داشته باشد"
     assert report.state is not RegimeState.UNKNOWN
     assert report.reasons and report.measures
-    assert report.adjustment is Adjustment.NOT_NEEDED
+    assert report.adjustment is Adjustment.NOT_APPLICABLE
     payload = report.to_dict()
     assert "پیش‌بینی" in payload["note"], "باید صریح بگوید پیش‌بینی نیست"
 
