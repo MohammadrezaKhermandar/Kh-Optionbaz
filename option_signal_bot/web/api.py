@@ -403,7 +403,13 @@ async def run_scan() -> dict[str, Any]:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     try:
-        ranking = _build_ranking(settings, signals, screening)
+        regime = await asyncio.to_thread(_scan_regime, settings, signals)
+    except Exception as exc:  # تحلیل وضعیت نباید پاس رصد را بخواباند
+        logger.exception("تحلیل وضعیت شکست خورد؛ بقیه‌ی پاس دست‌نخورده ماند.")
+        regime = {"enabled": True, "error": str(exc)}
+
+    try:
+        ranking = _build_ranking(settings, signals, screening, regime)
     except Exception as exc:  # رتبه‌بندی یک لایه‌ی نمایشی است، نه پیش‌نیاز
         logger.exception("رتبه‌بندی فرصت‌ها شکست خورد؛ پاس رصد دست‌نخورده ماند.")
         ranking = {"enabled": True, "error": str(exc)}
@@ -438,6 +444,7 @@ def _ranking_candidate(
     return {
         "report": record.report,
         "symbol": record.symbol,
+        "signal_id": record.signal_id,
         "strategy": record.strategy,
         "side": record.side,
         "quantity": record.quantity,
@@ -470,8 +477,60 @@ def _fee_schedule(settings: dict[str, Any]) -> Any:
     return FeeSchedule(**{k: v for k, v in config.items() if k in known})
 
 
+def _scan_regime(settings: dict[str, Any], signals: list[Signal]) -> dict[str, Any]:
+    """وضعیتِ بازار و نمادهای پایه‌ی همین پاس.
+
+    شکستش کشنده نیست: رتبه‌بندی و غربال بدونش هم کار می‌کنند و فقط این
+    بخش «نامشخص» می‌ماند.
+    """
+    symbols = [s.underlying for s in signals if s.underlying]
+    if not symbols:
+        symbols = list(section(settings, "market_data").get("symbols") or [])
+    context = create_app(settings, dry_run=True, as_json=False)
+    try:
+        return _regime_block(settings, context, symbols, date.today())
+    finally:
+        context.close()
+
+
+def _attach_fit(
+    payload: dict[str, Any],
+    regime: dict[str, Any] | None,
+    by_signal_id: dict[str, Signal],
+) -> None:
+    """تناسبِ جهتِ هر فرصت با وضعیت — **کنارِ** ردیف، نه داخلِ امتیاز.
+
+    امتیاز و ترتیبِ رتبه دست نمی‌خورند؛ اگر این تحلیل روزی امتیاز بگیرد
+    باید اول اعتبارسنجی شود، وگرنه یک مؤلفه‌ی ناسنجیده بی‌صدا در رتبه
+    می‌نشیند.
+    """
+    if not regime or not regime.get("enabled", False):
+        return
+    from market.opportunity_fit import assess_fit
+
+    reports = regime.get("_reports") or {}
+    market = reports.get("market")
+    underlyings = reports.get("underlyings") or {}
+    for row in payload.get("ranked", []):
+        signal = by_signal_id.get(row.get("signal_id") or "")
+        if signal is None:
+            continue
+        fit = assess_fit(
+            option_type=signal.option_type.value,
+            side=row.get("side", "buy"),
+            underlying=underlyings.get(signal.underlying),
+            market=market,
+            days_to_expiry=signal.days_to_expiry,
+        )
+        row["underlying"] = signal.underlying
+        row["fit"] = fit.to_dict()
+
+
 def _build_ranking(
-    settings: dict[str, Any], signals: list[Signal], screening: dict[str, Any]
+    settings: dict[str, Any],
+    signals: list[Signal],
+    screening: dict[str, Any],
+    regime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """رتبه‌بندیِ همین پاس، از رکوردهای غربال و خودِ سیگنال‌ها.
 
@@ -541,6 +600,9 @@ def _build_ranking(
         evaluated_at=datetime.now(),
     )
     payload = result.to_dict()
+    _attach_fit(payload, regime, by_signal_id)
+    if regime is not None:
+        payload["regime"] = {k: v for k, v in regime.items() if k != "_reports"}
     # کنارگذاشته‌های این لایه هم باید دیده شوند، نه اینکه بی‌صدا گم شوند.
     payload["excluded"] = [
         *payload["excluded"],
@@ -704,6 +766,164 @@ def update_ranking_settings(update: RankingUpdate) -> dict[str, Any]:
     return {"ok": True, "applied": patch}
 
 
+# ----------------------------------------------------------------------
+# وضعیت بازار و نماد پایه
+# ----------------------------------------------------------------------
+def _regime_thresholds(settings: dict[str, Any]) -> Any:
+    """آستانه‌های تشخیص وضعیت از تنظیمات؛ کلیدِ ناشناخته بی‌صدا رد می‌شود."""
+    from market.regime import RegimeThresholds
+
+    config = section(settings, "regime")
+    known = {f.name for f in fields(RegimeThresholds)}
+    return RegimeThresholds(**{k: v for k, v in config.items() if k in known})
+
+
+def _market_regime(settings: dict[str, Any], as_of: date) -> Any | None:
+    """وضعیتِ «بازار» از شاخص کل. `None` یعنی اصلاً نشد حساب کرد.
+
+    شاخص تعدیل نمی‌خواهد (خودش سریِ سطح است)، پس وضعیتِ تعدیل صریحاً
+    `not_needed` گزارش می‌شود، نه «نامعلوم».
+    """
+    from data.tsetmc_index_client import (
+        TSE_ALL_SHARE_INS_CODE,
+        TSE_ALL_SHARE_LABEL,
+        TsetmcIndexClient,
+    )
+    from market.regime import Adjustment, PricePoint, assess_regime
+
+    config = section(settings, "regime")
+    ins_code = str(config.get("market_ins_code") or TSE_ALL_SHARE_INS_CODE)
+    label = str(config.get("market_label") or TSE_ALL_SHARE_LABEL)
+    history_dir = config.get("index_history_dir")
+    client = TsetmcIndexClient(
+        timeout=section(settings, "market_data").get("timeout", 20),
+        history_dir=resolve_path(history_dir) if history_dir else None,
+    )
+    try:
+        points = [
+            PricePoint(p.date, p.close)
+            for p in client.get_history(
+                ins_code, days=int(config.get("history_days", 200)), label=label
+            )
+        ]
+    except Exception as exc:
+        logger.warning("تاریخچه‌ی شاخص خوانده نشد: %s", exc)
+        return None
+
+    return assess_regime(
+        points,
+        subject=label,
+        subject_kind="market",
+        as_of=as_of,
+        thresholds=_regime_thresholds(settings),
+        adjustment=Adjustment.NOT_NEEDED,
+    )
+
+
+def _underlying_regime(
+    settings: dict[str, Any], context: Any, symbol: str, as_of: date
+) -> Any | None:
+    """وضعیتِ یک نماد پایه، روی قیمتِ **تعدیل‌شده** اگر بشود.
+
+    سه حالتِ تعدیل از هم جدا می‌مانند: اعمال شد، رویدادی نبود، یا اصلاً
+    نشد پرسید. حالتِ سوم با «رویدادی نبود» یکی نیست و در گزارش هم
+    یکی نمی‌شود.
+    """
+    from market.corporate_actions import fetch_corporate_actions
+    from market.regime import Adjustment, PricePoint, assess_regime
+
+    config = section(settings, "regime")
+    days = int(config.get("history_days", 200))
+    try:
+        candles = context.market_data.get_history(symbol, days)
+    except Exception as exc:
+        logger.warning("تاریخچه‌ی %s خوانده نشد: %s", symbol, exc)
+        return None
+    if not candles:
+        return None
+
+    adjustment = Adjustment.UNKNOWN
+    if config.get("corporate_actions", True):
+        try:
+            ins_code = context.market_data.resolve_ins_code(symbol)
+            log = fetch_corporate_actions(ins_code, symbol)
+            if log.actions:
+                candles = log.adjust_history(candles)
+                adjustment = Adjustment.APPLIED
+            else:
+                adjustment = Adjustment.NOT_NEEDED
+        except Exception as exc:
+            # نشد بپرسیم ⇒ «نامعلوم»، نه «رویدادی نبود».
+            logger.warning("رویدادهای شرکتی %s در دسترس نبود: %s", symbol, exc)
+
+    return assess_regime(
+        [PricePoint(c.date, c.close) for c in candles],
+        subject=symbol,
+        subject_kind="underlying",
+        as_of=as_of,
+        thresholds=_regime_thresholds(settings),
+        adjustment=adjustment,
+    )
+
+
+def _regime_block(
+    settings: dict[str, Any], context: Any, symbols: list[str], as_of: date
+) -> dict[str, Any]:
+    """وضعیتِ بازار و هر نمادِ خواسته‌شده، در یک بسته برای رابط."""
+    config = section(settings, "regime")
+    if not config.get("enabled", True):
+        return {"enabled": False, "reason": "تحلیل وضعیت در تنظیمات خاموش است."}
+
+    market = _market_regime(settings, as_of)
+    underlyings: dict[str, Any] = {}
+    for symbol in dict.fromkeys(symbols):  # یکتا، با حفظ ترتیب
+        report = _underlying_regime(settings, context, symbol, as_of)
+        if report is not None:
+            underlyings[symbol] = report
+
+    return {
+        "enabled": True,
+        "as_of": as_of.isoformat(),
+        "market": None if market is None else market.to_dict(),
+        "underlyings": {k: v.to_dict() for k, v in underlyings.items()},
+        "note": (
+            "وضعیتِ **فعلی** بازار و نماد پایه، جدا از هم. این تشخیص در "
+            "امتیازِ رتبه‌بندی وارد نمی‌شود و پیش‌بینی تا سررسید هم نیست."
+        ),
+        "_reports": {"market": market, "underlyings": underlyings},
+    }
+
+
+@app.get("/api/regime")
+async def get_regime(underlyings: str | None = None) -> dict[str, Any]:
+    """وضعیتِ بازار و نمادهای پایه — بدون نیاز به پاس رصد.
+
+    `underlyings` فهرستِ نمادها با ویرگول؛ خالی یعنی همان نمادهای تحت
+    رصد در تنظیمات.
+    """
+    settings = _settings()
+    symbols = (
+        [s.strip() for s in underlyings.split(",") if s.strip()]
+        if underlyings
+        else list(section(settings, "market_data").get("symbols") or [])
+    )
+
+    def _work() -> dict[str, Any]:
+        context = create_app(settings, dry_run=True, as_json=False)
+        try:
+            block = _regime_block(settings, context, symbols, date.today())
+        finally:
+            context.close()
+        block.pop("_reports", None)
+        return block
+
+    try:
+        return await asyncio.to_thread(_work)
+    except Exception as exc:
+        logger.exception("تحلیل وضعیت ناموفق بود.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/ranking/demo")
 def get_ranking_demo(quantity: int = 10) -> dict[str, Any]:
     """فرصت‌های **مسیر آزمایشی** — همان دیتاستی که می‌شود رویش معامله کرد.
@@ -768,6 +988,25 @@ def get_ranking_demo(quantity: int = 10) -> dict[str, Any]:
         demo=True,
     )
     payload = result.to_dict()
+    # وضعیت و تناسب در تمرین هم دیده می‌شوند — با همان منطقِ مسیر واقعی،
+    # روی سریِ قیمتِ نمونه.
+    regime = sb.regime_block(_regime_thresholds(_settings()))
+    from market.opportunity_fit import assess_fit
+
+    reports = regime.pop("_reports")
+    for row in payload["ranked"]:
+        sample = sb.BY_SYMBOL.get(row["symbol"])
+        if sample is None:
+            continue
+        row["underlying"] = sb.SANDBOX_UNDERLYING
+        row["fit"] = assess_fit(
+            option_type=sample.option_type,
+            side=row["side"],
+            underlying=reports["underlyings"].get(sb.SANDBOX_UNDERLYING),
+            market=reports["market"],
+            days_to_expiry=sb.SANDBOX_DAYS_TO_EXPIRY,
+        ).to_dict()
+    payload["regime"] = regime
     notes = {s.symbol: s.note for s in sb.SAMPLES}
     for row in payload["ranked"]:
         row["sample_note"] = notes.get(row["symbol"])

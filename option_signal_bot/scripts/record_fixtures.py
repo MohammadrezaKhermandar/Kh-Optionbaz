@@ -21,6 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import force_utf8_stdio
 from data.tsetmc_http import fetch_json
+from data.tsetmc_index_client import (
+    INDEX_HISTORY_URL,
+    INDEX_KEY,
+    TSE_ALL_SHARE_INS_CODE,
+    TSE_ALL_SHARE_LABEL,
+)
 from data.tsetmc_market_data_client import DAILY_HISTORY_URL
 from data.tsetmc_option_chain_client import (
     HttpPayloadSource,
@@ -30,6 +36,11 @@ from data.tsetmc_option_chain_client import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = PROJECT_ROOT / "tests" / "fixtures"
 HISTORY_DIR = FIXTURE_DIR / "history"
+INDEX_DIR = FIXTURE_DIR / "index"
+
+#: تاریخچه‌ی شاخص از ۲۰۰۸ شروع می‌شود (هزاران ردیف) و کلش برای تست لازم
+#: نیست. همان اندازه‌ای نگه داشته می‌شود که TSETMC برای سهم می‌دهد.
+INDEX_SESSIONS = 400
 
 #: نمادهایی که تست‌ها استفاده می‌کنند؛ نقدشونده و همیشه آپشن دارند
 DEFAULT_SYMBOLS = ("خودرو", "شستا", "اهرم")
@@ -81,6 +92,27 @@ def main(argv: list[str] | None = None) -> int:
         count = len(history.get("closingPriceDaily") or [])
         print(f"  {symbol:10} → {out.name}  ({count} کندل)")
         saved += 1
+
+    # ۳) تاریخچه‌ی شاخص کل — «بازار» در تحلیل وضعیت
+    print("\nدریافت تاریخچه شاخص کل...")
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        index_payload = fetch_json(
+            INDEX_HISTORY_URL.format(ins_code=TSE_ALL_SHARE_INS_CODE),
+            label=f"تاریخچه {TSE_ALL_SHARE_LABEL}",
+        )
+        rows = index_payload.get(INDEX_KEY) or []
+        trimmed = {INDEX_KEY: rows[-INDEX_SESSIONS:]}
+        index_path = INDEX_DIR / f"{TSE_ALL_SHARE_INS_CODE}.json"
+        index_path.write_text(
+            json.dumps(trimmed, ensure_ascii=False), encoding="utf-8"
+        )
+        print(
+            f"  {TSE_ALL_SHARE_LABEL} → {index_path.name} "
+            f"({len(trimmed[INDEX_KEY])} جلسه از {len(rows)})"
+        )
+    except Exception as exc:  # نبودِ شاخص نباید ضبطِ بقیه را باطل کند
+        print(f"  شاخص کل ضبط نشد: {exc}")
 
     print(f"\n{saved} نماد ضبط شد. حالا تست‌ها روی داده‌ی واقعی اجرا می‌شوند.")
     print(f"نمادهای موجود در بازار: {len(client.available_underlyings())}")

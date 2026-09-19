@@ -26,6 +26,7 @@ import pytest
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 CHAIN_FIXTURE = FIXTURE_DIR / "tsetmc_option_market_watch.json"
 HISTORY_DIR = FIXTURE_DIR / "history"
+INDEX_DIR = FIXTURE_DIR / "index"
 
 
 class NetworkUsedInTest(AssertionError):
@@ -82,6 +83,10 @@ def _offline_settings(tmp_path) -> dict:
     settings["storage"]["sqlite_path"] = str(tmp_path / "signals.db")
     settings["storage"]["jsonl_path"] = str(tmp_path / "signals.jsonl")
     settings["trading_calendar"]["cache_path"] = str(tmp_path / "calendar.json")
+    # تحلیل وضعیت هم باید آفلاین باشد: شاخص از نمونه‌ی ضبط‌شده، و
+    # رویدادهای شرکتی اصلاً پرسیده نشوند.
+    settings["regime"]["index_history_dir"] = str(INDEX_DIR)
+    settings["regime"]["corporate_actions"] = False
     return settings
 
 
@@ -212,3 +217,31 @@ def test_dashboard_status_stays_offline(no_network, tmp_path, monkeypatch):
     with TestClient(web_api.app) as client:
         body = client.get("/api/status").json()
     assert "market_open" in body
+
+
+def test_regime_analysis_stays_offline(no_network, tmp_path, monkeypatch):
+    """تحلیل وضعیت هم باید روی نمونه‌ی ضبط‌شده کار کند.
+
+    این مسیر دو درخواستِ شبکه‌ی تازه آورد (تاریخچه‌ی شاخص و رویدادهای
+    شرکتی). هر دو باید از تنظیمات قابل خاموش‌کردن باشند، وگرنه همان
+    کندیِ بی‌صدای قبلی برمی‌گردد.
+    """
+    pytest.importorskip("fastapi")
+    yaml = pytest.importorskip("yaml")
+    from fastapi.testclient import TestClient
+
+    from web import api as web_api
+
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(
+        yaml.safe_dump(_offline_settings(tmp_path), allow_unicode=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_api, "SETTINGS_PATH", settings_path)
+
+    with TestClient(web_api.app) as client:
+        body = client.get("/api/regime?underlyings=خودرو").json()
+
+    assert body["enabled"] is True
+    assert body["market"]["sessions_used"] > 0, "شاخص از نمونه خوانده شد"
+    assert body["underlyings"]["خودرو"]["adjustment"] == "unknown"

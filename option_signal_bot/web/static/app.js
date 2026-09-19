@@ -269,6 +269,7 @@ async function scan(quiet = false) {
     );
     renderScreening(r.screening);
     renderRanking(r.ranking);
+    if (r.ranking && r.ranking.regime) renderRegime(r.ranking.regime);
     await Promise.all([loadSignals(), loadStatus()]);
     return r.generated || 0;
   } catch (err) {
@@ -392,6 +393,82 @@ function renderScreening(screening) {
   });
 }
 
+// ------------------------------------------------- وضعیت بازار و نماد پایه
+/** یک موضوع (بازار یا یک نماد) با حکم، سنجه‌ها و دلیل‌هایش. */
+function regimeBlock(report) {
+  const box = el("details", "screen-group");
+  const stale = report.staleness_days;
+  box.append(el("summary", "",
+    `${report.subject} — ${report.state_label}` +
+    (report.state === "unknown" ? "" : ` · افق ${fmt(report.horizon_sessions)} جلسه`)));
+
+  const head = el("div", "screen-head");
+  head.append(el("span", "note", `جلسه‌های استفاده‌شده: ${fmt(report.sessions_used)}`));
+  head.append(el("span", "note",
+    `آخرین جلسه: ${report.last_session || "—"}` +
+    (stale === null || stale === undefined ? "" : ` (${fmt(stale)} روز پیش)`)));
+  head.append(el("span", "note", report.adjustment_note));
+  box.append(head);
+
+  (report.reasons || []).forEach((r) => box.append(el("div", "note", "• " + r)));
+  if (report.unknown_reason) {
+    box.append(el("div", "note v-loss", report.unknown_reason));
+  }
+  (report.measures || []).forEach((m) => {
+    const line = el("div", "check-line");
+    line.append(el("span", "check-mark", "•"));
+    line.append(el("span", "",
+      `${m.label}: ${fmt(m.value, 2)} ${m.unit} — ${m.detail}`));
+    box.append(line);
+  });
+  return box;
+}
+
+function renderRegime(regime) {
+  const box = $("#regime");
+  box.innerHTML = "";
+  if (!regime) {
+    box.append(el("p", "empty", "هنوز بررسی نشده."));
+    return;
+  }
+  if (regime.enabled === false) {
+    $("#regime-state").textContent = "خاموش";
+    box.append(el("p", "hint", regime.reason || "در تنظیمات خاموش است."));
+    return;
+  }
+  $("#regime-state").textContent = "روشن";
+  if (regime.error) {
+    box.append(el("div", "error", "تحلیل وضعیت انجام نشد: " + regime.error));
+    return;
+  }
+  if (regime.market) {
+    box.append(regimeBlock(regime.market));
+  } else {
+    box.append(el("div", "note v-loss",
+      "وضعیت بازار نامشخص است: تاریخچه‌ی شاخص در دسترس نبود."));
+  }
+  const unders = regime.underlyings || {};
+  Object.keys(unders).forEach((k) => box.append(regimeBlock(unders[k])));
+  if (!Object.keys(unders).length) {
+    box.append(el("p", "hint", "نماد پایه‌ای برای بررسی نبود."));
+  }
+  if (regime.note) box.append(el("p", "hint", regime.note));
+}
+
+$("#btn-refresh-regime").addEventListener("click", async () => {
+  const note = $("#regime-note");
+  note.className = "note";
+  note.textContent = "در حال بررسی وضعیت…";
+  try {
+    renderRegime(await api("/api/regime"));
+    note.className = "note ok";
+    note.textContent = "به‌روز شد.";
+  } catch (err) {
+    note.className = "note bad";
+    note.textContent = err.message;
+  }
+});
+
 // ------------------------------------------------- رتبه‌بندی اولویت بررسی
 /** یک مؤلفه‌ی امتیاز: چقدر گرفت، از چه وزنی، و چرا. */
 function componentLine(c) {
@@ -474,6 +551,7 @@ function rankedItem(item, position) {
 
   (item.components || []).forEach((c) => box.append(componentLine(c)));
   box.append(el("div", "note", `ارزیابی روی دادهٔ ${item.observed_at.replace("T", " ")}`));
+  if (item.fit) box.append(fitLine(item));
   if (item.sample_note) box.append(el("div", "hint", item.sample_note));
   if (paperTradingEnabled || sandboxMode) {
     box.append(entryFlow({
@@ -483,6 +561,22 @@ function rankedItem(item, position) {
       label: "ثبت کاغذی این فرصت",
     }));
   }
+  return box;
+}
+
+/** تناسبِ جهتِ فرصت با وضعیتِ سهم و بازار — کنارِ امتیاز، نه داخلش. */
+function fitLine(item) {
+  const fit = item.fit;
+  const cls = fit.state === "conflict" ? "note v-loss"
+    : fit.state === "aligned" ? "note v-gain" : "note";
+  const box = el("div", "");
+  box.append(el("div", cls,
+    `تناسب با وضعیت: ${fit.state_label}` +
+    (item.underlying ? ` · پایه ${item.underlying}: ${fit.underlying_state_label}` : "") +
+    ` · بازار: ${fit.market_state_label}`));
+  (fit.reasons || []).forEach((r) => box.append(el("div", "note", "• " + r)));
+  if (fit.time_note) box.append(el("div", "note", "⏳ " + fit.time_note));
+  box.append(el("div", "hint", fit.note));
   return box;
 }
 
@@ -779,7 +873,9 @@ async function setSandboxMode(on) {
     if (sandboxMode) {
       // فرصت‌های تمرین از همان دیتاستی می‌آیند که بررسی و ثبتِ آزمایشی
       // هم از آن می‌خوانند؛ پس قیمتِ کارت و قیمتِ پرشدن یکی است.
-      renderRanking(await api("/api/ranking/demo"));
+      const demo = await api("/api/ranking/demo");
+      renderRanking(demo);
+      if (demo.regime) renderRegime(demo.regime);
       toast("حالت تمرین روشن شد — دادهٔ آزمایشی، حساب جدا.", "");
     } else {
       $("#ranking").innerHTML = "";
