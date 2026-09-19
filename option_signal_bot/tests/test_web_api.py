@@ -356,6 +356,128 @@ def _enable_paper_trading(client) -> None:
     assert response.status_code == 200
 
 
+# ----------------------------------------------------------------------
+# رتبه‌بندی اولویت بررسی — مرزِ API
+# ----------------------------------------------------------------------
+def test_ranking_settings_expose_units_and_the_what_this_is_not_note(client):
+    """رابط باید واحدها و «این عدد چه چیزی نیست» را از سرور بگیرد.
+
+    اگر این جمله گم شود، کاربر امتیاز را احتمال برد می‌خواند — همان
+    اشتباهی که کل طراحی برای جلوگیری از آن است.
+    """
+    body = client.get("/api/ranking").json()
+
+    assert body["fields"], "فیلدها باید از سرور بیایند، نه hardcode در JS"
+    for field in body["fields"]:
+        assert field["key"] and field["label"] and field["unit"]
+    assert "احتمال برد" in body["note"]
+    assert "بازده مورد انتظار" in body["note"]
+
+
+def test_ranking_weight_change_round_trips_and_rejects_nonsense(client):
+    """وزن‌ها باید واقعاً تنظیم‌پذیر باشند و ورودی بی‌معنا رد شود."""
+    assert client.put("/api/ranking", json={"weight_exit_capacity": 40.0}).status_code == 200
+    assert client.get("/api/ranking").json()["settings"]["weight_exit_capacity"] == 40.0
+
+    # خالی و منفی هر دو باید رد شوند، نه اینکه بی‌صدا در yaml بنشینند.
+    assert client.put("/api/ranking", json={}).status_code == 400
+    assert client.put("/api/ranking", json={"weight_exit_capacity": -1}).status_code == 422
+    assert client.put("/api/ranking", json={"max_fee_cost_pct": 0}).status_code == 422
+
+
+def test_scan_returns_ranking_without_leaking_internal_records(client):
+    """`_records` کلیدِ داخلیِ رتبه‌بندی است و نباید به UI برسد."""
+    body = client.post("/api/scan").json()
+
+    assert "ranking" in body
+    assert "_records" not in body["screening"], "کلید داخلی به پاسخ نشت کرد"
+    assert body["ranking"]["enabled"] is True
+    assert "evaluated_at" in body["ranking"], "زمان ارزیابی باید صریح باشد"
+
+
+def test_nothing_passing_the_gate_is_reported_with_a_reason_not_an_empty_list(client):
+    """فهرست خالی باید علت داشته باشد.
+
+    فیکسچرِ تست تاریخچه‌ی recorder ندارد، پس هیچ گزینه‌ای «قابل معامله»
+    نمی‌شود. خروجیِ درست این است که فهرست خالی بماند و علتِ هر کنارگذاشتن
+    گفته شود — نه اینکه برای پرشدن صفحه، آستانه‌ها شل شوند.
+    """
+    ranking = client.post("/api/scan").json()["ranking"]
+
+    assert ranking["ranked"] == []
+    assert ranking["excluded"], "علت کنارگذاشتن باید گزارش شود"
+    for item in ranking["excluded"]:
+        assert item["reason"].strip()
+
+
+def test_screening_records_carry_the_signal_id_they_belong_to(client):
+    """نتیجه‌ی غربال باید به **همان سیگنال** وصل شود، نه فقط همان نماد.
+
+    روی یک نماد می‌تواند چند سیگنال از چند استراتژی با سمت و تعدادِ
+    متفاوت در یک پاس باشد؛ وصل‌کردن با نماد یعنی عددهای بی‌ربط قاطی
+    شوند و «چرا این رتبه» دروغ از آب دربیاید.
+    """
+    records = client.post("/api/scan").json()["screening"]["records"]
+    assert records, "این فیکسچر باید چند گزینه ارزیابی کند"
+
+    for record in records:
+        assert record["signal_id"], f"{record['symbol']} شناسه‌ی سیگنال ندارد"
+
+    # و همان نماد با استراتژی‌های مختلف، شناسه‌های جدا می‌گیرد.
+    by_symbol: dict[str, set[str]] = {}
+    for record in records:
+        by_symbol.setdefault(record["symbol"], set()).add(record["signal_id"])
+    repeated = {s: ids for s, ids in by_symbol.items() if len(ids) > 1}
+    if repeated:
+        for symbol, ids in repeated.items():
+            assert len(ids) == len(
+                [r for r in records if r["symbol"] == symbol]
+            ), f"شناسه‌های {symbol} یکتا نیستند"
+
+
+def test_rejected_records_keep_their_verdict_and_reason_in_the_exclusions(client):
+    """ردشده و نیازمند بررسی نباید از فهرست کنارگذاشته‌ها گم شوند.
+
+    آن‌ها سیگنالِ منتشرشده ندارند، پس اگر اتصال با سیگنال باعث حذفشان
+    شود، کاربر دیگر نمی‌بیند چه چیزی رد شد و چرا.
+    """
+    body = client.post("/api/scan").json()
+    screened = body["screening"]["records"]
+    excluded = body["ranking"]["excluded"]
+
+    assert screened, "این فیکسچر باید چند گزینه ارزیابی کند"
+    assert len(excluded) >= len(screened), "هر رکوردِ غربال باید جایی دیده شود"
+    for item in excluded:
+        assert item["reason"].strip()
+    assert {i["verdict"] for i in excluded} <= {
+        "tradable", "needs_review", "rejected",
+    }
+
+
+def test_demo_ranking_is_labelled_and_served_from_a_separate_path(client):
+    """دادهٔ آزمایشی باید برچسب داشته باشد و از مسیر واقعی جدا بماند.
+
+    بدون برچسب، کاربر نمونه را نتیجه‌ی بازار می‌خواند — بدترین حالتِ
+    ممکن برای ابزاری که قرار است تصمیم مالی را پشتیبانی کند.
+    """
+    demo = client.get("/api/ranking/demo").json()
+    assert demo["demo"] is True
+    assert demo["ranked"], "نمونه باید واقعاً چند گزینه‌ی رتبه‌گرفته نشان بدهد"
+
+    # و پاسخِ پاس رصد هرگز `demo` نیست.
+    assert client.post("/api/scan").json()["ranking"].get("demo") is not True
+
+
+def test_ranking_can_be_turned_off_without_breaking_the_scan(client):
+    """خاموش‌بودن رتبه‌بندی نباید پاس رصد را بخواباند."""
+    client.put("/api/ranking", json={"enabled": False})
+
+    body = client.post("/api/scan").json()
+
+    assert body["ranking"]["enabled"] is False
+    assert "screening" in body, "پاس رصد باید مستقل از رتبه‌بندی کار کند"
+
+
 def test_paper_trading_is_disabled_by_default(client):
     body = client.get("/api/paper-trading/settings").json()
     assert body["enabled"] is False

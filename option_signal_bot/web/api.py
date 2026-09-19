@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import fields
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -311,6 +312,9 @@ async def run_scan() -> dict[str, Any]:
                 # «غربال خاموش بود» با «همه قبول شدند» یکی نیست.
                 screening["enabled"] = generator.tradability is not None
                 screening["history"] = _history_state(generator.tradability)
+                # رکوردهای خام فقط برای رتبه‌بندی لازم‌اند و به UI
+                # نمی‌روند؛ نسخه‌ی سریالایزشده‌شان از قبل در `records` هست.
+                screening["_records"] = generator.screening.records
                 return produced, screening
             finally:
                 context.close()
@@ -321,11 +325,156 @@ async def run_scan() -> dict[str, Any]:
             logger.exception("پاس رصد ناموفق بود.")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    try:
+        ranking = _build_ranking(settings, signals, screening)
+    except Exception as exc:  # رتبه‌بندی یک لایه‌ی نمایشی است، نه پیش‌نیاز
+        logger.exception("رتبه‌بندی فرصت‌ها شکست خورد؛ پاس رصد دست‌نخورده ماند.")
+        ranking = {"enabled": True, "error": str(exc)}
+    screening.pop("_records", None)
+
     return {
         "generated": len(signals),
         "signals": [_signal_dict(s) for s in signals],
         "screening": screening,
+        "ranking": ranking,
     }
+
+
+def _ranking_weights(settings: dict[str, Any]) -> Any:
+    """`RankingWeights` از تنظیمات؛ کلیدهای ناشناخته بی‌صدا نادیده می‌روند."""
+    from market.opportunity_ranking import RankingWeights
+
+    config = section(settings, "ranking")
+    known = {f.name for f in fields(RankingWeights)}
+    return RankingWeights(**{k: v for k, v in config.items() if k in known})
+
+
+def _ranking_candidate(
+    record: Any, signal: Signal | None, fees: Any
+) -> dict[str, Any]:
+    """ورودیِ رتبه‌بندی برای یک رکوردِ غربال.
+
+    `signal is None` فقط برای رکوردهایی است که اصلاً منتشر نمی‌شوند
+    (ردشده/نیازمند بررسی)؛ آن‌ها پیش از هر محاسبه‌ای در دروازه‌ی اولِ
+    رتبه‌بندی کنار می‌روند، پس عددهای قرارداد لازمشان نیست.
+    """
+    return {
+        "report": record.report,
+        "symbol": record.symbol,
+        "strategy": record.strategy,
+        "side": record.side,
+        "quantity": record.quantity,
+        "leg_group_id": record.leg_group_id,
+        "option_type": signal.option_type.value if signal else "",
+        "strike": signal.strike if signal else 0.0,
+        "contract_size": signal.units_per_contract if signal else 1,
+        "underlying_price": signal.underlying_price if signal else None,
+        # ⚠️ **قیمتِ** حد ضرر می‌رود، نه مبلغِ زیانِ ماژول ریسک: آن مبلغ
+        # از پرمیومِ *پیشنهادی* ساخته شده و با سرمایه و سر‌به‌سرِ
+        # رتبه‌بندی — که از قیمتِ اجرایی می‌آیند — هم‌مبنا نیست.
+        "stop_loss_price": signal.stop_loss if signal else None,
+        # نرخ، نه مبلغ: کارمزدِ ورود از قیمتِ اجراییِ ورود و کارمزدِ
+        # خروجِ فرضی از قیمتِ اجراییِ خروجِ همان تعداد حساب می‌شود.
+        "fees": fees,
+    }
+
+
+def _fee_schedule(settings: dict[str, Any]) -> Any:
+    """نرخ کارمزدِ ماژول ریسک، همان‌طور که تنظیم شده.
+
+    صفرِ اعلام‌شده هزینه‌ی دانسته است؛ صفرِ پیش‌فرضِ پروژه یعنی
+    «نمی‌دانیم» (`FeeSchedule.rates_known`). بدون این تفکیک، هر دو
+    یک‌جور خوانده می‌شدند.
+    """
+    from risk.fees import FeeSchedule
+
+    config = section(settings, "risk").get("fees") or {}
+    known = {f.name for f in fields(FeeSchedule)}
+    return FeeSchedule(**{k: v for k, v in config.items() if k in known})
+
+
+def _build_ranking(
+    settings: dict[str, Any], signals: list[Signal], screening: dict[str, Any]
+) -> dict[str, Any]:
+    """رتبه‌بندیِ همین پاس، از رکوردهای غربال و خودِ سیگنال‌ها.
+
+    داده‌ی قرارداد (استرایک، پرمیوم، قیمت پایه) روی `Signal` است و
+    نتیجه‌ی غربال روی `ScreeningRecord`؛ با نماد به هم وصل می‌شوند.
+    """
+    config = section(settings, "ranking")
+    if not config.get("enabled", True):
+        return {"enabled": False, "reason": "رتبه‌بندی در تنظیمات خاموش است."}
+
+    from market.opportunity_ranking import rank_opportunities
+    from market.tradability import Thresholds, Verdict
+
+    records = screening.get("_records") or []
+    if not records:
+        return {
+            "enabled": True,
+            "ranked": [],
+            "excluded": [],
+            "reason": (
+                "غربالی اجرا نشد یا هیچ گزینه‌ای ارزیابی نشد؛ چیزی برای "
+                "رتبه‌بندی نیست."
+            ),
+        }
+
+    # ⚠️ با **شناسه‌ی سیگنال** وصل می‌شوند، نه با نماد: روی یک نماد
+    # می‌تواند چند سیگنال از چند استراتژی، با سمت و تعدادِ متفاوت، در
+    # یک پاس باشد و وصل‌کردن با نماد عددهای بی‌ربط را قاطی می‌کند.
+    by_signal_id = {s.signal_id: s for s in signals}
+    thresholds_config = section(settings, "tradability")
+    known_thresholds = {f.name for f in fields(Thresholds)}
+    thresholds = Thresholds(**{
+        k: v for k, v in thresholds_config.items() if k in known_thresholds
+    })
+
+    fees = _fee_schedule(settings)
+    candidates: list[dict[str, Any]] = []
+    unpublished: list[dict[str, str]] = []
+    for record in records:
+        signal = by_signal_id.get(record.signal_id) if record.signal_id else None
+        if signal is None:
+            if record.report.verdict is not Verdict.TRADABLE:
+                # ردشده و نیازمند بررسی اصلاً منتشر نمی‌شوند؛ ولی حکم و
+                # علتشان باید در کنارگذاشته‌ها بماند. بدون سیگنال هم
+                # همه‌ی چیزی که برای گفتنِ «چرا» لازم است روی خودِ رکورد
+                # هست، پس با گزارش کامل به رتبه‌بندی می‌روند.
+                candidates.append(_ranking_candidate(record, None, fees))
+                continue
+            # از غربال گذشت ولی منتشر نشد — مثلاً تکراریِ بازه‌ی ضدتکرار.
+            # بدون خودِ سیگنال، استرایک و قیمت در دست نیست و رتبه‌دادن
+            # یعنی امتیازی که کاربر نمی‌تواند اجرایش کند.
+            unpublished.append({
+                "symbol": record.symbol,
+                "strategy": record.strategy,
+                "reason": (
+                    "از غربال گذشت ولی سیگنالش منتشر نشد (تکراری در بازه‌ی "
+                    "ضدتکرار، یا پایه‌ی ساختاری که کنار رفت)."
+                ),
+            })
+            continue
+        candidates.append(_ranking_candidate(record, signal, fees))
+
+    result = rank_opportunities(
+        candidates=candidates,
+        thresholds=thresholds,
+        weights=_ranking_weights(settings),
+        evaluated_at=datetime.now(),
+    )
+    payload = result.to_dict()
+    # کنارگذاشته‌های این لایه هم باید دیده شوند، نه اینکه بی‌صدا گم شوند.
+    payload["excluded"] = [
+        *payload["excluded"],
+        # همان شکلِ ردیف‌های رتبه‌بندی، تا مصرف‌کننده‌ی پاسخ کلیدِ
+        # جاافتاده نبیند.
+        *(
+            {**row, "verdict": "tradable", "code": "not_published"}
+            for row in unpublished
+        ),
+    ]
+    return {"enabled": True, **payload}
 
 
 def _history_state(screener: Any | None) -> dict[str, Any]:
@@ -404,6 +553,205 @@ def update_tradability(update: TradabilityUpdate) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="هیچ مقداری برای تغییر داده نشد.")
     _patch_settings({"tradability": patch})
     return {"ok": True, "applied": patch}
+
+
+# ----------------------------------------------------------------------
+# رتبه‌بندی اولویت بررسی
+# ----------------------------------------------------------------------
+#: واحد و توضیح هر تنظیم رتبه‌بندی — رابط از همین می‌خواند.
+RANKING_FIELDS: tuple[dict[str, Any], ...] = (
+    {"key": "weight_round_trip_cost", "label": "وزن هزینه‌ی رفت‌وبرگشت",
+     "unit": "٪ از پرمیومِ پرداختی (ورود تا خروج)", "step": 5},
+    {"key": "weight_exit_capacity", "label": "وزن ظرفیت خروج",
+     "unit": "عمقِ درونِ محدوده‌ی قیمتی، برابرِ سفارش", "step": 5},
+    {"key": "weight_time_to_expiry", "label": "وزن فاصله تا سررسید",
+     "unit": "روز تا سررسید", "step": 5},
+    {"key": "weight_required_move", "label": "وزن حرکت لازم تا سر‌به‌سر",
+     "unit": "٪ حرکت پایه", "step": 5},
+    {"key": "weight_fee_cost", "label": "وزن سهم کارمزد",
+     "unit": "٪ از سرمایه‌ی درگیر", "step": 5},
+    {"key": "depth_comfort_multiple", "label": "عمقِ «راحت»",
+     "unit": "برابرِ حداقلِ غربال", "step": 0.5},
+    {"key": "days_to_expiry_comfort", "label": "سررسیدِ «راحت»",
+     "unit": "روز", "step": 5},
+    {"key": "max_required_move_pct", "label": "سقف حرکت لازم",
+     "unit": "٪ حرکت پایه", "step": 5},
+    {"key": "max_round_trip_cost_pct", "label": "سقف هزینه‌ی رفت‌وبرگشت",
+     "unit": "٪ از پرمیومِ پرداختی", "step": 5},
+    {"key": "max_fee_cost_pct", "label": "سقف سهم کارمزد",
+     "unit": "٪ از سرمایه‌ی درگیر", "step": 1},
+)
+
+
+class RankingUpdate(BaseModel):
+    """ویرایش تنظیمات رتبه‌بندی. هر فیلد اختیاری است."""
+
+    enabled: bool | None = None
+    weight_round_trip_cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_exit_capacity: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_time_to_expiry: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_required_move: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    weight_fee_cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    depth_comfort_multiple: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    days_to_expiry_comfort: int | None = Field(default=None, ge=0)
+    max_required_move_pct: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    max_round_trip_cost_pct: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
+    max_fee_cost_pct: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+
+@app.get("/api/ranking")
+def get_ranking_settings() -> dict[str, Any]:
+    """تنظیمات رتبه‌بندی، همراه واحد و هشدارِ فرض‌بودنِ وزن‌ها."""
+    config = section(_settings(), "ranking")
+    return {
+        "settings": config,
+        "fields": list(RANKING_FIELDS),
+        "note": (
+            "خروجی «امتیاز اولویت بررسی» است — نه احتمال برد، نه بازده مورد "
+            "انتظار و نه توصیه‌ی خرید. وزن‌ها فرضِ اولیه‌اند و هیچ پژوهشی "
+            "پشتشان نیست. رتبه با امتیازِ محافظه‌کارانه چیده می‌شود: مؤلفه‌ی "
+            "نامعلوم صفر حساب می‌شود تا نبودِ داده کسی را بالا نبرد."
+        ),
+    }
+
+
+@app.put("/api/ranking")
+def update_ranking_settings(update: RankingUpdate) -> dict[str, Any]:
+    """ویرایش تنظیمات رتبه‌بندی؛ از ارزیابیِ بعدی اعمال می‌شود."""
+    patch = {k: v for k, v in update.model_dump().items() if v is not None}
+    if not patch:
+        raise HTTPException(status_code=400, detail="هیچ مقداری برای تغییر داده نشد.")
+    _patch_settings({"ranking": patch})
+    return {"ok": True, "applied": patch}
+
+
+@app.get("/api/ranking/demo")
+def get_ranking_demo() -> dict[str, Any]:
+    """نمونه‌ی **آزمایشی** با دادهٔ ساختگی، برای دیدنِ شکلِ خروجی.
+
+    ⚠️ این داده بازار نیست و هیچ‌وقت با دادهٔ واقعی مخلوط نمی‌شود:
+    مسیرش جداست، `demo` را `true` برمی‌گرداند و رابط بالای فهرست
+    برچسب می‌زند. لازم است چون تا وقتی تاریخچه‌ی recorder ساخته نشده،
+    خروجیِ واقعی به‌درستی خالی است و کاربر شکلِ توضیح‌ها را نمی‌بیند.
+    """
+    from datetime import timedelta
+
+    from data.order_book import BookLevel, OrderBook
+    from market.opportunity_ranking import rank_opportunities
+    from market.tradability import (
+        HistoryStats,
+        LiquidityObservation,
+        Thresholds,
+        evaluate,
+    )
+    from risk.fees import FeeSchedule
+
+    now = datetime.now()
+    thresholds = Thresholds()
+    healthy = HistoryStats(
+        sessions=20, sessions_with_trades=18, sessions_with_both_quotes=20,
+        known=True, sessions_verified=True,
+    )
+    quantity = 10
+    contract_size = 1_000
+    strike = 10_000.0
+    spot = 10_500.0
+    #: نرخِ **اعلام‌شده**ی نمونه: ۰٫۲۵٪ هر سمت. مبلغش را خودِ رتبه‌بندی
+    #: از قیمتِ اجراییِ همان سمت حساب می‌کند، نه از پرمیومِ پیشنهادی.
+    demo_fees = FeeSchedule(buy_rate=0.0025, sell_rate=0.0025, declared=True)
+
+    def observation(symbol: str, bids: list[tuple[float, int]],
+                    asks: list[tuple[float, int]]) -> LiquidityObservation:
+        """مشاهده را از یک دفترِ **واقعی** می‌سازد.
+
+        همه‌ی عددها از همین دفتر در می‌آیند، پس قیمتِ ورود، قیمتِ خروج،
+        عمق و ارزش موقعیت نمی‌توانند با هم ناسازگار باشند — برچسبِ
+        آزمایشی جای سازگاریِ عددها را نمی‌گیرد.
+        """
+        book = OrderBook(
+            symbol,
+            bids=tuple(BookLevel(p, q) for p, q in bids),
+            asks=tuple(BookLevel(p, q) for p, q in asks),
+        )
+        exit_price, exit_filled = book.fill_price("sell", quantity)
+        entry_price, entry_filled = book.fill_price("buy", quantity)
+        return LiquidityObservation(
+            symbol=symbol, position_side="buy", quantity=quantity, observed_at=now,
+            bid=book.best_bid, ask=book.best_ask,
+            exit_depth_contracts=book.real_depth("sell"),
+            exit_depth_within_band_contracts=book.depth_within(
+                "sell", thresholds.max_exit_slippage_pct
+            ),
+            exit_fill_price=exit_price if exit_filled >= quantity else None,
+            entry_fill_price=entry_price if entry_filled >= quantity else None,
+            # عمقِ سمت ورود از همان دفتر: «کم بود» را از «ندیدیم» جدا
+            # می‌کند وقتی ورود پر نمی‌شود.
+            entry_depth_contracts=book.real_depth("buy"),
+            best_exit_price=book.best_bid,
+            open_interest=500, trades_today=40, days_to_expiry=45,
+            quote_age_seconds=5.0,
+        )
+
+    def candidate(obs: LiquidityObservation, **kwargs: Any) -> dict[str, Any]:
+        entry = obs.entry_fill_price or 0.0
+        data: dict[str, Any] = {
+            "report": evaluate(obs, healthy, thresholds),
+            "symbol": obs.symbol, "strategy": "نمونه‌ی آزمایشی",
+            "side": "buy", "quantity": quantity, "leg_group_id": None,
+            "option_type": "call", "strike": strike, "contract_size": contract_size,
+            "underlying_price": spot,
+            # حد ضررِ ۳۵٪ روی **قیمتِ اجراییِ ورودِ همین دفتر**؛ مبلغ زیانش
+            # را رتبه‌بندی از همان مبنا می‌سازد، پس عددها با هم می‌خوانند.
+            "stop_loss_price": round(entry * 0.65, 1) or None,
+            "fees": demo_fees,
+        }
+        data.update(kwargs)
+        return data
+
+    result = rank_opportunities(
+        candidates=[
+            # نقدشونده و تنگ؛ عمقِ دور عمداً هست تا دیده شود که شمرده نمی‌شود.
+            candidate(observation(
+                "نمونه‌الف",
+                bids=[(995.0, 200), (700.0, 1_000)],
+                asks=[(1_005.0, 200)],
+            )),
+            # اسپرد بازتر و عمقِ کم‌تر
+            candidate(observation(
+                "نمونه‌ب", bids=[(950.0, 15)], asks=[(1_050.0, 15)],
+            )),
+            # نرخ کارمزد اعلام نشده → مؤلفه‌اش نامعلوم، نه صفر.
+            candidate(
+                observation("نمونه‌پ", bids=[(980.0, 100)], asks=[(1_020.0, 100)]),
+                fees=None,
+            ),
+            # ورودِ اجراناپذیر: عمقِ خرید ۱ قرارداد برای سفارشِ ۱۰ تایی.
+            # از غربال می‌گذرد (عمقِ خروج دارد) ولی رتبه نمی‌گیرد.
+            candidate(observation(
+                "نمونه‌چ", bids=[(980.0, 100)], asks=[(1_020.0, 1)],
+            )),
+            # ردشده‌ی غربال: اسپرد ۱۰۰٪
+            candidate(observation(
+                "نمونه‌ت", bids=[(500.0, 100)], asks=[(1_500.0, 100)],
+            )),
+            # خارج از دامنه‌ی نسخه‌ی اول
+            candidate(
+                observation("نمونه‌ث", bids=[(980.0, 100)], asks=[(1_020.0, 100)]),
+                leg_group_id="grp-نمونه",
+            ),
+            candidate(
+                observation("نمونه‌ج", bids=[(980.0, 100)], asks=[(1_020.0, 100)]),
+                side="sell",
+            ),
+        ],
+        thresholds=thresholds,
+        weights=_ranking_weights(_settings()),
+        evaluated_at=now - timedelta(seconds=1),
+        demo=True,
+    )
+    return {"enabled": True, **result.to_dict()}
 
 
 # ----------------------------------------------------------------------

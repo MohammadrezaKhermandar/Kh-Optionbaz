@@ -105,7 +105,8 @@ class TradabilityScreener:
             )
 
         exit_side = "sell" if position_side.lower() == "buy" else "buy"
-        book_data = self._exit_book(contract, exit_side, quantity)
+        entry_side = "buy" if exit_side == "sell" else "sell"
+        book_data = self._exit_book(contract, exit_side, quantity, entry_side)
         # مظنه‌ی دفترِ چندسطحی تازه‌تر از زنجیره است؛ اگر بود، همان.
         bid = book_data["bid"] if book_data["bid"] is not None else getattr(
             contract, "bid", None
@@ -124,6 +125,9 @@ class TradabilityScreener:
             exit_depth_contracts=book_data["depth"],
             exit_fill_price=book_data["fill_price"],
             best_exit_price=book_data["best_exit"],
+            entry_fill_price=book_data["entry_fill_price"],
+            entry_depth_contracts=book_data["entry_depth"],
+            exit_depth_within_band_contracts=book_data["depth_in_band"],
             open_interest=getattr(contract, "open_interest", None),
             trades_today=self._trades_today(contract),
             days_to_expiry=self._days_to_expiry(contract, moment),
@@ -135,18 +139,25 @@ class TradabilityScreener:
             source_time=self._source_time(contract),
         )
 
-    def _exit_book(self, contract: Any, exit_side: str, quantity: int) -> dict[str, Any]:
-        """ظرفیت و قیمتِ سمت خروج.
+    def _exit_book(
+        self, contract: Any, exit_side: str, quantity: int, entry_side: str
+    ) -> dict[str, Any]:
+        """ظرفیت و قیمتِ **هر دو سمت** برای همین اندازه‌ی سفارش.
 
-        سه عدد که با هم معنا دارند:
-
-        * `depth` — عمقِ **کل** آن سمت. عمداً به اندازه‌ی سفارش بریده
+        * `depth` — عمقِ **کل** سمت خروج. عمداً به اندازه‌ی سفارش بریده
           نمی‌شود (اشکالِ نسخه‌ی قبل، که نسبت را هرگز بالای ۱ نمی‌برد).
-        * `fill_price` — میانگین وزنیِ پرشدنِ **همین** سفارش.
-        * `best_exit` — بهترین مظنه‌ی همان سمت.
+        * `entry_depth` — عمقِ **کل** سمت ورود. وقتی ورود پر نمی‌شود،
+          همین عدد است که «عمق کم بود» را از «دفتری ندیدیم» جدا
+          می‌کند؛ بدون آن هر دو یک‌جور `None` می‌شدند.
+        * `depth_in_band` — همان عمق، ولی فقط سطوحی که تا آستانه‌ی لغزش
+          از بهترین مظنه فاصله دارند. حجمِ قیمت‌های دور حاشیه‌ی امن
+          نیست.
+        * `fill_price` / `entry_fill_price` — میانگین وزنیِ پرشدنِ
+          **همین** سفارش در سمت خروج و ورود. داشتنِ هر دو لازم است تا
+          هزینه‌ی رفت‌وبرگشت از قیمتِ اجراپذیر بیاید، نه از نصفِ اسپرد.
+        * `best_exit` — بهترین مظنه‌ی سمت خروج.
 
-        اختلاف دو عددِ آخر همان لغزش است: عمقی که فقط در قیمت‌های دور
-        وجود دارد، سفارش را پر می‌کند ولی «ظرفیت خروج» نیست.
+        اختلاف `fill_price` و `best_exit` همان لغزش است.
         """
         ins_code = getattr(contract, "ins_code", "")
         if self.order_book_client is not None and ins_code:
@@ -156,14 +167,23 @@ class TradabilityScreener:
                 logger.warning("دفتر سفارش %s خوانده نشد: %s", contract.symbol, exc)
                 book = None
             if book is not None:
-                fill_price, filled = book.fill_price(exit_side, max(quantity, 1))
+                needed = max(quantity, 1)
+                fill_price, filled = book.fill_price(exit_side, needed)
+                entry_price, entry_filled = book.fill_price(entry_side, needed)
                 best_exit = book.best_bid if exit_side == "sell" else book.best_ask
                 return {
                     "depth": int(book.real_depth(exit_side)),
+                    # عمقِ سمت ورود: تنها چیزی که «کم است» را از
+                    # «نمی‌دانیم» جدا می‌کند وقتی سفارش پر نمی‌شود.
+                    "entry_depth": int(book.real_depth(entry_side)),
                     # قیمتِ پرشدن فقط وقتی معنا دارد که سفارش **کامل** پر
                     # شود؛ میانگینِ یک پرشدنِ ناقص، لغزشِ واقعی را
-                    # کم‌برآورد می‌کند.
-                    "fill_price": fill_price if filled >= max(quantity, 1) else None,
+                    # کم‌برآورد می‌کند. همین قاعده برای سمت ورود هم هست.
+                    "fill_price": fill_price if filled >= needed else None,
+                    "entry_fill_price": entry_price if entry_filled >= needed else None,
+                    "depth_in_band": book.depth_within(
+                        exit_side, self.thresholds.max_exit_slippage_pct
+                    ),
                     "best_exit": best_exit,
                     "bid": book.best_bid,
                     "ask": book.best_ask,
@@ -177,10 +197,21 @@ class TradabilityScreener:
             contract, "bid_quantity" if exit_side == "sell" else "ask_quantity", None
         )
         best_exit = getattr(contract, "bid" if exit_side == "sell" else "ask", None)
-        fits = level_one is not None and level_one >= max(quantity, 1)
+        entry_level_one = getattr(
+            contract, "ask_quantity" if entry_side == "buy" else "bid_quantity", None
+        )
+        best_entry = getattr(contract, "ask" if entry_side == "buy" else "bid", None)
+        needed = max(quantity, 1)
+        fits = level_one is not None and level_one >= needed
+        entry_fits = entry_level_one is not None and entry_level_one >= needed
         return {
             "depth": None if level_one is None else int(level_one),
+            "entry_depth": None if entry_level_one is None else int(entry_level_one),
             "fill_price": best_exit if fits else None,
+            "entry_fill_price": best_entry if entry_fits else None,
+            # تک‌سطحی است: همان سطح، اگر اصلاً سطحی باشد. فاصله‌اش از
+            # بهترین مظنه صفر است، پس کلِ آن در محدوده می‌نشیند.
+            "depth_in_band": None if level_one is None else int(level_one),
             "best_exit": best_exit,
             "bid": getattr(contract, "bid", None),
             "ask": getattr(contract, "ask", None),

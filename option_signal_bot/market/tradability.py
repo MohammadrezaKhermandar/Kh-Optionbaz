@@ -59,6 +59,24 @@ VERDICT_LABELS: dict[Verdict, str] = {
 }
 
 
+class EntryStatus(str, Enum):
+    """اجراپذیریِ **سمتِ ورود** برای همین اندازه‌ی سفارش.
+
+    سه حالت، چون دو تای آخر یک چیز نیستند و درمانشان هم یکی نیست:
+
+    * `EXECUTABLE` — سفارش با عمقِ موجود **کامل** پر می‌شود؛ قیمتِ
+      اجراییِ ورود در دست است و همه‌ی عددهای ریالی مبنا دارند.
+    * `SHORT_OF_DEPTH` — دفتر را دیده‌ایم و **قطعاً** کم است: کاربر
+      می‌تواند سفارش را کوچک‌تر کند.
+    * `UNKNOWN` — اصلاً دفتری نداریم؛ **ندانستن** است، نه کمبود. اینجا
+      کوچک‌کردنِ سفارش هم چیزی را حل نمی‌کند، باید داده آورد.
+    """
+
+    EXECUTABLE = "executable"
+    SHORT_OF_DEPTH = "short_of_depth"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class Check:
     """یک سنجه‌ی منفرد، با عددِ اندازه‌گیری‌شده و آستانه‌اش.
@@ -152,6 +170,18 @@ class LiquidityObservation:
     exit_fill_price: float | None = None
     #: بهترین قیمتِ سمت خروج (سطح اول)
     best_exit_price: float | None = None
+    #: میانگین وزنیِ قیمتی که سفارشِ **ورود** با آن پر می‌شود — همان
+    #: تعداد قرارداد. بدون این، هزینه‌ی رفت‌وبرگشت قابل محاسبه نیست و
+    #: نصفِ اسپرد جایش گذاشته می‌شد که هزینه‌ی رفت‌وبرگشت **نیست**.
+    entry_fill_price: float | None = None
+    #: عمقِ **کلِ** سمت ورود، به تعداد قرارداد. بودنِ این عدد در کنارِ
+    #: نبودنِ `entry_fill_price` یعنی دفتر را دیده‌ایم و عمقش کم بوده —
+    #: که با «دفتر را ندیده‌ایم» یکی نیست و نباید یک‌جور خوانده شود.
+    entry_depth_contracts: int | None = None
+    #: عمقِ سمت خروج که در محدوده‌ی قیمتیِ قابل قبول است. حجمی که فقط
+    #: در قیمت‌های دور هست حاشیه‌ی امنِ خروج نیست، پس اینجا شمرده
+    #: نمی‌شود. (دروازه‌ی غربال همچنان با عمقِ کل کار می‌کند.)
+    exit_depth_within_band_contracts: int | None = None
     open_interest: int | None = None
     trades_today: int | None = None
     days_to_expiry: int | None = None
@@ -210,6 +240,60 @@ class LiquidityObservation:
         else:
             drop = self.exit_fill_price - self.best_exit_price
         return max(drop / self.best_exit_price * 100.0, 0.0)
+
+    @property
+    def round_trip_cost_pct(self) -> float | None:
+        """هزینه‌ی قیمتیِ ورود و خروجِ **همین تعداد قرارداد**، درصد.
+
+        مخرج: قیمتِ اجراپذیرِ **ورود** (پرمیومی که واقعاً پرداخت
+        می‌شود). یعنی «اگر همین حالا وارد و بلافاصله خارج شوی، چند درصد
+        از پرمیومِ پرداختی از دست می‌رود».
+
+        این عدد **کلِ** اسپرد را در بر می‌گیرد به‌علاوه‌ی لغزشِ هر دو
+        سمت برای این حجم — نه نصفِ اسپرد، که هزینه‌ی رفت‌وبرگشت نیست.
+
+        `None` وقتی یکی از دو سمت برای این حجم اجراپذیر نیست؛ آن‌وقت
+        عددی ساخته نمی‌شود.
+        """
+        if not self.entry_fill_price or not self.exit_fill_price:
+            return None
+        if self.entry_fill_price <= 0:
+            return None
+        return max(
+            (self.entry_fill_price - self.exit_fill_price)
+            / self.entry_fill_price
+            * 100.0,
+            0.0,
+        )
+
+    @property
+    def entry_depth_ratio(self) -> float | None:
+        """عمقِ کلِ سمت ورود تقسیم بر اندازه‌ی سفارش."""
+        if self.entry_depth_contracts is None or self.quantity <= 0:
+            return None
+        return self.entry_depth_contracts / self.quantity
+
+    @property
+    def entry_status(self) -> EntryStatus:
+        """آیا **ورود** برای همین تعداد قرارداد اجراپذیر است؟
+
+        `entry_fill_price` فقط وقتی مقدار می‌گیرد که سفارش **کامل** پر
+        شود؛ پس بودنش یعنی اجراپذیر. اگر نیست، عمقِ دیده‌شده تعیین
+        می‌کند که «کم است» بگوییم یا «نمی‌دانیم» — و این دو با هم فرق
+        دارند، چون یکی با کوچک‌کردنِ سفارش حل می‌شود و دیگری نه.
+        """
+        if self.entry_fill_price:
+            return EntryStatus.EXECUTABLE
+        if self.entry_depth_contracts is None:
+            return EntryStatus.UNKNOWN
+        return EntryStatus.SHORT_OF_DEPTH
+
+    @property
+    def usable_exit_depth_ratio(self) -> float | None:
+        """عمقِ **درون محدوده‌ی قیمتی** تقسیم بر اندازه‌ی سفارش."""
+        if self.exit_depth_within_band_contracts is None or self.quantity <= 0:
+            return None
+        return self.exit_depth_within_band_contracts / self.quantity
 
     @property
     def source_time_known(self) -> bool:
@@ -445,6 +529,13 @@ class ScreeningRecord:
     report: TradabilityReport
     #: شناسه‌ی ساختار چندپایه، اگر پایه‌ی یک ساختار باشد
     leg_group_id: str | None = None
+    #: شناسه‌ی **همان** سیگنالی که غربال شد.
+    #:
+    #: نماد برای وصل‌کردنِ نتیجه به سیگنال کافی نیست: روی یک نماد
+    #: می‌تواند چند سیگنال از چند استراتژی، با سمت و تعدادِ متفاوت،
+    #: در یک پاس صادر شود. وصل‌کردن با نماد یعنی نتیجه‌ی غربالِ یکی به
+    #: دیگری بچسبد و عددهای بی‌ربط قاطی شوند.
+    signal_id: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -453,6 +544,7 @@ class ScreeningRecord:
             "side": self.side,
             "quantity": self.quantity,
             "leg_group_id": self.leg_group_id,
+            "signal_id": self.signal_id,
             "verdict": self.report.verdict.value,
             "verdict_label": self.report.verdict_label,
             "reason": self.report.reason,

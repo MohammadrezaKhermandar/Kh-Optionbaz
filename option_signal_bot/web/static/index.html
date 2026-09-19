@@ -82,6 +82,32 @@
       </div>
     </div>
 
+    <div class="card" id="ranking-card">
+      <h3>
+        رتبه‌بندی اولویت بررسی
+        <span class="count" id="ranking-state"></span>
+      </h3>
+      <p class="hint">
+        فقط گزینه‌هایی که از غربال <strong>گذشته‌اند</strong> رتبه می‌گیرند؛
+        امتیاز بالا جای نقدشوندگی را نمی‌گیرد. دامنهٔ نسخهٔ اول فقط
+        <strong>خریدِ اختیارِ تک‌پایه</strong> است — فروش و ساختارهای چندپایه
+        با فرمولِ خرید امتیاز نمی‌گیرند.
+        <br>
+        ⚠️ این عدد <strong>احتمال برد یا بازده مورد انتظار نیست</strong> —
+        فقط می‌گوید با دادهٔ موجود کدام فرصت ارزشِ بررسیِ دقیق‌تر دارد.
+        وزن‌ها <strong>فرضِ اولیه‌اند</strong>، نه نتیجهٔ پژوهش.
+        رتبه با امتیازِ <strong>محافظه‌کارانه</strong> چیده می‌شود: مؤلفهٔ
+        نامعلوم صفر حساب می‌شود تا نبودِ داده کسی را بالا نبرد.
+      </p>
+      <div class="params" id="ranking-fields"></div>
+      <div class="card-actions">
+        <button class="btn btn-primary" id="btn-save-ranking">ذخیره تنظیمات</button>
+        <button class="btn btn-ghost" id="btn-ranking-demo">نمایش نمونه (دادهٔ آزمایشی)</button>
+        <span class="note" id="ranking-note"></span>
+      </div>
+    </div>
+
+    <div id="ranking"></div>
     <div id="screening"></div>
     <div id="signals"><p class="empty">در حال بارگذاری…</p></div>
   </section>
