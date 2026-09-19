@@ -515,10 +515,10 @@ def test_shipped_config_decides_about_every_strategy():
 def test_only_the_executable_family_is_active_by_default():
     """فقط خریدِ اختیارِ تک‌پایه پیش‌فرض پیشنهاد می‌شود.
 
-    تصمیمِ `docs/strategy-selection.md`: خانواده‌های چندپایه و فروش‌دار
-    روی زنجیره‌ی واقعی اجراپذیر نیستند (سفارشِ ۱۰ قراردادی: تک‌پایه
-    ۱۸٪، استردل ۴٪). کدشان هست و با یک کلید برمی‌گردند — ولی پیش‌فرض
-    نیستند. اگر کسی این را عوض کند، باید سند را هم عوض کند.
+    تصمیمِ **موقتِ دامنه‌ی محصول** در `docs/strategy-selection.md`: با
+    نقدشوندگیِ مشاهده‌شده و محدودیتِ شبیه‌ساز، فعلاً فقط همین یک
+    خانواده پیشنهادِ فعال می‌دهد. کدِ بقیه هست و با یک کلید برمی‌گردد.
+    اگر کسی این پیش‌فرض را عوض کند، باید سند را هم عوض کند.
     """
     defaults = default_settings()["strategies"]
     active = [n for n, entry in defaults.items() if (entry or {}).get("enabled")]

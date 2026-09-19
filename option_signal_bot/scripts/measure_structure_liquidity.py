@@ -79,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"اسپرد نسبی — چارک اول {at(0.25):.1f}٪ · میانه {at(0.5):.1f}٪ "
               f"· چارک سوم {at(0.75):.1f}٪ · صدک ۹۰ {at(0.9):.1f}٪")
+        print("  (هر عدد نسبت به میانه‌ی مظنه‌ی **همان قرارداد** است. "
+              "درصدِ پایه‌ها با هم جمع نمی‌شود: هزینه‌ی یک ساختار یعنی "
+              "مجموع هزینه‌ی ریالیِ پایه‌ها ÷ مجموع پرمیومِ پرداختیِ آن‌ها.)")
 
     # جفت‌های کال/پوتِ هم‌استرایک (برای استردل) و استرایک‌های مجاور
     # (برای اسپرد عمودی).
@@ -95,7 +98,14 @@ def main(argv: list[str] | None = None) -> int:
         max(len([1 for s, legs in strikes if "call" in legs]) - 1, 0)
         for strikes in by_expiry.values()
     )
-    print(f"جفتِ کال/پوتِ هم‌استرایک: {len(by_strike)} · جفتِ عمودیِ مجاور: {adjacent}")
+    # ⚠️ مخرجِ استردل فقط استرایک‌هایی است که **هر دو پایه** را دارند.
+    # شمردنِ همه‌ی استرایک‌ها (حتی آن‌هایی که فقط کال یا فقط پوت دارند)
+    # مخرج را باد می‌کند و نسبت را کوچک‌تر از واقع نشان می‌دهد.
+    straddle_candidates = sum(
+        1 for legs in by_strike.values() if "call" in legs and "put" in legs
+    )
+    print(f"استرایک‌ها: {len(by_strike)} · با هر دو پایه (نامزدِ استردل): "
+          f"{straddle_candidates} · جفتِ عمودیِ مجاور: {adjacent}")
 
     print("\nاندازه | خریدِ تک‌پایه | ورود+خروجِ تک‌پایه | استردل (۲ پایه) | اسپرد عمودی")
     for size in SIZES:
@@ -128,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
                     vertical += 1
 
         total = len(contracts)
-        pairs = max(len(by_strike), 1)
+        pairs = max(straddle_candidates, 1)
         print(
             f"{size:>5} | {entry:>5} ({entry / total:>4.0%}) | "
             f"{round_trip:>6} ({round_trip / total:>4.0%}) | "
