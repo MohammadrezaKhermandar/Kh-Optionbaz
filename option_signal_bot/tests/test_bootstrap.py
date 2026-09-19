@@ -485,14 +485,45 @@ def test_a_complete_config_warns_about_nothing(caplog):
     assert "نیستند" not in caplog.text
 
 
-def test_shipped_config_enables_every_strategy():
-    """تنظیمات نمونه نباید هیچ استراتژی‌ای را جا بگذارد."""
+def test_shipped_config_decides_about_every_strategy():
+    """تنظیمات نمونه نباید هیچ استراتژی‌ای را جا بگذارد.
+
+    «نیامده» با «خاموش» یکی نیست: استراتژیِ نیامده بی‌صدا ساخته
+    نمی‌شود و کسی هم نمی‌فهمد چرا. پس هر استراتژیِ ثبت‌شده باید در
+    فهرستِ سفید **تصمیمِ صریح** داشته باشد.
+    """
     import yaml
 
     from config.loader import EXAMPLE_CONFIG_PATH
     from strategies.registry import available_strategies
 
     data = yaml.safe_load(EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8"))
-    configured = set(data.get("strategies") or {})
-    missing = set(available_strategies()) - configured
+    configured = data.get("strategies") or {}
+    missing = set(available_strategies()) - set(configured)
     assert not missing, f"در settings.example.yaml نیستند: {sorted(missing)}"
+
+    # و تصمیمِ فایل نمونه باید با پیش‌فرضِ کد یکی باشد، وگرنه اجرای
+    # با و بدون `settings.yaml` دو رفتار متفاوت می‌دهد.
+    shipped = {n for n, entry in configured.items() if (entry or {}).get("enabled")}
+    coded = {
+        n for n, entry in default_settings()["strategies"].items()
+        if (entry or {}).get("enabled")
+    }
+    assert shipped == coded
+
+
+def test_only_the_executable_family_is_active_by_default():
+    """فقط خریدِ اختیارِ تک‌پایه پیش‌فرض پیشنهاد می‌شود.
+
+    تصمیمِ `docs/strategy-selection.md`: خانواده‌های چندپایه و فروش‌دار
+    روی زنجیره‌ی واقعی اجراپذیر نیستند (سفارشِ ۱۰ قراردادی: تک‌پایه
+    ۱۸٪، استردل ۴٪). کدشان هست و با یک کلید برمی‌گردند — ولی پیش‌فرض
+    نیستند. اگر کسی این را عوض کند، باید سند را هم عوض کند.
+    """
+    defaults = default_settings()["strategies"]
+    active = [n for n, entry in defaults.items() if (entry or {}).get("enabled")]
+
+    assert active == ["directional_ma_cross"]
+    assert set(defaults) == set(available_strategies()), (
+        "هر استراتژیِ ثبت‌شده باید در پیش‌فرض‌ها تصمیمِ صریح داشته باشد"
+    )
