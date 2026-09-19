@@ -44,6 +44,12 @@ def client(tmp_path, monkeypatch):
     data["option_chain"]["fixture_path"] = str(fixture)
     # تقویم هم نباید از شبکه یاد بگیرد
     data.setdefault("trading_calendar", {})["learn_from_market"] = False
+    # تحلیل وضعیت هم: شاخص از نمونه‌ی ضبط‌شده خوانده شود و رویدادهای
+    # شرکتی پرسیده نشوند — هر دو درخواستِ شبکه‌اند.
+    data.setdefault("regime", {})["index_history_dir"] = str(
+        Path(__file__).parent / "fixtures" / "index"
+    )
+    data["regime"]["corporate_actions"] = False
     # ⚠️ بدون این، `sqlite_path` نمونه به `var/paper_trading.db` **واقعی**
     # اشاره می‌کند و اجرای تست‌ها حساب کاغذیِ خودِ کاربر را ریست می‌کند.
     data.setdefault("paper_trading", {})["sqlite_path"] = str(tmp_path / "paper_trading.db")
@@ -1133,3 +1139,47 @@ def test_a_price_that_moved_past_the_tolerance_voids_the_confirmation():
         _reject_if_price_moved(1_000.0, 1_010.0, 0.5)  # ۱٪ — رد
     assert excinfo.value.status_code == 409
     assert "جابه‌جا" in excinfo.value.detail
+
+
+# ----------------------------------------------------------------------
+# وضعیت بازار و نماد پایه
+# ----------------------------------------------------------------------
+def test_regime_reports_market_and_underlyings_separately(client):
+    """بازار و سهم دو چیزند و جداگانه گزارش می‌شوند."""
+    body = client.get("/api/regime?underlyings=خودرو").json()
+
+    assert body["enabled"] is True
+    assert body["market"]["subject_kind"] == "market"
+    assert body["market"]["state"] in {"up", "down", "range", "unknown"}
+    assert body["market"]["reasons"], "حکم بدون دلیل به درد نمی‌خورد"
+    assert "خودرو" in body["underlyings"]
+    assert body["underlyings"]["خودرو"]["subject_kind"] == "underlying"
+
+
+def test_regime_says_it_is_not_a_prediction(client):
+    """این تشخیصِ وضعیتِ فعلی است؛ اگر جای دیگری جور دیگری خوانده شود،
+    کاربر آن را پیش‌بینی می‌فهمد."""
+    body = client.get("/api/regime").json()
+
+    assert "پیش‌بینی" in body["note"]
+    assert "پیش‌بینی" in body["market"]["note"]
+
+
+def test_regime_reports_an_unknown_adjustment_instead_of_assuming_none(client):
+    """وقتی رویدادهای شرکتی پرسیده نشده‌اند، «تعدیل نشده» ادعا نمی‌شود."""
+    body = client.get("/api/regime?underlyings=خودرو").json()
+
+    report = body["underlyings"]["خودرو"]
+    assert report["adjustment"] == "unknown"
+    assert "نامعلوم" in report["adjustment_note"]
+
+
+def test_a_scan_carries_the_regime_without_letting_it_into_the_score(client):
+    """وضعیت کنارِ رتبه‌بندی می‌آید، ولی مؤلفه‌ی امتیاز نمی‌شود."""
+    ranking = client.post("/api/scan").json()["ranking"]
+
+    assert "regime" in ranking
+    assert ranking["regime"]["enabled"] is True
+    for row in ranking.get("ranked", []):
+        keys = {c["key"] for c in row["components"]}
+        assert "regime" not in keys and "fit" not in keys

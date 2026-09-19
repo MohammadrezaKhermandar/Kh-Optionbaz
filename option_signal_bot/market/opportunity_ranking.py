@@ -243,6 +243,12 @@ class RankedOpportunity:
     breakeven_basis: str
     observed_at: str
     verdict: str
+    #: شناسه‌ی همان سیگنالی که این فرصت از آن آمده.
+    #:
+    #: بدونش هیچ لایه‌ی بعدی‌ای نمی‌تواند ردیف را به سیگنالش وصل کند —
+    #: نه تحلیلِ تناسب، نه ارزیابیِ بعدی. نماد کافی نیست: روی یک نماد
+    #: می‌تواند چند سیگنال باشد.
+    signal_id: str | None = None
 
     @property
     def total_weight(self) -> float:
@@ -324,6 +330,7 @@ class RankedOpportunity:
             "breakeven_basis": self.breakeven_basis,
             "observed_at": self.observed_at,
             "verdict": self.verdict,
+            "signal_id": self.signal_id,
             "components": [c.to_dict() for c in self.components],
             "strengths": [c.label for c in self.strengths],
             "weakness": None if weakness is None else {
@@ -764,6 +771,7 @@ def rank_opportunity(
     underlying_price: float | None,
     stop_loss_price: float | None,
     fees: FeeSchedule | None,
+    signal_id: str | None = None,
 ) -> RankedOpportunity:
     """امتیازِ یک **خریدِ اختیارِ تک‌پایه**، با همه‌ی مؤلفه‌ها و دلایلشان.
 
@@ -883,6 +891,7 @@ def rank_opportunity(
         breakeven_basis=breakeven_basis,
         observed_at=observation.observed_at.isoformat(timespec="seconds"),
         verdict=report.verdict.value,
+        signal_id=signal_id,
     )
 
 
@@ -975,6 +984,7 @@ def rank_opportunities(
             underlying_price=candidate.get("underlying_price"),  # type: ignore[arg-type]
             stop_loss_price=candidate.get("stop_loss_price"),  # type: ignore[arg-type]
             fees=candidate.get("fees"),  # type: ignore[arg-type]
+            signal_id=candidate.get("signal_id"),  # type: ignore[arg-type]
         ))
 
     # چیدنِ رتبه با امتیازِ **محافظه‌کارانه**: نامعلوم هیچ‌وقت بالا نمی‌برد.
