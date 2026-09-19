@@ -85,6 +85,14 @@ strategies:
   # ⚠️ این بخش یک **فهرست سفید** است: هر استراتژی که اینجا نباشد اصلاً
   # ساخته نمی‌شود. قبلاً فقط دو تا اینجا بودند و collar/long_straddle
   # بی‌صدا اجرا نمی‌شدند — بدون هیچ خطا یا هشداری.
+  #
+  # ⚠️ فقط **خریدِ اختیارِ تک‌پایه** پیش‌فرض روشن است. سه خانواده‌ی دیگر
+  # خاموش‌اند چون روی زنجیره‌ی واقعی اجراپذیر نیستند، نه چون بد
+  # مدل‌سازی شده‌اند: روی سفارشِ ۱۰ قراردادی، تک‌پایه ۱۸٪ رفت‌وبرگشتِ
+  # اجراپذیر دارد و استردل ۴٪ (اندازه‌گیری ۲۰۲۶-۰۹-۱۹،
+  # `scripts/measure_structure_liquidity.py`). دلیل و شرطِ برگشتِ هر
+  # کدام در `docs/strategy-selection.md` نوشته شده. روشن‌کردنشان
+  # ممنوع نیست — فقط پیش‌فرض نیست.
   directional_ma_cross:
     enabled: true
     params:
@@ -97,8 +105,11 @@ strategies:
       min_days_to_expiry: 14
       max_days_to_expiry: 90
       min_open_interest: 50
+  # ⛔ خاموش: پایه‌ی **فروش** دارد (وجه تضمین مدل نشده) و ورودی‌اش IV
+  # است، که خطای مدلش در همین بازار سیستماتیک گزارش شده.
+  # docs/strategy-selection.md §۳ و §۴
   neutral_iv_spread:
-    enabled: true
+    enabled: false
     params:
       trend_window: 20
       # ⚠️ ۳٪ برای بورس تهران یعنی «هرگز»: انحراف واقعی از MA20 روی
@@ -115,8 +126,10 @@ strategies:
       enable_straddle: true
   # ساختار سه‌پایه: سهم + خرید پوت (کف) + فروش کال (سقف).
   # نیازمند داشتن سهم پایه است.
+  # ⛔ خاموش: سه پایه، با شرطِ مالکیتِ سهم و یک پایه‌ی فروش.
+  # docs/strategy-selection.md §۴
   collar:
-    enabled: true
+    enabled: false
     params:
       protection_pct: 0.10     # کف حفاظت، ۱۰٪ زیر قیمت
       cap_pct: 0.10            # سقف سود، ۱۰٪ بالای قیمت
@@ -127,8 +140,10 @@ strategies:
       max_relative_spread: 0.30
   # خرید همزمان کال و پوت هم‌استرایک — وقتی IV نسبت به نوسان
   # تاریخی ارزان است و انتظار حرکت بزرگ (در هر دو جهت) داریم.
+  # ⛔ خاموش: فقط ۴٪ از جفت‌های کال/پوتِ هم‌استرایک برای سفارشِ ۱۰
+  # قراردادی در هر دو سمت اجراپذیرند. docs/strategy-selection.md §۲
   long_straddle:
-    enabled: true
+    enabled: false
     params:
       max_iv_to_rv_ratio: 0.95
       rv_window: 30

@@ -70,7 +70,17 @@ def default_settings() -> dict[str, Any]:
             },
         },
         # خالی = همه استراتژی‌های ثبت‌شده با پارامترهای پیش‌فرض خودشان
-        "strategies": {},
+        # ⚠️ فهرستِ سفیدِ پیشنهادهای **فعال**. فقط خریدِ اختیارِ تک‌پایه
+        # روشن است؛ بقیه کد دارند ولی پیش‌فرض خاموش‌اند چون روی
+        # زنجیره‌ی واقعی اجراپذیر نیستند (سفارشِ ۱۰ قراردادی: تک‌پایه
+        # ۱۸٪، استردل ۴٪). دلیل، عددها و شرطِ برگشت:
+        # `docs/strategy-selection.md`.
+        "strategies": {
+            "directional_ma_cross": {"enabled": True},
+            "neutral_iv_spread": {"enabled": False},
+            "collar": {"enabled": False},
+            "long_straddle": {"enabled": False},
+        },
         "notifiers": {
             "console": {"enabled": True, "as_json": False},
             "telegram": {
