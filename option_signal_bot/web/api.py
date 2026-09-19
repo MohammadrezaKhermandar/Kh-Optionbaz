@@ -103,8 +103,11 @@ def _signal_log(settings: dict[str, Any]) -> SignalLog:
     )
 
 
-def _paper_broker(settings: dict[str, Any]):
+def _paper_broker(settings: dict[str, Any], sandbox: bool = False):
     """می‌سازد `PaperBroker` را با اجزای واقعی (عمق مظنه، زنجیره آپشن).
+
+    با `sandbox=True` همان کارگزار روی دادهٔ نمونه و پایگاهِ جدا ساخته
+    می‌شود؛ هیچ‌کدام از دو مسیر پایگاه یا مظنه‌ی دیگری را نمی‌بینند.
 
     این تنها جای مجاز import کردن `execution` خارج از خودِ آن پوشه است
     (تصمیم صریح کاربر، تست گارد `test_only_execution_layer_imports_execution`
@@ -115,6 +118,9 @@ def _paper_broker(settings: dict[str, Any]):
     from execution.paper_broker import PaperBroker
     from risk.fees import FeeSchedule
     from storage.paper_trading_store import PaperTradingStore
+
+    if sandbox:
+        return _sandbox_broker(settings)
 
     config = section(settings, "paper_trading")
     store = PaperTradingStore(resolve_path(config.get("sqlite_path", "var/paper_trading.db")))
@@ -147,7 +153,54 @@ def _paper_broker(settings: dict[str, Any]):
     ), context
 
 
-def _require_paper_trading_enabled(settings: dict[str, Any]) -> None:
+class _NullContext:
+    """جای `AppContext` در مسیر آزمایشی — چیزی برای بستن نیست.
+
+    مسیر آزمایشی هیچ کلاینت شبکه‌ای نمی‌سازد، ولی فراخواننده‌ها همه
+    `context.close()` را صدا می‌زنند؛ همین یک متد کافی است تا دو مسیر
+    شکلِ یکسانی داشته باشند.
+    """
+
+    def close(self) -> None:
+        return None
+
+
+def _sandbox_broker(settings: dict[str, Any]):
+    """`PaperBroker` روی دادهٔ نمونه و **پایگاهِ جدا**.
+
+    هیچ‌چیزِ این مسیر از تنظیماتِ حساب واقعی نمی‌آید جز مسیر پایگاه
+    (که خودش هم پیش‌فرضِ جداگانه دارد): موجودی و نرخ کارمزد ثابت و
+    **اعلام‌شده**‌اند تا عددهای تمرین کامل باشند و کاربر با تغییر
+    تنظیماتِ واقعی، نتیجه‌ی تمرین را عوض نکند — و برعکس.
+    """
+    from execution.paper_broker import PaperBroker
+    from market import sandbox
+    from risk.fees import FeeSchedule
+    from storage.paper_trading_store import PaperTradingStore
+
+    config = section(settings, "paper_trading")
+    store = PaperTradingStore(
+        resolve_path(config.get("sandbox_sqlite_path", "var/paper_trading_sandbox.db"))
+    )
+    return PaperBroker(
+        store=store,
+        order_book_client=sandbox.SandboxOrderBookClient(),
+        resolve_contract=sandbox.resolve_contract,
+        initial_balance=sandbox.SANDBOX_INITIAL_BALANCE,
+        fees=FeeSchedule(
+            buy_rate=sandbox.SANDBOX_FEE_RATE,
+            sell_rate=sandbox.SANDBOX_FEE_RATE,
+            declared=True,
+        ),
+    ), _NullContext()
+
+
+def _require_paper_trading_enabled(settings: dict[str, Any], sandbox: bool = False) -> None:
+    # مسیر آزمایشی عمداً به کلیدِ حساب واقعی گره نمی‌خورد: کسی که هنوز
+    # معاملات کاغذی را روشن نکرده، دقیقاً همان کسی است که می‌خواهد اول
+    # جریان را یک‌بار تمرین کند.
+    if sandbox:
+        return
     if not section(settings, "paper_trading").get("enabled"):
         raise HTTPException(
             status_code=400,
@@ -186,6 +239,30 @@ def _reject_multi_leg(strategy_name: str) -> None:
                 "خودِ ساختار دارد."
             ),
         )
+
+
+def _entry_decisions(broker: Any) -> dict[str, dict[str, Any]]:
+    """آخرین «عکسِ تصمیم» برای هر نماد، از سفارش‌های خریدِ پرشده.
+
+    روی خودِ موقعیت ستونی برایش نیست و ساختنِ ستونِ تازه هم لازم نبود:
+    سفارشِ ورود همان‌جاست و `metadata` دارد.
+    """
+    decisions: dict[str, dict[str, Any]] = {}
+    for order in broker.store.list_orders(limit=200):
+        if order.get("side") != "buy" or order.get("status") != "filled":
+            continue
+        symbol = order.get("symbol")
+        if symbol in decisions:
+            continue  # فهرست از جدید به قدیم است؛ اولی تازه‌ترین است
+        metadata = order.get("metadata")
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = None
+        if isinstance(metadata, dict) and metadata.get("decision"):
+            decisions[symbol] = metadata["decision"]
+    return decisions
 
 
 def _serialize_order(order: Any) -> dict[str, Any]:
@@ -628,130 +705,83 @@ def update_ranking_settings(update: RankingUpdate) -> dict[str, Any]:
 
 
 @app.get("/api/ranking/demo")
-def get_ranking_demo() -> dict[str, Any]:
-    """نمونه‌ی **آزمایشی** با دادهٔ ساختگی، برای دیدنِ شکلِ خروجی.
+def get_ranking_demo(quantity: int = 10) -> dict[str, Any]:
+    """فرصت‌های **مسیر آزمایشی** — همان دیتاستی که می‌شود رویش معامله کرد.
 
-    ⚠️ این داده بازار نیست و هیچ‌وقت با دادهٔ واقعی مخلوط نمی‌شود:
-    مسیرش جداست، `demo` را `true` برمی‌گرداند و رابط بالای فهرست
+    ⚠️ این داده بازار نیست و هیچ‌وقت با دادهٔ واقعی مخلوط نمی‌شود: مسیرش
+    جداست، `demo`/`sandbox` را `true` برمی‌گرداند و رابط بالای فهرست
     برچسب می‌زند. لازم است چون تا وقتی تاریخچه‌ی recorder ساخته نشده،
-    خروجیِ واقعی به‌درستی خالی است و کاربر شکلِ توضیح‌ها را نمی‌بیند.
+    خروجیِ واقعی به‌درستی خالی است و کاربر حتی یک بار هم جریانِ کامل را
+    نمی‌بیند.
+
+    عمداً **همان** دیتاستِ `market/sandbox.py` است که بررسیِ پیش‌از‌ورود
+    و کارگزارِ کاغذیِ آزمایشی هم از آن می‌خوانند: قیمتی که اینجا می‌بینید
+    همان قیمتی است که آنجا پر می‌شود.
     """
     from datetime import timedelta
 
-    from data.order_book import BookLevel, OrderBook
+    from market import sandbox as sb
     from market.opportunity_ranking import rank_opportunities
-    from market.tradability import (
-        HistoryStats,
-        LiquidityObservation,
-        Thresholds,
-        evaluate,
-    )
+    from market.tradability import Thresholds, evaluate
     from risk.fees import FeeSchedule
+
+    if quantity <= 0:
+        raise HTTPException(status_code=400, detail="quantity باید مثبت باشد.")
 
     now = datetime.now()
     thresholds = Thresholds()
-    healthy = HistoryStats(
-        sessions=20, sessions_with_trades=18, sessions_with_both_quotes=20,
-        known=True, sessions_verified=True,
+    healthy = sb.history()
+    fees = FeeSchedule(
+        buy_rate=sb.SANDBOX_FEE_RATE, sell_rate=sb.SANDBOX_FEE_RATE, declared=True
     )
-    quantity = 10
-    contract_size = 1_000
-    strike = 10_000.0
-    spot = 10_500.0
-    #: نرخِ **اعلام‌شده**ی نمونه: ۰٫۲۵٪ هر سمت. مبلغش را خودِ رتبه‌بندی
-    #: از قیمتِ اجراییِ همان سمت حساب می‌کند، نه از پرمیومِ پیشنهادی.
-    demo_fees = FeeSchedule(buy_rate=0.0025, sell_rate=0.0025, declared=True)
 
-    def observation(symbol: str, bids: list[tuple[float, int]],
-                    asks: list[tuple[float, int]]) -> LiquidityObservation:
-        """مشاهده را از یک دفترِ **واقعی** می‌سازد.
-
-        همه‌ی عددها از همین دفتر در می‌آیند، پس قیمتِ ورود، قیمتِ خروج،
-        عمق و ارزش موقعیت نمی‌توانند با هم ناسازگار باشند — برچسبِ
-        آزمایشی جای سازگاریِ عددها را نمی‌گیرد.
-        """
-        book = OrderBook(
-            symbol,
-            bids=tuple(BookLevel(p, q) for p, q in bids),
-            asks=tuple(BookLevel(p, q) for p, q in asks),
+    candidates: list[dict[str, Any]] = []
+    for sample in sb.SAMPLES:
+        observation = sb.observation(
+            sample,
+            quantity,
+            now=now,
+            max_exit_slippage_pct=thresholds.max_exit_slippage_pct,
         )
-        exit_price, exit_filled = book.fill_price("sell", quantity)
-        entry_price, entry_filled = book.fill_price("buy", quantity)
-        return LiquidityObservation(
-            symbol=symbol, position_side="buy", quantity=quantity, observed_at=now,
-            bid=book.best_bid, ask=book.best_ask,
-            exit_depth_contracts=book.real_depth("sell"),
-            exit_depth_within_band_contracts=book.depth_within(
-                "sell", thresholds.max_exit_slippage_pct
-            ),
-            exit_fill_price=exit_price if exit_filled >= quantity else None,
-            entry_fill_price=entry_price if entry_filled >= quantity else None,
-            # عمقِ سمت ورود از همان دفتر: «کم بود» را از «ندیدیم» جدا
-            # می‌کند وقتی ورود پر نمی‌شود.
-            entry_depth_contracts=book.real_depth("buy"),
-            best_exit_price=book.best_bid,
-            open_interest=500, trades_today=40, days_to_expiry=45,
-            quote_age_seconds=5.0,
-        )
-
-    def candidate(obs: LiquidityObservation, **kwargs: Any) -> dict[str, Any]:
-        entry = obs.entry_fill_price or 0.0
-        data: dict[str, Any] = {
-            "report": evaluate(obs, healthy, thresholds),
-            "symbol": obs.symbol, "strategy": "نمونه‌ی آزمایشی",
-            "side": "buy", "quantity": quantity, "leg_group_id": None,
-            "option_type": "call", "strike": strike, "contract_size": contract_size,
-            "underlying_price": spot,
-            # حد ضررِ ۳۵٪ روی **قیمتِ اجراییِ ورودِ همین دفتر**؛ مبلغ زیانش
-            # را رتبه‌بندی از همان مبنا می‌سازد، پس عددها با هم می‌خوانند.
-            "stop_loss_price": round(entry * 0.65, 1) or None,
-            "fees": demo_fees,
-        }
-        data.update(kwargs)
-        return data
+        entry = observation.entry_fill_price
+        candidates.append({
+            "report": evaluate(observation, healthy, thresholds),
+            "symbol": sample.symbol,
+            "strategy": "نمونه‌ی آزمایشی",
+            "side": sample.side,
+            "quantity": quantity,
+            "leg_group_id": sample.leg_group_id,
+            "option_type": sample.option_type,
+            "strike": sample.strike,
+            "contract_size": sb.SANDBOX_CONTRACT_SIZE,
+            "underlying_price": sb.SANDBOX_SPOT,
+            # حد ضررِ ۳۵٪ روی قیمتِ اجراییِ همین دفتر، تا عددها با هم بخوانند
+            "stop_loss_price": round(entry * 0.65, 1) if entry else None,
+            "fees": fees,
+        })
 
     result = rank_opportunities(
-        candidates=[
-            # نقدشونده و تنگ؛ عمقِ دور عمداً هست تا دیده شود که شمرده نمی‌شود.
-            candidate(observation(
-                "نمونه‌الف",
-                bids=[(995.0, 200), (700.0, 1_000)],
-                asks=[(1_005.0, 200)],
-            )),
-            # اسپرد بازتر و عمقِ کم‌تر
-            candidate(observation(
-                "نمونه‌ب", bids=[(950.0, 15)], asks=[(1_050.0, 15)],
-            )),
-            # نرخ کارمزد اعلام نشده → مؤلفه‌اش نامعلوم، نه صفر.
-            candidate(
-                observation("نمونه‌پ", bids=[(980.0, 100)], asks=[(1_020.0, 100)]),
-                fees=None,
-            ),
-            # ورودِ اجراناپذیر: عمقِ خرید ۱ قرارداد برای سفارشِ ۱۰ تایی.
-            # از غربال می‌گذرد (عمقِ خروج دارد) ولی رتبه نمی‌گیرد.
-            candidate(observation(
-                "نمونه‌چ", bids=[(980.0, 100)], asks=[(1_020.0, 1)],
-            )),
-            # ردشده‌ی غربال: اسپرد ۱۰۰٪
-            candidate(observation(
-                "نمونه‌ت", bids=[(500.0, 100)], asks=[(1_500.0, 100)],
-            )),
-            # خارج از دامنه‌ی نسخه‌ی اول
-            candidate(
-                observation("نمونه‌ث", bids=[(980.0, 100)], asks=[(1_020.0, 100)]),
-                leg_group_id="grp-نمونه",
-            ),
-            candidate(
-                observation("نمونه‌ج", bids=[(980.0, 100)], asks=[(1_020.0, 100)]),
-                side="sell",
-            ),
-        ],
+        candidates=candidates,
         thresholds=thresholds,
         weights=_ranking_weights(_settings()),
         evaluated_at=now - timedelta(seconds=1),
         demo=True,
     )
-    return {"enabled": True, **result.to_dict()}
+    payload = result.to_dict()
+    notes = {s.symbol: s.note for s in sb.SAMPLES}
+    for row in payload["ranked"]:
+        row["sample_note"] = notes.get(row["symbol"])
+    for row in payload["excluded"]:
+        row["sample_note"] = notes.get(row["symbol"])
+    return {
+        "enabled": True,
+        "sandbox": True,
+        "sandbox_label": sb.SANDBOX_LABEL,
+        "underlying": sb.SANDBOX_UNDERLYING,
+        "spot_price": sb.SANDBOX_SPOT,
+        "quantity": quantity,
+        **payload,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -1230,6 +1260,26 @@ class PaperOrderRequest(BaseModel):
     signal_id: str | None = None
     side: str | None = None
     quantity: int | None = None
+    #: بلیتِ بررسیِ پیش‌از‌ورود (`POST /api/trade-check`).
+    #:
+    #: برای ورودی که از دلِ یک **فرصت/سیگنال** می‌آید اجباری است: بدون
+    #: آن، معامله با ارزیابیِ قدیمی تأیید می‌شد. فرمِ دستیِ زنجیره بلیت
+    #: نمی‌خواهد، چون اصلاً ارزیابیِ قبلی‌ای پشتش نیست.
+    ticket: str | None = None
+    #: مسیر آزمایشی: حساب، پایگاه و مظنه‌های جدا از دادهٔ واقعی.
+    sandbox: bool = False
+
+
+class TradeCheckRequest(BaseModel):
+    """بررسیِ «همین حالا و برای همین تعداد، ورود ممکن است؟»"""
+
+    symbol: str | None = None
+    signal_id: str | None = None
+    quantity: int = Field(gt=0)
+    side: str | None = None
+    sandbox: bool = False
+    #: امتیازی که کاربر روی کارت دیده بود — فقط برای مقایسه و هشدار.
+    previous_score: float | None = None
 
 
 class PaperSettleRequest(BaseModel):
@@ -1247,6 +1297,8 @@ class PaperSettleRequest(BaseModel):
     #: کاری است که این تغییر جلویش را گرفت. `allow_inf_nan=False` چون
     #: `inf` نقد را بی‌نهایت می‌کند و `nan` هر کنترلی را بی‌صدا رد.
     settlement_price: float = Field(ge=0, allow_inf_nan=False)
+    #: مسیر آزمایشی — حساب و پایگاهِ جدا.
+    sandbox: bool = False
 
 
 @app.get("/api/datasource")
@@ -1508,17 +1560,369 @@ async def get_paper_trading_chain(underlying: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+# ----------------------------------------------------------------------
+# بررسی پیش از ورود — و بلیتی که تأیید روی آن بسته می‌شود
+# ----------------------------------------------------------------------
+#: بلیت‌های صادرشده. در حافظه‌اند و با ری‌استارتِ سرور پاک می‌شوند — عمدی:
+#: عمرشان کمتر از دو دقیقه است و ماندگاری‌شان هیچ‌چیز را نجات نمی‌دهد.
+_TRADE_TICKETS: dict[str, dict[str, Any]] = {}
+
+#: عمرِ بلیت. کوتاه است چون کارش همین است: تأییدی که با دادهٔ کهنه
+#: انجام شود، تأییدِ چیزِ دیگری است.
+DEFAULT_TICKET_TTL_SECONDS = 90.0
+#: قیمتِ ورود تا این درصد بتواند تکان بخورد و بلیت معتبر بماند.
+DEFAULT_TICKET_PRICE_TOLERANCE_PCT = 0.5
+
+
+def _ticket_settings(settings: dict[str, Any]) -> tuple[float, float]:
+    config = section(settings, "paper_trading")
+    return (
+        float(config.get("ticket_ttl_seconds", DEFAULT_TICKET_TTL_SECONDS)),
+        float(
+            config.get(
+                "ticket_price_tolerance_pct", DEFAULT_TICKET_PRICE_TOLERANCE_PCT
+            )
+        ),
+    )
+
+
+def _issue_ticket(check: Any, sandbox: bool, ttl_seconds: float) -> dict[str, Any]:
+    """بلیتِ تأیید برای همین بررسی. بدونش سفارشِ فرصت ثبت نمی‌شود."""
+    import uuid
+    from datetime import timedelta
+
+    now = datetime.now()
+    ticket_id = str(uuid.uuid4())
+    # بلیت‌های منقضی همین‌جا پاک می‌شوند؛ صفِ جدایی لازم نیست.
+    for key, row in list(_TRADE_TICKETS.items()):
+        if row["expires_at"] < now:
+            _TRADE_TICKETS.pop(key, None)
+    _TRADE_TICKETS[ticket_id] = {
+        "symbol": check.symbol,
+        "side": check.side,
+        "quantity": check.quantity,
+        "sandbox": sandbox,
+        "fingerprint": check.fingerprint,
+        "entry_price": check.entry_price,
+        "signal_id": check.record.signal_id,
+        "issued_at": now,
+        "expires_at": now + timedelta(seconds=ttl_seconds),
+    }
+    return {
+        "id": ticket_id,
+        "ttl_seconds": ttl_seconds,
+        "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(
+            timespec="seconds"
+        ),
+    }
+
+
+def _claim_ticket(
+    ticket_id: str, symbol: str, side: str, quantity: int, sandbox: bool
+) -> dict[str, Any]:
+    """بلیت را بررسی و **مصرف** می‌کند. هر ناسازگاری یعنی رد.
+
+    مصرفِ یک‌باره عمدی است: هر تأیید به یک بررسیِ خودش گره می‌خورد، پس
+    یک بلیت نمی‌تواند پشتِ سرِ هم چند سفارش را امضا کند.
+    """
+    row = _TRADE_TICKETS.pop(ticket_id, None)
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail="بلیتِ بررسی پیدا نشد یا قبلاً مصرف شده؛ دوباره «بررسی با دادهٔ تازه» را بزنید.",
+        )
+    if row["expires_at"] < datetime.now():
+        raise HTTPException(
+            status_code=409,
+            detail="بلیتِ بررسی منقضی شده است؛ دادهٔ آن لحظه دیگر تازه نیست. دوباره بررسی کنید.",
+        )
+    if row["sandbox"] != sandbox:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "بلیتِ مسیرِ دیگری است؛ بررسی و ثبت باید هر دو در یک مسیر "
+                "(واقعی یا آزمایشی) باشند."
+            ),
+        )
+    if row["symbol"] != symbol or row["side"] != side.lower():
+        raise HTTPException(
+            status_code=409,
+            detail=f"بلیت برای {row['symbol']}/{row['side']} صادر شده، نه {symbol}/{side}.",
+        )
+    if row["quantity"] != quantity:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"تعداد عوض شده است: بررسی برای {row['quantity']} قرارداد بود و "
+                f"سفارش برای {quantity}. با همین تعداد دوباره بررسی کنید."
+            ),
+        )
+    return row
+
+
+def _reject_if_price_moved(
+    ticket_price: float | None, fresh_price: float | None, tolerance_pct: float
+) -> None:
+    """اگر قیمتِ اجراییِ ورود از زمانِ بررسی جابه‌جا شده، تأیید باطل است.
+
+    بلیت عمرِ کوتاه دارد، ولی در همان چند ثانیه هم دفتر می‌تواند عوض
+    شود. آستانه از تنظیمات می‌آید تا کاربر خودش سخت‌گیری‌اش را انتخاب
+    کند؛ صفر یعنی «هر تکانی یعنی بررسی دوباره».
+    """
+    if ticket_price is None or fresh_price is None:
+        return
+    if ticket_price <= 0:
+        return
+    moved = abs(fresh_price - ticket_price) / ticket_price * 100.0
+    if moved > tolerance_pct:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"قیمتِ اجراییِ ورود از زمان بررسی {moved:,.2f}٪ جابه‌جا شده "
+                f"({ticket_price:,.0f} ← {fresh_price:,.0f}) و از آستانه‌ی "
+                f"{tolerance_pct:,.2f}٪ گذشته است. دوباره بررسی کنید."
+            ),
+        )
+
+
+def _signal_by_id(settings: dict[str, Any], signal_id: str) -> Signal:
+    with _signal_log(settings) as log:
+        match = next(
+            (s for s in log.all_signals(limit=None) if s.signal_id == signal_id), None
+        )
+    if match is None:
+        raise HTTPException(status_code=404, detail=f"سیگنال {signal_id} یافت نشد.")
+    return match
+
+
+def _run_entry_check(
+    settings: dict[str, Any],
+    *,
+    symbol: str | None,
+    signal_id: str | None,
+    side: str | None,
+    quantity: int,
+    sandbox: bool,
+    previous_score: float | None = None,
+) -> Any:
+    """بررسیِ کاملِ ورود با دادهٔ **همین لحظه** — واقعی یا آزمایشی.
+
+    هر دو مسیر از یک تابعِ مشترک (`market/entry_check.py`) رد می‌شوند تا
+    عددها و دلیل‌ها در تمرین و در واقعیت یک شکل داشته باشند.
+    """
+    from market.entry_check import check_entry
+    from market.tradability import Thresholds
+
+    thresholds_config = section(settings, "tradability")
+    known_thresholds = {f.name for f in fields(Thresholds)}
+    thresholds = Thresholds(**{
+        k: v for k, v in thresholds_config.items() if k in known_thresholds
+    })
+    weights = _ranking_weights(settings)
+
+    signal: Signal | None = None
+    if signal_id:
+        signal = _signal_by_id(settings, signal_id)
+        _reject_multi_leg(signal.strategy_name)
+        symbol = signal.symbol
+        side = signal.side.value
+
+    if not symbol:
+        raise HTTPException(status_code=400, detail="یا symbol یا signal_id باید داده شود.")
+    side = (side or "buy").lower()
+
+    broker, context = _paper_broker(settings, sandbox=sandbox)
+    try:
+        available_cash = broker.account_snapshot().available
+    finally:
+        context.close()
+
+    if sandbox:
+        check = _sandbox_entry_check(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            thresholds=thresholds,
+            weights=weights,
+            available_cash=available_cash,
+            previous_score=previous_score,
+            signal_id=signal_id,
+        )
+        return check
+
+    context = create_app(settings, dry_run=True, as_json=False)
+    try:
+        screener = context.generator.tradability
+        if screener is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "غربال قابلیت معامله خاموش است؛ بدونش بررسیِ ورود مبنا "
+                    "ندارد. از تب «سیگنال‌ها» روشنش کنید."
+                ),
+            )
+        contract = context.option_chain.get_contract(symbol)
+        if contract is None:
+            raise HTTPException(status_code=404, detail=f"قرارداد «{symbol}» پیدا نشد.")
+        report = screener.evaluate_symbol(
+            symbol=symbol, position_side=side, quantity=quantity
+        )
+        try:
+            spot = context.option_chain.get_chain(contract.underlying).spot_price
+        except Exception:  # قیمت پایه نبود ⇒ «حرکت لازم» نامعلوم، نه خطا
+            logger.warning("قیمت پایه‌ی %s خوانده نشد.", contract.underlying)
+            spot = None
+    finally:
+        context.close()
+
+    return check_entry(
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        report=report,
+        strategy=signal.strategy_name if signal else "ورود دستی",
+        option_type=contract.option_type,
+        strike=contract.strike,
+        contract_size=contract.contract_size,
+        expiry=contract.expiry,
+        underlying_price=spot,
+        stop_loss_price=signal.stop_loss if signal else None,
+        # نرخِ همان حسابی که قرار است پول از آن کم شود، نه نرخِ ماژول ریسک:
+        # عددِ بررسی باید با چیزی که کارگزارِ کاغذی برمی‌دارد یکی باشد.
+        fees=_paper_fee_schedule(settings),
+        thresholds=thresholds,
+        weights=weights,
+        available_cash=available_cash,
+        previous_score=previous_score,
+        signal_id=signal_id,
+    )
+
+
+def _sandbox_entry_check(
+    *,
+    symbol: str,
+    side: str,
+    quantity: int,
+    thresholds: Any,
+    weights: Any,
+    available_cash: float | None,
+    previous_score: float | None,
+    signal_id: str | None,
+) -> Any:
+    """همان بررسی، روی دادهٔ نمونه‌ی برچسب‌دار."""
+    from market import sandbox as sb
+    from market.entry_check import check_entry
+    from market.tradability import evaluate
+    from risk.fees import FeeSchedule
+
+    sample = sb.BY_SYMBOL.get(symbol)
+    if sample is None:
+        raise HTTPException(
+            status_code=404, detail=f"نمونه‌ی آزمایشی «{symbol}» وجود ندارد."
+        )
+    observation = sb.observation(
+        sample, quantity, max_exit_slippage_pct=thresholds.max_exit_slippage_pct
+    )
+    report = evaluate(observation, sb.history(), thresholds)
+    entry = observation.entry_fill_price
+    return check_entry(
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        report=report,
+        strategy="نمونه‌ی آزمایشی",
+        option_type=sample.option_type,
+        strike=sample.strike,
+        contract_size=sb.SANDBOX_CONTRACT_SIZE,
+        expiry=sb.expiry(),
+        underlying_price=sb.SANDBOX_SPOT,
+        # حد ضررِ ۳۵٪ روی قیمتِ اجراییِ همین دفتر — مثل بقیه‌ی عددها.
+        stop_loss_price=round(entry * 0.65, 1) if entry else None,
+        fees=FeeSchedule(
+            buy_rate=sb.SANDBOX_FEE_RATE, sell_rate=sb.SANDBOX_FEE_RATE, declared=True
+        ),
+        thresholds=thresholds,
+        weights=weights,
+        available_cash=available_cash,
+        previous_score=previous_score,
+        signal_id=signal_id,
+    )
+
+
+def _paper_fee_schedule(settings: dict[str, Any]) -> Any:
+    """نرخ کارمزدِ **حساب کاغذی** — همانی که موقع پرشدن برداشته می‌شود."""
+    from risk.fees import FeeSchedule
+
+    config = section(settings, "paper_trading").get("fees") or {}
+    known = {f.name for f in fields(FeeSchedule)}
+    return FeeSchedule(**{k: v for k, v in config.items() if k in known})
+
+
+@app.post("/api/trade-check")
+async def check_trade_entry(request: TradeCheckRequest) -> dict[str, Any]:
+    """«همین حالا، برای همین تعداد، ورود ممکن است؟»
+
+    رتبه‌ای که کاربر روی کارت دیده عکسِ یک لحظه است. اینجا همه‌چیز با
+    دادهٔ تازه و برای تعدادِ انتخابیِ خودش دوباره حساب می‌شود: غربال،
+    اجراپذیریِ ورود، قیمتِ اجرایی، وجهِ لازم و خودِ امتیاز.
+
+    اگر مانعی نباشد یک **بلیتِ کوتاه‌عمر** صادر می‌شود که ثبتِ سفارش
+    بدون آن انجام نمی‌گیرد.
+    """
+    settings = _settings()
+    ttl, _tolerance = _ticket_settings(settings)
+
+    def _work() -> dict[str, Any]:
+        check = _run_entry_check(
+            settings,
+            symbol=request.symbol,
+            signal_id=request.signal_id,
+            side=request.side,
+            quantity=request.quantity,
+            sandbox=request.sandbox,
+            previous_score=request.previous_score,
+        )
+        payload = check.to_dict()
+        payload["sandbox"] = request.sandbox
+        if request.sandbox:
+            from market import sandbox as sb
+
+            payload["sandbox_label"] = sb.SANDBOX_LABEL
+        payload["ticket"] = (
+            _issue_ticket(check, request.sandbox, ttl) if check.ok else None
+        )
+        return payload
+
+    try:
+        return await asyncio.to_thread(_work)
+    except HTTPException:
+        raise
+    except ValueError as exc:  # نماد نامعتبر — خطای کاربر، نه خرابی سرور
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("بررسی پیش از ورود ناموفق بود.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/api/paper-trading/orders")
 async def place_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
     """ثبت یک سفارش کاغذی — فوری، در برابر عمق واقعی دفتر سفارش.
 
-    یا `symbol`+`side` مستقیم داده می‌شود، یا `signal_id` یک سیگنال
-    موجود را اجرا می‌کند («اجرای این سیگنال» با یک کلیک) — نماد، سمت و
-    تعداد پیشنهادی از خودِ سیگنال خوانده می‌شود، ولی قیمتِ پرشدن همیشه
-    از عمق **زنده** دفتر سفارش است، نه از `suggested_price` سیگنال.
+    سه راهِ ورودی، با یک قاعده‌ی مشترک: **هیچ ورودی‌ای با ارزیابیِ قدیمی
+    تأیید نمی‌شود.**
+
+    * از دلِ یک فرصت/سیگنال (`signal_id`) یا در مسیر آزمایشی → بلیتِ
+      `POST /api/trade-check` اجباری است. بلیت با تعداد و نمادِ همین
+      سفارش سنجیده می‌شود و یک بار بیشتر مصرف نمی‌شود؛ بعد هم بررسی
+      **دوباره** و با دادهٔ تازه تکرار می‌شود تا قیمت از زمانِ تأیید
+      جابه‌جا نشده باشد.
+    * فرمِ دستیِ زنجیره (symbol + side) بلیت نمی‌خواهد، چون ارزیابیِ
+      قبلی‌ای پشتش نیست؛ پرشدنش هم مثل همیشه از عمقِ **زنده** است.
+    * فروش (بستنِ موقعیت) بلیتِ ورود نمی‌خواهد — بررسیِ ورود درباره‌ی
+      خروج چیزی نمی‌گوید.
     """
     settings = _settings()
-    _require_paper_trading_enabled(settings)
+    _require_paper_trading_enabled(settings, sandbox=request.sandbox)
 
     symbol = request.symbol
     side = request.side
@@ -1526,10 +1930,7 @@ async def place_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
     signal_id = request.signal_id
 
     if signal_id:
-        with _signal_log(settings) as log:
-            match = next((s for s in log.all_signals(limit=None) if s.signal_id == signal_id), None)
-        if match is None:
-            raise HTTPException(status_code=404, detail=f"سیگنال {signal_id} یافت نشد.")
+        match = _signal_by_id(settings, signal_id)
         _reject_multi_leg(match.strategy_name)
         symbol = match.symbol
         side = match.side.value
@@ -1543,31 +1944,108 @@ async def place_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
     if quantity is None or quantity <= 0:
         raise HTTPException(status_code=400, detail="quantity باید یک عدد مثبت باشد.")
 
-    def _work() -> dict[str, Any]:
-        broker, context = _paper_broker(settings)
+    side = (side or "").lower()
+    is_entry = side == "buy"
+    needs_ticket = is_entry and (bool(signal_id) or request.sandbox)
+    if needs_ticket and not request.ticket:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "ورود از روی یک فرصت باید اول با دادهٔ تازه بررسی شود. "
+                "«بررسی با دادهٔ تازه» را بزنید و بعد تأیید کنید."
+            ),
+        )
+
+    decision: dict[str, Any] | None = None
+    entry_guard: dict[str, Any] | None = None
+    if request.ticket:
+        claimed = _claim_ticket(request.ticket, symbol, side, quantity, request.sandbox)
+        _ttl, tolerance = _ticket_settings(settings)
+
+        def _recheck() -> Any:
+            return _run_entry_check(
+                settings,
+                symbol=symbol,
+                signal_id=signal_id,
+                side=side,
+                quantity=quantity,
+                sandbox=request.sandbox,
+            )
+
         try:
-            order = broker.place_order(symbol, side, quantity, signal_id=signal_id)
+            fresh = await asyncio.to_thread(_recheck)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("بررسی دوباره پیش از ثبت ناموفق بود.")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if not fresh.ok:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "شرایط از زمان بررسی عوض شده است: "
+                    + "؛ ".join(b.message for b in fresh.blockers)
+                ),
+            )
+        # این بررسیِ اول **زودهنگام** است و فقط برای پیامِ روشن: گاردِ
+        # اصلی داخلِ کارگزار و روی همان مظنه‌ای است که حساب را عوض
+        # می‌کند. اینجا رد کردن یعنی کاربر زودتر بفهمد، نه اینکه
+        # کنترلِ دوم لازم نباشد.
+        _reject_if_price_moved(claimed["entry_price"], fresh.entry_price, tolerance)
+        from market.entry_check import decision_snapshot
+
+        decision = decision_snapshot(fresh, request.ticket)
+        entry_guard = {
+            "ticket_id": request.ticket,
+            # آنچه کاربر دید و تأیید کرد
+            "confirmed_at": claimed["issued_at"].isoformat(timespec="seconds"),
+            "confirmed_price": claimed["entry_price"],
+            "confirmed_quantity": claimed["quantity"],
+            # آنچه بررسیِ نهایی، لحظه‌ی ثبت، دید
+            "final_check_at": fresh.checked_at.isoformat(timespec="seconds"),
+            "final_check_price": fresh.entry_price,
+            # قیدی که کارگزار روی پرشدنِ واقعی اعمال می‌کند
+            "tolerance_pct": tolerance,
+            "require_full_fill": True,
+        }
+
+    def _work() -> dict[str, Any]:
+        broker, context = _paper_broker(settings, sandbox=request.sandbox)
+        try:
+            order = broker.place_order(
+                symbol,
+                side,
+                quantity,
+                signal_id=signal_id,
+                decision=decision,
+                entry_guard=entry_guard,
+            )
             return _serialize_order(order)
         finally:
             context.close()
 
     try:
-        return await asyncio.to_thread(_work)
+        payload = await asyncio.to_thread(_work)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("ثبت سفارش کاغذی ناموفق بود.")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    payload["sandbox"] = request.sandbox
+    return payload
 
 
 @app.get("/api/paper-trading/orders")
-def get_paper_orders(limit: int | None = None) -> dict[str, Any]:
+def get_paper_orders(limit: int | None = None, sandbox: bool = False) -> dict[str, Any]:
     """تاریخچه سفارش‌های کاغذی، جدیدترین اول."""
     settings = _settings()
-    broker, context = _paper_broker(settings)
+    broker, context = _paper_broker(settings, sandbox=sandbox)
     try:
         orders = broker.store.list_orders(limit=limit)
     finally:
         context.close()
-    return {"total": len(orders), "orders": orders}
+    return {"total": len(orders), "orders": orders, "sandbox": sandbox}
 
 
 def _serialize_valuation(v: Any) -> dict[str, Any]:
@@ -1646,7 +2124,7 @@ def _serialize_snapshot(snapshot: Any) -> dict[str, Any]:
 
 
 @app.get("/api/paper-trading/positions")
-async def get_paper_positions() -> dict[str, Any]:
+async def get_paper_positions(sandbox: bool = False) -> dict[str, Any]:
     """پوزیشن‌های باز کاغذی، همراه با ارزش روز و **وضعیت ارزش‌گذاری**.
 
     ⚠️ دیگر هیچ موقعیتی خودکار تسویه نمی‌شود. موقعیتِ سررسیدشده با
@@ -1655,14 +2133,20 @@ async def get_paper_positions() -> dict[str, Any]:
     settings = _settings()
 
     def _work() -> dict[str, Any]:
-        broker, context = _paper_broker(settings)
+        broker, context = _paper_broker(settings, sandbox=sandbox)
         try:
             positions = [_serialize_valuation(v) for v in broker.value_positions()]
+            decisions = _entry_decisions(broker)
+            for position in positions:
+                # «چرا وارد شدم» باید کنارِ خودِ موقعیت دیده شود، نه در
+                # تاریخچه‌ی سفارش‌ها که کاربر باید دنبالش بگردد.
+                position["entry_decision"] = decisions.get(position["symbol"])
             return {
                 "positions": positions,
                 "expired_unsettled": [
                     p["symbol"] for p in positions if p["status"] == "expired_unsettled"
                 ],
+                "sandbox": sandbox,
             }
         finally:
             context.close()
@@ -1675,7 +2159,7 @@ async def get_paper_positions() -> dict[str, Any]:
 
 
 @app.get("/api/paper-trading/account")
-async def get_paper_account() -> dict[str, Any]:
+async def get_paper_account(sandbox: bool = False) -> dict[str, Any]:
     """وضعیت کامل و **قابل تطبیق** حساب کاغذی.
 
     رابطه‌ی مبنا: `ارزش کل حساب = نقد + ارزش روز موقعیت‌ها`. نسخه‌ی قبلی
@@ -1685,9 +2169,15 @@ async def get_paper_account() -> dict[str, Any]:
     settings = _settings()
 
     def _work() -> dict[str, Any]:
-        broker, context = _paper_broker(settings)
+        broker, context = _paper_broker(settings, sandbox=sandbox)
         try:
-            return _serialize_snapshot(broker.account_snapshot())
+            payload = _serialize_snapshot(broker.account_snapshot())
+            payload["sandbox"] = sandbox
+            if sandbox:
+                from market import sandbox as sb
+
+                payload["sandbox_label"] = sb.SANDBOX_LABEL
+            return payload
         finally:
             context.close()
 
@@ -1711,10 +2201,10 @@ async def settle_paper_position(request: PaperSettleRequest) -> dict[str, Any]:
     کل از `قیمت × تعداد × اندازه‌ی قرارداد` در می‌آید.
     """
     settings = _settings()
-    _require_paper_trading_enabled(settings)
+    _require_paper_trading_enabled(settings, sandbox=request.sandbox)
 
     def _work() -> dict[str, Any]:
-        broker, context = _paper_broker(settings)
+        broker, context = _paper_broker(settings, sandbox=request.sandbox)
         try:
             return broker.settle_position(request.symbol, request.settlement_price)
         finally:
@@ -1739,30 +2229,35 @@ async def settle_paper_position(request: PaperSettleRequest) -> dict[str, Any]:
 
 
 @app.get("/api/paper-trading/report")
-def get_paper_report(days: int | None = None) -> dict[str, Any]:
+def get_paper_report(days: int | None = None, sandbox: bool = False) -> dict[str, Any]:
     """معیارهای عملکرد معاملات کاغذی بسته‌شده — همان تابع بک‌تست/گزارش زنده."""
     settings = _settings()
-    broker, context = _paper_broker(settings)
+    broker, context = _paper_broker(settings, sandbox=sandbox)
     try:
         return {
             "metrics": broker.performance_summary(days),
             "recent": broker.store.list_trades(days),
+            "sandbox": sandbox,
         }
     finally:
         context.close()
 
 
 @app.post("/api/paper-trading/reset")
-def reset_paper_account() -> dict[str, Any]:
-    """پاک‌کردن کامل حساب کاغذی و بازگرداندن موجودی به مقدار اولیه."""
+def reset_paper_account(sandbox: bool = False) -> dict[str, Any]:
+    """پاک‌کردن کامل حساب کاغذی و بازگرداندن موجودی به مقدار اولیه.
+
+    ⚠️ `sandbox=true` فقط حسابِ آزمایشی را پاک می‌کند و به حساب واقعی
+    دست نمی‌زند — و برعکس. دو پایگاهِ جدا، دو ریستِ جدا.
+    """
     settings = _settings()
-    _require_paper_trading_enabled(settings)
-    broker, context = _paper_broker(settings)
+    _require_paper_trading_enabled(settings, sandbox=sandbox)
+    broker, context = _paper_broker(settings, sandbox=sandbox)
     try:
         account = broker.reset()
     finally:
         context.close()
-    return {"ok": True, "account": account}
+    return {"ok": True, "account": account, "sandbox": sandbox}
 
 
 @app.get("/api/status")

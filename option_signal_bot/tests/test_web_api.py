@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 from datetime import date, timedelta
 from pathlib import Path
@@ -47,6 +48,9 @@ def client(tmp_path, monkeypatch):
     # ⚠️ بدون این، `sqlite_path` نمونه به `var/paper_trading.db` **واقعی**
     # اشاره می‌کند و اجرای تست‌ها حساب کاغذیِ خودِ کاربر را ریست می‌کند.
     data.setdefault("paper_trading", {})["sqlite_path"] = str(tmp_path / "paper_trading.db")
+    # همان خطر برای حسابِ **تمرینی**: بدون این، تست‌ها حسابِ آزمایشیِ
+    # خودِ کاربر را پر و ریست می‌کنند.
+    data["paper_trading"]["sandbox_sqlite_path"] = str(tmp_path / "paper_sandbox.db")
 
     settings = tmp_path / "settings.yaml"
     settings.write_text(
@@ -968,3 +972,215 @@ def test_account_separates_costs_known_from_rates_configured(client, paper_order
     assert "rates_configured" in account
     assert "positions_with_unknown_cost" in account
     assert "total_costs_recorded" in account
+
+
+# ----------------------------------------------------------------------
+# مسیر کامل: فرصت ← بررسی با دادهٔ تازه ← تأیید ← موقعیت
+# ----------------------------------------------------------------------
+#: نمونه‌ای که در دیتاستِ تمرین همیشه اجراپذیر است.
+PRACTICE_SYMBOL = "نمونه‌الف"
+#: نمونه‌ای که عمقِ ورودش عمداً کم است.
+PRACTICE_THIN = "نمونه‌چ"
+
+
+def _check(client, symbol=PRACTICE_SYMBOL, quantity=10, **extra):
+    response = client.post(
+        "/api/trade-check",
+        json={"symbol": symbol, "quantity": quantity, "sandbox": True, **extra},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _order(client, ticket=None, symbol=PRACTICE_SYMBOL, quantity=10, side="buy"):
+    payload = {
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "sandbox": True,
+    }
+    if ticket:
+        payload["ticket"] = ticket
+    return client.post("/api/paper-trading/orders", json=payload)
+
+
+def test_the_practice_path_offers_the_same_numbers_it_will_fill_at(client):
+    """قیمتِ کارت، قیمتِ بررسی و قیمتِ پرشدن باید یکی باشند.
+
+    اگر هر کدام از منبعِ دیگری بیاید، تمرین چیزی را یاد می‌دهد که در
+    عمل اتفاق نمی‌افتد.
+    """
+    demo = client.get("/api/ranking/demo?quantity=10").json()
+    assert demo["sandbox"] is True and demo["demo"] is True
+    top = next(r for r in demo["ranked"] if r["symbol"] == PRACTICE_SYMBOL)
+
+    check = _check(client)
+    assert check["entry_price"] == top["entry_price"]
+
+    order = _order(client, check["ticket"]["id"])
+    assert order.status_code == 200, order.text
+    assert order.json()["price"] == top["entry_price"]
+
+
+def test_an_entry_that_cannot_be_filled_gets_no_confirmation_ticket(client):
+    """بلیتِ تأیید فقط وقتی صادر می‌شود که واقعاً بشود وارد شد."""
+    body = _check(client, symbol=PRACTICE_THIN)
+
+    assert body["ok"] is False
+    assert [b["code"] for b in body["blockers"]] == ["entry_short_of_depth"]
+    assert body["ticket"] is None
+
+
+def test_an_entry_from_an_opportunity_is_refused_without_a_fresh_check(client):
+    """رتبه‌ی دیده‌شده تضمینِ اجرای حالا نیست؛ بدون بررسی، تأییدی نیست."""
+    response = _order(client)
+
+    assert response.status_code == 409
+    assert "بررسی" in response.json()["detail"]
+
+
+def test_changing_the_quantity_invalidates_the_confirmation(client):
+    """بررسی برای ۱۰ قرارداد، جوابِ سؤالِ ۵ قرارداد نیست."""
+    check = _check(client, quantity=10)
+
+    response = _order(client, check["ticket"]["id"], quantity=5)
+
+    assert response.status_code == 409
+    assert "تعداد" in response.json()["detail"]
+
+
+def test_a_ticket_signs_one_order_and_not_the_next(client):
+    """بلیت یک‌بارمصرف است، وگرنه یک بررسی چند معامله را امضا می‌کرد."""
+    check = _check(client)
+    ticket = check["ticket"]["id"]
+
+    assert _order(client, ticket).status_code == 200
+    again = _order(client, ticket)
+
+    assert again.status_code == 409
+    assert "مصرف" in again.json()["detail"] or "پیدا نشد" in again.json()["detail"]
+
+
+def test_a_stale_ticket_is_refused(client):
+    """بلیتِ منقضی یعنی دادهٔ آن لحظه دیگر تازه نیست."""
+    data = _load(client.settings_path)
+    data["paper_trading"]["ticket_ttl_seconds"] = -1  # از همان لحظه منقضی
+    client.settings_path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    check = _check(client)
+
+    response = _order(client, check["ticket"]["id"])
+
+    assert response.status_code == 409
+    assert "منقضی" in response.json()["detail"]
+
+
+def test_the_decision_at_entry_is_kept_with_the_trade(client):
+    """بدون عکسِ تصمیم، بعداً نمی‌شود پرسید «آن موقع چه می‌دانستم؟»."""
+    check = _check(client)
+    order = _order(client, check["ticket"]["id"])
+    assert order.status_code == 200, order.text
+
+    decision = order.json()["metadata"]["decision"]
+    assert decision["quantity"] == 10
+    assert decision["entry_price_at_decision"] == check["entry_price"]
+    assert decision["score"] == check["opportunity"]["score"]
+    assert decision["capital_required"] == check["opportunity"]["capital_required"]
+    assert decision["ticket_id"] == check["ticket"]["id"]
+
+    positions = client.get("/api/paper-trading/positions?sandbox=true").json()
+    held = next(p for p in positions["positions"] if p["symbol"] == PRACTICE_SYMBOL)
+    assert held["entry_decision"]["score"] == decision["score"]
+
+
+def test_the_practice_account_never_touches_the_real_one(client):
+    """دو حساب، دو پایگاه. تمرین نباید هیچ اثری روی حساب واقعی بگذارد."""
+    before = client.get("/api/paper-trading/account").json()
+    check = _check(client)
+    assert _order(client, check["ticket"]["id"]).status_code == 200
+
+    after = client.get("/api/paper-trading/account").json()
+    practice = client.get("/api/paper-trading/account?sandbox=true").json()
+
+    assert after["cash"] == before["cash"], "حساب واقعی نباید تکان بخورد"
+    assert after["sandbox"] is False and practice["sandbox"] is True
+    assert practice["cash"] < practice["initial_balance"], "خریدِ تمرین باید نقد را کم کند"
+    real_positions = client.get("/api/paper-trading/positions").json()["positions"]
+    assert all(p["symbol"] != PRACTICE_SYMBOL for p in real_positions)
+
+
+def test_closing_a_practice_position_needs_no_entry_ticket(client):
+    """بررسیِ ورود درباره‌ی خروج چیزی نمی‌گوید؛ بستن نباید قفل شود."""
+    check = _check(client)
+    assert _order(client, check["ticket"]["id"]).status_code == 200
+
+    closed = _order(client, symbol=PRACTICE_SYMBOL, quantity=10, side="sell")
+
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["status"] == "filled"
+    report = client.get("/api/paper-trading/report?sandbox=true").json()
+    assert report["metrics"]["total"] == 1
+
+
+def test_a_price_that_moved_past_the_tolerance_voids_the_confirmation():
+    """گاردِ قیمت مستقل از مسیر، چون همان‌جاست که پول جابه‌جا می‌شود."""
+    from fastapi import HTTPException
+
+    from web.api import _reject_if_price_moved
+
+    _reject_if_price_moved(1_000.0, 1_004.0, 0.5)  # ۰٫۴٪ — مجاز
+    with pytest.raises(HTTPException) as excinfo:
+        _reject_if_price_moved(1_000.0, 1_010.0, 0.5)  # ۱٪ — رد
+    assert excinfo.value.status_code == 409
+    assert "جابه‌جا" in excinfo.value.detail
+
+
+def test_a_book_that_moved_between_check_and_order_does_not_change_the_account(
+    client, monkeypatch
+):
+    """دفتر بین «بررسی» و «تأیید» عوض می‌شود — حساب نباید تکان بخورد.
+
+    این همان حالتی است که بلیت برایش هست: تأییدِ کاربر روی قیمتی بود
+    که دیگر وجود ندارد.
+    """
+    from market import sandbox as sb
+
+    check = _check(client)
+    before = client.get("/api/paper-trading/account?sandbox=true").json()["cash"]
+
+    moved = sb.BY_SYMBOL[PRACTICE_SYMBOL]
+    monkeypatch.setitem(
+        sb.BY_SYMBOL,
+        PRACTICE_SYMBOL,
+        dataclasses.replace(moved, asks=((1_200.0, 200),)),
+    )
+    response = _order(client, check["ticket"]["id"])
+
+    assert response.status_code == 409
+    after = client.get("/api/paper-trading/account?sandbox=true").json()["cash"]
+    assert after == before, "هیچ پولی نباید جابه‌جا شده باشد"
+    positions = client.get("/api/paper-trading/positions?sandbox=true").json()
+    assert positions["positions"] == []
+
+
+def test_depth_that_vanished_between_check_and_order_is_refused(client, monkeypatch):
+    """عمق بین بررسی و ثبت آب می‌رود: به‌جای نصفه‌پرکردن، رد."""
+    from market import sandbox as sb
+
+    check = _check(client)
+    before = client.get("/api/paper-trading/account?sandbox=true").json()["cash"]
+
+    thin = sb.BY_SYMBOL[PRACTICE_SYMBOL]
+    monkeypatch.setitem(
+        sb.BY_SYMBOL,
+        PRACTICE_SYMBOL,
+        dataclasses.replace(thin, asks=((1_005.0, 2),)),
+    )
+    response = _order(client, check["ticket"]["id"])
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "عمق" in detail or "اجراپذیر" in detail
+    after = client.get("/api/paper-trading/account?sandbox=true").json()["cash"]
+    assert after == before
