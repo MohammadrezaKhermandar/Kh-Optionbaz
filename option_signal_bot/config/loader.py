@@ -70,7 +70,18 @@ def default_settings() -> dict[str, Any]:
             },
         },
         # خالی = همه استراتژی‌های ثبت‌شده با پارامترهای پیش‌فرض خودشان
-        "strategies": {},
+        # ⚠️ فهرستِ سفیدِ پیشنهادهای **فعال** — تصمیمِ **موقتِ دامنه‌ی
+        # محصول**، نه ردِ استراتژی‌های دیگر. بقیه کد دارند و با یک کلید
+        # برمی‌گردند. مبنا: نقدشوندگیِ مشاهده‌شده (سفارشِ ۱۰ قراردادی،
+        # رفت‌وبرگشتِ اجراپذیر: تک‌پایه ۱۹٪، استردل ۵٪) و محدودیتِ
+        # شبیه‌ساز (وجه تضمین مدل نشده). جزئیات و شرطِ برگشت:
+        # `docs/strategy-selection.md`.
+        "strategies": {
+            "directional_ma_cross": {"enabled": True},
+            "neutral_iv_spread": {"enabled": False},
+            "collar": {"enabled": False},
+            "long_straddle": {"enabled": False},
+        },
         "notifiers": {
             "console": {"enabled": True, "as_json": False},
             "telegram": {
