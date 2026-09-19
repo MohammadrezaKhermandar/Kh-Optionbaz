@@ -20,6 +20,7 @@ import pytest
 from data.option_chain_client import OptionContract
 from data.order_book import BookLevel, OrderBook
 from market.tradability import (
+    EntryStatus,
     HistoryStats,
     LiquidityObservation,
     Thresholds,
@@ -380,6 +381,51 @@ def test_screener_uses_multi_level_depth_for_the_exit_side():
 
     depth = next(c for c in report.checks if c.key == "exit_depth")
     assert depth.value == pytest.approx(1.5), "عمق کل ۱۵ است، تقسیم بر ۱۰"
+
+
+def test_screener_reads_the_entry_side_depth_so_a_shortfall_is_not_called_unknown():
+    """کمبودِ عمقِ ورود باید **قطعی** گزارش شود، نه «نمی‌دانیم».
+
+    بدون خواندنِ عمقِ سمت ورود، هر دو حالت یک `None` می‌شدند و
+    رتبه‌بندی نمی‌توانست بگوید مشکل از سفارشِ بزرگ است یا از نبودِ
+    داده — دو مشکل با دو راه‌حلِ متفاوت.
+    """
+    book = OrderBook(
+        SYMBOL,
+        bids=(BookLevel(1_000.0, 100),),
+        asks=(BookLevel(1_050.0, 2),),
+    )
+    screener = TradabilityScreener(
+        resolve_contract=lambda s: _contract(),
+        thresholds=Thresholds(min_history_sessions=1),
+        order_book_client=_Books(book),
+        history=None,
+    )
+
+    observation = screener.evaluate_symbol(
+        SYMBOL, position_side="buy", quantity=10
+    ).observation
+
+    assert observation.entry_fill_price is None, "۲ قرارداد برای ۱۰ تا کافی نیست"
+    assert observation.entry_depth_contracts == 2
+    assert observation.entry_status is EntryStatus.SHORT_OF_DEPTH
+
+
+def test_a_contract_we_could_not_resolve_leaves_the_entry_side_unknown():
+    """نبودِ قرارداد یعنی **ندانستن**، نه کمبودِ عمق."""
+    screener = TradabilityScreener(
+        resolve_contract=lambda s: None,
+        thresholds=Thresholds(),
+        order_book_client=None,
+        history=None,
+    )
+
+    observation = screener.evaluate_symbol(
+        SYMBOL, position_side="buy", quantity=10
+    ).observation
+
+    assert observation.entry_depth_contracts is None
+    assert observation.entry_status is EntryStatus.UNKNOWN
 
 
 def test_screener_falls_back_to_level_one_without_an_order_book():

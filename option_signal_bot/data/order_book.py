@@ -115,6 +115,26 @@ class OrderBook:
         """
         return sum(level.quantity for level in self._levels(side) if level.is_real)
 
+    def depth_within(self, side: str, max_slippage_pct: float) -> int | None:
+        """عمقی که **در محدوده‌ی قیمتیِ قابل قبول** است.
+
+        حجمی که در قیمت‌های خیلی دور نشسته، «حاشیه‌ی امنِ خروج» نیست:
+        سفارش را پر می‌کند ولی با زیانی که خودِ معامله را بی‌معنا
+        می‌کند. `real_depth` همه را می‌شمارد و برای دروازه‌ی غربال
+        درست است؛ برای سنجشِ حاشیه‌ی اطمینان باید فقط سطوحی شمرده شوند
+        که تا این درصد از بهترین مظنه فاصله دارند.
+
+        `None` یعنی بهترین مظنه‌ای نیست که فاصله با آن سنجیده شود.
+        """
+        levels = [lv for lv in self._levels(side) if lv.is_real]
+        best = next((lv.price for lv in levels), None)
+        if not best or best <= 0:
+            return None
+        limit = max_slippage_pct / 100.0
+        return sum(
+            lv.quantity for lv in levels if abs(lv.price - best) / best <= limit
+        )
+
     def _levels(self, side: str) -> tuple[BookLevel, ...]:
         """سطوحی که باید بخوریم تا سفارشِ `side` پر شود.
 

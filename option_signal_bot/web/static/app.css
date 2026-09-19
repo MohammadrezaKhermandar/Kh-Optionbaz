@@ -454,3 +454,13 @@ tbody tr.selected:hover { background: color-mix(in srgb, var(--garnet) 24%, tran
 }
 .check-line { display: flex; gap: 8px; line-height: 1.9; }
 .check-mark { width: 14px; text-align: center; font-weight: 700; }
+
+/* رتبه‌بندی: همان قالب گروه‌های غربال، با بدنه‌ی بازشونده‌ی خودش. */
+.rank-item > summary { font-weight: 600; }
+.rank-item > *:not(summary) {
+  border-inline: 1px solid var(--border);
+  padding-inline: 12px;
+  font-size: 12.5px;
+}
+.rank-item > *:last-child { border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+.rank-item > .screen-head { padding-top: 8px; }
