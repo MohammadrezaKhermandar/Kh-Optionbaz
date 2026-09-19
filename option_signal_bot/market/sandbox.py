@@ -31,11 +31,13 @@ recorder چند جلسه‌ی معاملاتی ثبت نکند، سنجه‌ی �
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from data.option_chain_client import OptionContract
 from data.order_book import BookLevel, OrderBook
+from market.regime import Adjustment, PricePoint, RegimeThresholds, assess_regime
 from market.tradability import HistoryStats, LiquidityObservation
 
 #: برچسبی که همراهِ هر پاسخِ آزمایشی می‌رود. رابط هم همین را نشان می‌دهد.
@@ -43,6 +45,11 @@ SANDBOX_LABEL = (
     "دادهٔ آزمایشی — بازار واقعی نیست. حساب، پایگاه و مظنه‌های این مسیر "
     "کاملاً از مسیر واقعی جدا هستند و هیچ سفارشی به بازار نمی‌رود."
 )
+
+#: «بازار»ِ نمونه — هم‌نام با هیچ شاخصِ واقعی‌ای نیست.
+SANDBOX_MARKET = "شاخصِ نمونه"
+#: طولِ سریِ قیمتِ نمونه (جلسه). از کفِ دادهٔ لازمِ تحلیل وضعیت بیشتر است.
+SANDBOX_SESSIONS = 80
 
 #: نماد پایه‌ی نمونه و قیمتش. عمداً اسم واقعیِ هیچ سهمی نیست.
 SANDBOX_UNDERLYING = "نمونه‌پایه"
@@ -291,3 +298,72 @@ def resolve_contract(symbol: str, today: date | None = None) -> OptionContract |
     """قراردادِ نمونه با نام — همان امضایی که کارگزارِ کاغذی می‌خواهد."""
     sample = BY_SYMBOL.get(symbol)
     return None if sample is None else contract(sample, today)
+
+
+# ----------------------------------------------------------------------
+# سریِ قیمتِ نمونه — تا وضعیت و تناسب هم قابل تمرین باشند
+# ----------------------------------------------------------------------
+def _sample_series(
+    start: float, drift: float, wobble: float, sessions: int = SANDBOX_SESSIONS
+) -> list[float]:
+    """سریِ قیمتِ **ساختگیِ قطعی** با فرمولِ نوشته‌شده.
+
+    عمداً تصادفی نیست: خروجیِ تمرین باید هر بار یکی باشد تا کاربر
+    بتواند همان چیزی را که دیده دوباره ببیند. این سری بازار نیست و
+    هیچ‌جا هم به‌جای بازار نمی‌نشیند — فقط در مسیرِ آزمایشیِ برچسب‌دار
+    استفاده می‌شود.
+    """
+    return [
+        start * ((1 + drift) ** i) * (1 + wobble * math.sin(i / 3.0))
+        for i in range(sessions)
+    ]
+
+
+def price_points(values: list[float], as_of: date | None = None) -> list[PricePoint]:
+    """سری را به جلسه‌های **گذشته** می‌چسباند (آخرین جلسه: دیروز)."""
+    end = (as_of or date.today()) - timedelta(days=1)
+    return [
+        PricePoint(end - timedelta(days=len(values) - 1 - i), value)
+        for i, value in enumerate(values)
+    ]
+
+
+def regime_block(
+    thresholds: RegimeThresholds | None = None, as_of: date | None = None
+) -> dict[str, object]:
+    """وضعیتِ «بازار» و «پایه»ی نمونه، هم‌شکلِ همان بلوکِ مسیر واقعی.
+
+    سریِ پایه صعودِ آرام دارد و سریِ بازار آرام‌تر، تا کاربر هر دو حالتِ
+    «سازگار» و تفاوتِ سهم با بازار را ببیند.
+    """
+    moment = as_of or date.today()
+    market = assess_regime(
+        price_points(_sample_series(2_000_000.0, 0.0015, 0.004), moment),
+        subject=SANDBOX_MARKET,
+        subject_kind="market",
+        as_of=moment,
+        thresholds=thresholds,
+        adjustment=Adjustment.NOT_APPLICABLE,
+    )
+    underlying = assess_regime(
+        price_points(_sample_series(9_000.0, 0.0035, 0.012), moment),
+        subject=SANDBOX_UNDERLYING,
+        subject_kind="underlying",
+        as_of=moment,
+        thresholds=thresholds,
+        # سریِ نمونه اصلاً رویداد شرکتی ندارد؛ ساخته‌شدنش با فرمولِ
+        # نوشته‌شده است و مبنای قیمتش عوض نمی‌شود.
+        adjustment=Adjustment.NO_CAPITAL_EVENTS,
+    )
+    return {
+        "enabled": True,
+        "as_of": moment.isoformat(),
+        "sandbox": True,
+        "market": market.to_dict(),
+        "underlyings": {SANDBOX_UNDERLYING: underlying.to_dict()},
+        "note": (
+            "وضعیتِ **نمونه‌ی آزمایشی** — نه بازار واقعی. شکل و منطقش همان "
+            "چیزی است که در مسیر واقعی می‌بینید."
+        ),
+        "_reports": {"market": market, "underlyings": {SANDBOX_UNDERLYING: underlying}},
+    }
