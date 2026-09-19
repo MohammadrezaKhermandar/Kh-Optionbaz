@@ -315,3 +315,81 @@ def test_performance_summary_delegates_to_shared_metrics(tmp_path):
     summary = broker.performance_summary()
     assert "sharpe_per_signal" in summary
     assert "max_drawdown_pct" in summary
+
+
+# ---------------------------------------------------------------------------
+# گاردِ ورودِ تأییدشده — همان‌جا که حساب عوض می‌شود
+# ---------------------------------------------------------------------------
+def _guard(price: float = 1000.0, quantity: int = 5, tolerance: float = 0.5) -> dict:
+    """همان چیزی که لایه‌ی وب موقع ثبت پاس می‌دهد."""
+    return {
+        "ticket_id": "t-1",
+        "confirmed_price": price,
+        "confirmed_quantity": quantity,
+        "tolerance_pct": tolerance,
+        "require_full_fill": True,
+    }
+
+
+def test_a_price_that_moved_since_confirmation_leaves_the_account_untouched(tmp_path):
+    """کاربر ۱۰۰۰ را تأیید کرده؛ دفتر تا لحظه‌ی پرشدن رفته ۱۰۵۰.
+
+    کنترل باید روی **همان پرشدنی** باشد که پول را جابه‌جا می‌کند، نه
+    روی مظنه‌ای که لایه‌ی بالاتر چند ثانیه قبل دیده بود.
+    """
+    broker = _broker(tmp_path, _deep_book(price=1_050.0, qty=100))
+    before = broker.account_snapshot().cash
+
+    order = broker.place_order(SYMBOL, "buy", 5, entry_guard=_guard(price=1_000.0))
+
+    assert order.status == OrderStatus.REJECTED
+    assert "جابه‌جایی" in order.metadata["reason"]
+    assert broker.account_snapshot().cash == before, "حساب نباید تکان بخورد"
+    assert broker.store.get_position(SYMBOL) is None
+
+
+def test_a_move_inside_the_tolerance_still_fills(tmp_path):
+    """آستانه یعنی آستانه: تکانِ کوچک نباید معامله را ببندد."""
+    broker = _broker(tmp_path, _deep_book(price=1_004.0, qty=100))
+
+    order = broker.place_order(SYMBOL, "buy", 5, entry_guard=_guard(price=1_000.0))
+
+    assert order.status == OrderStatus.FILLED
+    assert order.price == 1_004.0
+    assert order.metadata["entry_guard"]["ticket_id"] == "t-1"
+
+
+def test_depth_that_shrank_since_confirmation_is_refused_not_half_filled(tmp_path):
+    """عمق کم شده: نصفه‌پرکردن یعنی موقعیتی که کاربر تأییدش نکرده.
+
+    بدون گارد، همین سفارش `partially_filled` می‌شد و حساب عوض
+    می‌شد — تستِ بالاترِ همین فایل همان رفتار را برای ورودِ **بدون
+    تأیید** نشان می‌دهد.
+    """
+    book = OrderBook(SYMBOL, asks=(BookLevel(1_000.0, 3),))
+    broker = _broker(tmp_path, book)
+    before = broker.account_snapshot().cash
+
+    order = broker.place_order(SYMBOL, "buy", 5, entry_guard=_guard(quantity=5))
+
+    assert order.status == OrderStatus.REJECTED
+    assert "عمق از زمان تأیید کم شده" in order.metadata["reason"]
+    assert "3 از 5" in order.metadata["reason"]
+    assert broker.account_snapshot().cash == before
+    assert broker.store.get_position(SYMBOL) is None
+
+
+def test_confirmation_final_check_and_execution_stay_separable(tmp_path):
+    """سه لایه باید در ردیفِ سفارش از هم قابل تشخیص بمانند."""
+    broker = _broker(tmp_path, _deep_book(price=1_002.0, qty=100))
+    guard = {**_guard(price=1_000.0), "final_check_price": 1_001.0}
+
+    order = broker.place_order(
+        SYMBOL, "buy", 5, entry_guard=guard, decision={"score": 88.0}
+    )
+
+    stored = order.metadata
+    assert stored["decision"]["score"] == 88.0, "تصمیمِ کاربر"
+    assert stored["entry_guard"]["confirmed_price"] == 1_000.0, "چه چیزی تأیید شد"
+    assert stored["entry_guard"]["final_check_price"] == 1_001.0, "بررسیِ نهایی چه دید"
+    assert order.price == 1_002.0, "و واقعاً با چه قیمتی پر شد"
